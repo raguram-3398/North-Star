@@ -1,0 +1,22 @@
+# Never let secrets enter Claude Code's context window
+.env
+.env.*
+!.env.example
+
+# Credentials of any kind
+*.pem
+*.key
+secrets/
+credentials/
+
+# Local DB dumps that might contain user data
+*.sql
+*.dump
+
+# Standard noise
+__pycache__/
+*.pyc
+.venv/
+venv/
+node_modules/
+.git/

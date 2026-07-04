@@ -1,0 +1,39 @@
+name: Refresh roles_cache
+
+# Deterministic wall-clock trigger for roles_cache refresh, per Architecture_North_Star.md §3.
+# Runs the shared refresh function (src/cron/refresh_roles.py) against the seed role list.
+# This is the primary trigger; the Streamlit app's startup staleness check is the resilience
+# layer alongside it — see Architecture_North_Star.md §3 for the full two-layer design.
+
+on:
+  schedule:
+    # Runs monthly (day 1, 03:00 UTC) — satisfies the "minimum every 30 days" floor.
+    # The significant-event trigger (immediate, not wall-clock) is handled separately,
+    # inline, by the app itself when a live research call surfaces a bucket/confidence
+    # crossing — not by this workflow.
+    - cron: "0 3 1 * *"
+  workflow_dispatch: {}  # allow manual trigger for testing/demo purposes
+
+jobs:
+  refresh-roles-cache:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -e .
+
+      - name: Run roles_cache refresh
+        env:
+          NEON_CONNECTION_STRING: ${{ secrets.NEON_CONNECTION_STRING }}
+          TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          python -m src.cron.refresh_roles
