@@ -201,6 +201,8 @@ Generated when a significant market event affects an already-completed topic. Ne
 - High confidence → prioritized into near-term delivery
 - Low/uncertain confidence → user is asked: learn now (confidence-labeled, folded in) or defer
 
+**Resolved cutoff (`src/patches/patch_manager.py`; judgment call made and flagged during implementation, not specified above at the time of writing):** only `high` confidence auto-prioritizes. `medium`, `low`, `cached-low`, and `general-knowledge-only` all route to "needs a user decision." Reasoning: §7.3 defines `high` as both sources agreeing, and `medium` as a single source or minor disagreement — `medium` is therefore not fully cross-validated and reads as "uncertain" in this document's own terms, consistent with the system's "honest about its own confidence" value proposition (§3). This is an easy, low-risk constant to change if `medium` was intended to auto-prioritize too.
+
 **Deferred patches:** parked permanently — no expiry, no accumulation problem (append-only) — resurface at the goal-completion closing note, or on-demand if the user explicitly asks.
 
 **Delivery position:** always at/near the user's current position, never retroactively reinserted at the original hierarchical slot.

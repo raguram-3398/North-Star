@@ -28,7 +28,7 @@ Per course guidance on DAG orchestration and "Shift Intelligence Left": agents h
 - Clarify-gate bound-counting and loop-termination (`security/input_gate.py`)
 - Significant-event detection — bucket/confidence-crossing diff (`outline/significant_event.py`)
 - Pace calculation — topic_score, timing_ratio, the 80/20 blend, sustained-drift threshold check (`pace/calculator.py`)
-- Patch-note confidence branching (prioritize vs. ask-user, a threshold lookup on an already-computed value) (`patches/patch_manager.py`)
+- Patch-note confidence branching (prioritize vs. ask-user, a threshold lookup on an already-computed value) (`patches/patch_manager.py`) — implemented as `branch_by_confidence` returning the literal `"prioritize"` / `"needs_user_decision"` (only `high` confidence prioritizes; see PRD §7.9 for the resolved cutoff)
 - Outline insertion/positioning into an *already-known* dependency structure (`outline/hierarchy.py`) — distinct from initial full-hierarchy *creation*, which does require reasoning and stays in Agent 1
 
 **State passing is by database reference, not shared prompt context.** Agent 1 persists its output (resolved role, grounded outline rows, confidence tiers) to Postgres. Agent 2 receives only `user_id` / `topic_id` references and reads what it needs directly from the database. Raw agent output is never passed as accumulated text into the other agent's context window — this follows the course's explicit "Decouple State... pass only URIs or pointers" guidance and keeps each agent's context scoped and small.
