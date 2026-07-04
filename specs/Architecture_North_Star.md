@@ -18,6 +18,12 @@ Companion to PRD_North_Star.md. This document defines *how* the system is built:
 | Deployment | HF Spaces (Streamlit SDK) | Public link satisfies project-link requirement with no login |
 | Secrets | HF Space secrets | Neon connection string, Tavily key, Gemini key — never committed to repo |
 
+**Resolved implementation details (flagged during `src/db/connection.py` / `src/data/roles_cache.py` implementation, not pinned down above at the time of writing):**
+- **DB access library**: plain SQLAlchemy 2.0 (declarative `Mapped`/`mapped_column` style), not SQLModel — the table above left this open ("SQLAlchemy (or SQLModel)").
+- **Driver**: `psycopg` v3 (`postgresql+psycopg://` SQLAlchemy dialect), not the legacy `psycopg2` a bare `postgresql://` connection string resolves to by default — `pyproject.toml` installs `psycopg[binary]>=3.2.0`, not `psycopg2`. `db/connection.py` rewrites a bare `postgresql://` prefix automatically so `.env`'s existing `NEON_CONNECTION_STRING` format doesn't need to change.
+- **Neon timeouts** (CLAUDE.md guardrail #14 requires an explicit timeout on every external call, but names no duration): `connect_timeout=10` seconds (TCP handshake) and `statement_timeout=10` seconds (per-query, set via a Postgres connection option) — both generous-but-bounded defaults for a free-tier instance, to be tuned once real latency is measured (ship-day README requirement).
+- **Engine lifecycle**: the Engine is a lazy-but-memoized module-level singleton in `db/connection.py` (created on first use, cached, never recreated) rather than instantiated at raw import time — this avoids making `NEON_CONNECTION_STRING` a hard import-time requirement (e.g. in CI/test contexts with no DB configured) while still satisfying "one client per module."
+
 ---
 
 ## 2. Orchestration Principles (course-aligned)
@@ -55,7 +61,7 @@ Two real agents, consistent with the "don't inflate agent count for rubric-check
 **Implementation — two layers, one shared function:**
 - **Refresh function** (single, reusable): re-runs Agent 1's Research/Grounding pipeline for the seed role list, writes results to `roles_cache`. Called by both triggers below — no duplicated logic.
 - **Primary trigger — GitHub Actions scheduled workflow** (`schedule:` cron, e.g. every 30 days): calls the refresh function directly (either via a script with its own DB/API credentials, or by hitting an app endpoint). Genuinely wall-clock triggered, independent of app traffic — this is the real "deployability"/"scheduled job" demonstration for the video.
-- **Resilience layer — startup/session staleness check**: on Streamlit app startup (or first session of the day), check `roles_cache.last_updated` per cached role; if past the 30-day floor, call the same refresh function inline before continuing. Ensures the system stays honest even if the GitHub Action hasn't fired yet relative to a live demo session — not a replacement for the scheduled trigger, a safety net alongside it.
+- **Resilience layer — startup/session staleness check**: on Streamlit app startup (or first session of the day), check `roles_cache.last_updated` per cached role; if past the 30-day floor, call the same refresh function inline before continuing. Ensures the system stays honest even if the GitHub Action hasn't fired yet relative to a live demo session — not a replacement for the scheduled trigger, a safety net alongside it. **Implementation note:** the staleness comparison itself (`is_stale`) is a pure function living in `data/roles_cache.py` rather than a separate pure module — it operates on a value only that module reads (`last_updated`) with no other caller, so a separate module would be pure indirection; it still takes an explicit `reference_time` rather than calling the wall clock internally, keeping it deterministic and testable like the project's other pure modules.
 
 ---
 
@@ -89,6 +95,11 @@ users (
 )
 
 -- roles.json equivalent — cached market data, cron-refreshed
+-- Write boundary note: per guardrail #12, each core_skills/emerging_skills
+-- entry must be a validated grounding result (security/output_guard.py's
+-- ValidatedGroundedContent) before data/roles_cache.py's upsert_role will
+-- accept it — this table is an enforced structural-gate boundary, not
+-- just outline items and patch-notes.
 roles_cache (
   role_name TEXT PRIMARY KEY,
   core_skills JSONB,           -- [{skill, source_url, confidence}]
@@ -207,7 +218,7 @@ Deterministic diff on `roles_cache` between refreshes: for each skill, compare b
 
 ## 11. Non-negotiable Guardrails (carry into CLAUDE.md)
 
-- Never accept or store an outline item / patch-note without a `source_url` and `confidence` value
+- Never accept or store an outline item / patch-note / `roles_cache` skill entry without a `source_url` and `confidence` value
 - Never delete or reduce outline content under any pace condition
 - Never repeat an identical verification question on retry — always regenerate fresh
 - Never let enrichment topic outcomes write into `pace_snapshots`

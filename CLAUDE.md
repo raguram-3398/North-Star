@@ -104,7 +104,7 @@ north-star/
 
 Never do these, even if a task seems to call for it — ask first:
 
-1. Never create or store an outline item, patch-note, or roadmap content without a `source_url` and `confidence` value populated.
+1. Never create or store an outline item, patch-note, roadmap content, or `roles_cache` skill entry without a `source_url` and `confidence` value populated.
 2. Never delete or reduce outline content for any reason, including "user is behind" — pacing extends, content is never removed.
 3. Never repeat an identical verification question on retry — always generate a fresh one from the same source.
 4. Never let enrichment topic results write into `pace_snapshots` or influence velocity in any way.
@@ -115,7 +115,7 @@ Never do these, even if a task seems to call for it — ask first:
 9. Never touch the `roles_cache` bootstrap/refresh function's core logic (used by both the seed run and the cron job) without checking both call sites still work.
 10. Never write agent reasoning that duplicates logic already living in `security/`, `pace/`, `outline/`, or `patches/` — call those modules, don't reimplement their checks inline in a prompt.
 11. Never pass one agent's full raw output into the other agent's prompt/context — pass a database reference (`user_id`, `topic_id`) and let the receiving agent read what it needs.
-12. Never let a database write function accept an unvalidated object — writes for outline items, patch-notes, and grounding results require a post-`output_guard` object, not a raw dict.
+12. Never let a database write function accept an unvalidated object — writes for outline items, patch-notes, and grounding results (including `data/roles_cache.py`'s `upsert_role`, whose `core_skills`/`emerging_skills` entries are grounding results) require a post-`output_guard` object, not a raw dict.
 13. Never let input validation run after any content-processing step that could corrupt what it's checking for — `security/input_gate.py` always runs on raw input first.
 14. Never let an external API call (Gemini, Tavily, Himalayas, Neon) run without an explicit timeout.
 

@@ -2,9 +2,21 @@
 exactly. If a field needs to change, the architecture doc is updated in the
 same commit (CLAUDE.md coding conventions).
 
-Field-level definitions are deferred — this stage only scaffolds the table
-entities the rest of the system references.
+Field-level definitions are fleshed out incrementally, as each table's I/O
+module is implemented — a class with no columns below is still a
+docstring-only placeholder awaiting its own I/O module; `RolesCache` is
+the first to be fully mapped, alongside `src/data/roles_cache.py`.
 """
+
+from datetime import datetime
+from typing import Any
+
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+
+class Base(DeclarativeBase):
+    """Shared declarative base for all SQLAlchemy models in this project."""
 
 
 class User:
@@ -14,11 +26,18 @@ class User:
     """
 
 
-class RolesCache:
+class RolesCache(Base):
     """`roles_cache` — cron-refreshed market data cache: core_skills /
     emerging_skills per role, each carrying a confidence tier, plus
     last_updated.
     """
+
+    __tablename__ = "roles_cache"
+
+    role_name: Mapped[str] = mapped_column(primary_key=True)
+    core_skills: Mapped[list[dict[str, Any]]] = mapped_column(JSONB)
+    emerging_skills: Mapped[list[dict[str, Any]]] = mapped_column(JSONB)
+    last_updated: Mapped[datetime] = mapped_column()
 
 
 class OutlineTopic:
