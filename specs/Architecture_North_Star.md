@@ -203,6 +203,7 @@ Deterministic diff on `roles_cache` between refreshes: for each skill, compare b
 - No mobile-specific UI work — Streamlit default responsive behavior only
 - No admin dashboard for `roles_cache` — cron script output is sufficient for v1
 - Full skill-graduation tier system, adversarial red-teaming, and canary rollout (see §7) — noted as future work
+- `outline/hierarchy.py` only supports must-follow (prerequisite) positioning constraints, not must-precede — see code comment in `insert_new_topic` for detail. Flagged during implementation, not from original design.
 
 ## 11. Non-negotiable Guardrails (carry into CLAUDE.md)
 

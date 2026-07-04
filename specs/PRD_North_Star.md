@@ -183,6 +183,14 @@ Timing ratio: `days_taken / days_expected`, benchmarked against the **user's own
 **Behind (sustained):** pacing extends only — outline content is never reduced.
 **Ahead (sustained):** triggers enrichment (see 7.10).
 
+**Resolved calibration values (`src/pace/calculator.py`; judgment calls made and flagged during implementation, not specified above at the time of writing):**
+- Outlier threshold: `timing_ratio` must deviate more than ±50% from 1.0 (on-baseline-pace) before timing exerts any pull at all on the combined signal (`TIMING_OUTLIER_THRESHOLD = 0.5`). Inside that band, timing is ignored entirely, not just down-weighted.
+- Saturation point: timing's pull reaches its full ~20% ceiling once the deviation reaches ±100% (`TIMING_SATURATION_DEVIATION = 1.0`), scaling linearly between the outlier threshold and this point.
+- Rolling window size: 3 consecutive check-ins (`DRIFT_WINDOW_SIZE = 3`).
+- Behind threshold: the window's **mean** combined pace signal at or below 0.7 triggers "behind" (`SUSTAINED_BEHIND_THRESHOLD = 0.7`) — calibrated so it roughly corresponds to needing the half-credit teach-in fallback (§7.7) on 3 or more of the 5 questions in a topic.
+- Ahead threshold: the window's mean at or above 0.95 triggers "ahead" (`SUSTAINED_AHEAD_THRESHOLD = 0.95`).
+- The sustained-drift check is **mean-based** over the trailing window, not requiring every single entry to individually cross the threshold — a single unusually good or bad day within an otherwise-consistent window does not by itself reset the streak.
+
 **Initial pace expectation:** background/experience sets the *starting* pace-expectation profile (used pre-calibration); actual hierarchy-position skipping only ever happens via test-out, never via background-based assumption.
 
 ### 7.9 Patch-Notes
@@ -256,3 +264,4 @@ Triggered by sustained-ahead pace. Uses the **same outline-update insertion mech
 1. Support for changing goals/roles mid-journey without losing progress or pace history
 2. Visible base-knowledge level indicator (low/high) to the user — v1 keeps this internal-only
 3. Pause/leave-of-absence handling distinct from both "behind" pace-drift and 30-day dormancy
+4. Support a "must-precede" positioning constraint in `outline/hierarchy.py` for cases where a new or enrichment topic must be inserted before an existing topic, not just after a prerequisite — currently unhandled, flagged as a limitation during implementation.

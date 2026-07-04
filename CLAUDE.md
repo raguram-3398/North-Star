@@ -166,6 +166,7 @@ Caught and corrected in prior projects — avoid on first pass here, don't wait 
 
 ## Git workflow
 
+- **Before every commit, reconcile `specs/PRD_North_Star.md` and `specs/Architecture_North_Star.md` against what was actually implemented in this commit's changes.** If an implementation decision (a chosen constant, a resolved ambiguity, a discovered limitation, a design choice not previously specified) isn't yet reflected in the specs, update the specs in the same commit — specs must never silently drift behind the code they're supposed to govern.
 - Commit after each working, reviewed unit — not after each generated diff
 - Never commit `.env` or any file containing a real secret
 - **Semantic commits only** — every commit message starts with `feat:`, `fix:`, `docs:`, `refactor:`, `test:`, or `chore:`, followed by a specific, concrete description. No vague messages (`update stuff`, `wip`, `changes`).
