@@ -110,6 +110,8 @@ Output: a **pacing profile** (background-derived initial pace expectation) and a
 
 **Full confidence ladder:** high → medium → low → cached-fallback (low, labeled with `last_updated`) → general-knowledge-only floor (explicitly labeled as such) → reject (zero signal, see Clarify Gate exit).
 
+**Resolved (`src/data/grounding_fallback.py`; judgment calls made and flagged during implementation, not specified above at the time of writing):** see Architecture_North_Star.md §8 for the full reasoning on (1) why `general-knowledge-only` returns a structurally distinct, sourceless result rather than being forced through the same validated-object type every other rung uses, (2) why a stale cached entry still counts as usable fallback data instead of being treated as "no entry," and (3) the constant `source_type` stamp used for cached-fallback results, since `roles_cache` never persists a per-skill `source_type` to read back.
+
 **Grounding rule (absolute):** every downstream content item carries `source_url`, `source_type`, `confidence`. Nothing enters the system ungrounded.
 
 **`roles.json`:** structured with `core_skills` / `emerging_skills` per role, each carrying a confidence tier. Refreshed on a deterministic cron (minimum every 30 days, immediately on a significant event). Serves as fallback data and normalization anchor — never a shortcut that skips live research for a new user; every user gets a fresh live research pass.

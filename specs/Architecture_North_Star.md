@@ -47,7 +47,7 @@ Two real agents, consistent with the "don't inflate agent count for rubric-check
 
 ### Agent 1 — Research & Outline Agent
 **Owns (reasoning/generation only):** clarify-gate conversation (asking narrowing questions, proposing/explaining role interpretations — the *content* of what to ask, not the round-counting), cross-validation normalization judgment (anchored to `roles_cache`), initial full-outline hierarchy creation (sequencing sourced skills into dependency order).
-**Calls as tools (deterministic, not owned):** `security/input_gate.py` (bound state, reject detection), `security/output_guard.py` (confidence/source validation before any write), `data/roles_cache.py` (I/O), `outline/significant_event.py` (diff logic), `outline/hierarchy.py` (insertion into existing structure), `patches/patch_manager.py` (confidence branching).
+**Calls as tools (deterministic, not owned):** `security/input_gate.py` (bound state, reject detection), `security/output_guard.py` (confidence/source validation before any write), `data/roles_cache.py` (I/O), `data/grounding_fallback.py` (cached-fallback and general-knowledge-only floor rungs, invoked only once live Himalayas/Tavily grounding has already failed for the current request), `outline/significant_event.py` (diff logic), `outline/hierarchy.py` (insertion into existing structure), `patches/patch_manager.py` (confidence branching).
 **Tools:** Himalayas MCP, Tavily search, Postgres (via the gated write paths above only — never a raw insert).
 
 ### Agent 2 — Coaching & Pace Agent
@@ -201,6 +201,11 @@ Full production skill-graduation tiers (Read-Only → Draft → Action-Allowed, 
 
 Used consistently across `roles_cache`, `outline_topics`, `patch_notes`:
 `high` → `medium` → `low` → `cached-low` → `general-knowledge-only` → (reject, no record created)
+
+**Resolved (`src/data/grounding_fallback.py`; judgment calls made and flagged during implementation, not specified above at the time of writing):**
+- **`general-knowledge-only` is structurally distinct from `ValidatedGroundedContent`, never coerced into it.** This rung means "no real source of any kind" by definition (PRD §7.3) — `security/output_guard.py`'s `ValidatedGroundedContent` requires a non-empty, structurally valid `source_url`, and fabricating one to force this rung through that type would violate guardrail #1 and the "never silently fabricate a source" rule. `grounding_fallback.py` instead returns a separate `GeneralKnowledgeFloorResult` (role_name, confidence, a human-readable label) with no `source_url` field to omit or fake. Per `specs/scenarios/high_risk_flows.feature`'s "No source returns usable data" scenario, this result is for honest user-facing reporting only and must never be written into `outline_topics`/`patch_notes`/`roles_cache`.
+- **A stale `roles_cache` entry (past the 30-day floor) still counts as usable cached-fallback data**, not as equivalent to "no entry." Staleness only triggers the existing cron/startup refresh cycle; it does not disqualify already-grounded data from being served as today's fallback once live sources have failed. `is_stale` is surfaced as metadata on `CachedFallbackResult` so a caller can label the result honestly (e.g. "based on data from 47 days ago"), per PRD §7.3's "labeled with `last_updated`" phrasing. Flagged as a genuine judgment call, revisable if a stricter reading (stale should escalate straight to the floor) is preferred.
+- **`roles_cache` skill entries carry no per-skill `source_type` on disk** (§5's JSONB shape is `{skill, source_url, confidence}` only), so one cannot be read back honestly. Cached-fallback results are stamped with a constant `source_type` of `"roles_cache-cached"`, naming the provenance layer truthfully (a previously-validated result now being re-served from cache) rather than guessing at the original external source's type.
 
 ## 9. Significant Event Detection — implementation note
 
