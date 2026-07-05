@@ -32,3 +32,13 @@ class HimalayasParseError(Exception):
     input isn't a search_jobs response, as distinct from a listing merely
     missing an optional field (which is not an error).
     """
+
+
+class TavilyParseError(Exception):
+    """Raised by data/tavily_parser.py when a Tavily search result dict is
+    missing a required structural field (`url` or `title`) — Tavily's
+    response is structured JSON, not fragile prose like Himalayas's, so a
+    missing `url`/`title` signals a genuinely malformed/unexpected API
+    response, not merely a result with no extractable skills (which is
+    not an error — see data/tavily_parser.py's module docstring).
+    """
