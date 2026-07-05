@@ -256,3 +256,210 @@ session).
   one role at a time. How PRD §7.3's seed-role bootstrap loop
   (5-8 roles, written into `roles_cache` via `upsert_role`) actually
   calls this repeatedly hasn't been wired up.
+
+---
+
+# Context Transfer — Session 2: Clarify Gate → Outline → Verification Skill → Coaching/Pace Agent
+
+Written at the end of a separate, later session (interleaved with — not a
+continuation of — the grounding-pipeline session documented above; that
+work's files/tests are untouched here). Covers: git-history splitting,
+the Clarify Gate, Initial Outline Creation, an end-to-end pipeline
+integration test, Outline Confirmation, the Verification Question
+Generator Skill, and `coaching_pace_agent.py`. Session narrative and
+judgment-call rationale only — nothing here duplicates CLAUDE.md.
+
+## What was accomplished this session
+
+1. **Git-history splitting** — an existing, unsplit working tree was
+   broken into 8 logical commits.
+2. **Clarify Gate** (`security/input_gate.py`'s `classify_stated_goal`;
+   `research_outline_agent.py`'s `begin_clarify_gate`/
+   `advance_clarify_gate`) — bounded (~2 round) goal-clarification loop.
+3. **Initial Outline Creation** (`create_initial_outline`) — consumes
+   `ground_role`'s output shape into a sequenced, hierarchy-positioned
+   outline.
+4. **End-to-end pipeline integration test**
+   (`tests/test_pipeline_integration.py`) — exercises clarify gate →
+   outline creation as one real flow, not just unit-isolated pieces.
+5. **Outline Confirmation** (`OutlineConfirmationState`/
+   `OutlineReviewAction`, `begin_outline_confirmation`/
+   `handle_review_turn`/`regenerate_outline_with_addition`) — the second
+   bounded (~2 round) interactive loop, plus regeneration-not-insertion
+   semantics for user-requested additions.
+6. **Verification Question Generator Skill**
+   (`.agent/skills/verification_question_generator/generator.py` +
+   `SKILL.md` + EDD eval files) — stateless per-call question generation
+   and answer grading, packaged as a real Antigravity Skill artifact.
+7. **`coaching_pace_agent.py`** — day-by-day content generation (7-step
+   hands-on-eligible structure + conceptual-only variant), verification
+   retry-cap orchestration, and pace-signal computation/persistence.
+   Required fleshing out four previously-stub pieces first:
+   `models/schemas.py` (`OutlineTopic`/`ProgressLog`/
+   `VerificationAttempt`/`PaceSnapshot` fully mapped), a rewritten
+   `data/progress_log.py` (the stub had no `session` param at all),
+   and two new modules, `data/verification_log.py` and
+   `data/pace_snapshots.py`, plus a read/status-update-only
+   `data/outline_topics.py`.
+8. **`tests/test_coaching_pace_agent.py`** — 24 tests, all passing,
+   covering both day-structure variants, the exact-3 retry cap (with the
+   specific anti-pattern check CLAUDE.md names), half-credit teach-and-
+   de-escalate, success-stops-retrying at every attempt number, the
+   all-5-slots-resolved completion gate, and pace-calculator wiring.
+
+Every module above passed ruff/black/mypy clean; full suite finished at
+313 passed / 1 pre-existing unrelated failure (`test_research_grounding.py`'s
+placeholder). Nothing in this session has been committed — the user
+reviews and commits personally, and has said so explicitly more than
+once (e.g. "do no stage ill handle git").
+
+## Key decisions and why
+
+**Turn-based state machine, not a blocking loop (recurring pattern across 3 features)**
+- Clarify Gate, Outline Confirmation, and Verification retry-cap
+  orchestration all use the same shape: an immutable, frozen dataclass
+  carrying `stage`/`attempt_number`/etc., advanced one call at a time by
+  a function that takes the current state and one new input, rather than
+  an internal loop that blocks for multiple turns. Chosen because a real
+  Streamlit request/response cycle cannot synchronously wait on several
+  separate human inputs inside one function call.
+- For verification specifically, this is *how* CLAUDE.md's named
+  anti-pattern ("first attempt must live inside the same counter as
+  retries 2/3") is satisfied without an actual `for` loop: every attempt
+  number (1, 2, or 3) calls the identical `submit_verification_answer`
+  function — no special-cased first-attempt code path exists to
+  accidentally exclude attempt 1 from the count.
+
+**Hands-on ramping formula (a real ambiguity, resolved and flagged, not guessed silently)**
+- `(position_in_group - 1) / (group_size - 1)`, linear across a
+  topic-group, 0.0 on day 1 to 1.0 on the last day. `group_size == 1` is
+  special-cased to return 1.0 rather than 0.0 — otherwise a single-day
+  topic-group would never get any hands-on practice at all. Written into
+  PRD §7.6 and Architecture §3 as a "Resolved" block, per the task's
+  explicit instruction to propose and name a concrete rule rather than
+  leave the ramp undecided.
+
+**Weekly-hours-to-daily-minutes conversion**
+- `STUDY_DAYS_PER_WEEK = 5` (Monday-through-Friday assumption) — PRD
+  never states a study cadence; flagged as revisable, not asserted as
+  correct.
+
+**Taught-answer message is deterministic, not a second LLM call**
+- Built directly from the Verification Skill's own `grading_criteria` +
+  `source_url` (`_build_taught_answer_message`). Reasoning: the grading
+  criteria already **is** the rubric; asking Gemini to restate it as
+  "teaching" prose risks it subtly contradicting its own rubric for no
+  benefit. Consistent with this codebase's broader pattern of preferring
+  structural correctness over prompt-only correctness wherever possible.
+
+**`verification_attempts` (not caller-tracked state) is the source of truth for topic completion**
+- `complete_topic_verification` reads each question slot's *final*
+  attempt back from the database rather than trusting a value threaded
+  through the calling code. This also turned out to be where "all 5
+  slots resolved (not just attempted)" is actually enforced — a slot
+  that failed but hasn't hit the retry cap yet is genuinely still in
+  progress, and `_get_final_credits_per_question` raises `ValueError` in
+  that case rather than treating "attempted" as "done."
+
+**Dynamic-sizing/spillover mechanism: one generic string pair, not a typed union**
+- `carried_over_content` (input) / `remaining_content` (output) on
+  `generate_day_content`, deliberately not specific to *why* something
+  spilled. Reasoned through explicitly (per the task's own ask) that a
+  future patch-note's content could plug into the same
+  `carried_over_content` parameter without reworking the mechanism —
+  this task only wires it for regular-content overflow, but the seam is
+  designed to be reusable, not something that will need revisiting.
+
+**Prompt duplication over dynamic templating for hands-on vs. conceptual-only**
+- Two full, separately-frozen `PROMPT_REGISTRY` strings
+  (`day_content_generation_hands_on_v1` /
+  `..._conceptual_v1`) rather than one template with conditional
+  sections — keeps each version's baseline regression test asserting on
+  a single literal string (per CLAUDE.md's LLM Call Discipline), with no
+  risk of a conditional-assembly bug silently changing a frozen version.
+
+## Traps / failed approaches — don't repeat
+
+- **A private-name import resolves in its *defining* module's namespace,
+  not the caller's — this determines where a test must patch it.**
+  `_call_gemini_json`'s internal `_get_gemini_client()` lookup always
+  resolves inside `research_outline_agent.py` regardless of which module
+  calls `_call_gemini_json`, so `test_research_outline_agent.py`'s
+  existing `_patch_gemini` helper could be reused *unchanged* for
+  `coaching_pace_agent.py`'s day-content tests. But `_get_tavily_client`
+  is separately imported *into* `coaching_pace_agent.py`'s own
+  namespace, and `_fetch_theory_material_links` (defined in that module)
+  resolves the bare name there — reusing `research_outline_agent.py`'s
+  `_patch_tavily` would have silently patched the wrong module and the
+  fake would never have been called. Always trace where a name is
+  looked up from, not just where the underlying function is defined,
+  before deciding what a test should patch.
+- **An IDE "unused parameter" diagnostic caught a real design mismatch,
+  not just a lint nit.** `begin_verification_question` was first written
+  taking a `session` param it never used — worth checking, when a
+  diagnostic like this fires, whether the function's docstring/contract
+  actually promised that parameter would do something (it didn't: this
+  function doesn't write to the DB, `submit_verification_answer` does).
+- **An "unused import" diagnostic caught a genuine missing wire-up, not
+  dead code.** After building `data/outline_topics.py`'s
+  `mark_topic_completed` specifically to be called from
+  `complete_topic_verification`, the import was added but the actual
+  call was initially forgotten — the task's own requirement ("topic
+  requires all 5 slots... to complete") wasn't fully satisfied until the
+  diagnostic forced a second look and the call was added.
+- **Resist writing a read function "for symmetry" before its consumer
+  exists.** A `get_recent_pace_signals` read function was written into
+  `data/pace_snapshots.py`, then deleted before being used — it would
+  have guessed at the rolling-window shape `detect_sustained_drift`'s
+  eventual caller needs (a decision explicitly deferred to a later
+  task), which is the same "don't guess at an undecided next-task shape"
+  principle already applied earlier (core/emerging skill split gap,
+  addition-grounding gap). A one-line comment explaining the omission
+  replaced it instead of a speculative function.
+- **A "Resolved" spec block needs to name the actual chosen constant,
+  not just gesture at "a formula was picked."** Both PRD §7.6 and §7.7
+  now carry inline `Resolved (`src/agents/coaching_pace_agent.py`; ...)`
+  blocks matching the exact style already established for the Clarify
+  Gate, Outline Creation, and Outline Confirmation sections earlier in
+  the same document — consistency here matters because future spec
+  reconciliation passes pattern-match on that heading style.
+
+## Open items
+
+- **Test-out (verification-first)**, **patch-note delivery/surfacing**
+  into the new spillover mechanism, **enrichment triggering/generation**,
+  and **goal-completion closing-note content** are real, named PRD items
+  deliberately not built in the `coaching_pace_agent.py` task —
+  `generate_closing_note` is still an untouched `NotImplementedError`
+  stub.
+- **Acting on the pace signal is unbuilt**: `complete_topic_verification`
+  computes and persists `pace_snapshots`, but nothing calls
+  `pace/calculator.py`'s `detect_sustained_drift` or responds to
+  "behind"/"ahead" yet.
+- **No `outline_topics` insert path exists anywhere** — `data/
+  outline_topics.py` only reads and status-updates rows;
+  `create_initial_outline`/`regenerate_outline_with_addition`'s output
+  is never persisted into real `outline_topics` rows. Every function in
+  `coaching_pace_agent.py` assumes the row already exists. Flagged in
+  PRD §11 item 8 / Architecture §10.
+- **Third consumer of `research_outline_agent.py`'s private Gemini/
+  Tavily helpers** (`_call_gemini_json`, `_get_tavily_client`) —
+  `coaching_pace_agent.py` joins the Verification Skill as a module
+  reaching across a package boundary into underscore-prefixed names.
+  Extraction to a shared `src/utils/` module keeps getting more
+  justified and keeps not happening (would mean touching already-tested,
+  already-committed Agent code as a side effect of a narrower task).
+  Flagged in PRD §11 item 7 / Architecture §10.
+- **The `.agent/skills/` sys.path bootstrap is now duplicated** —
+  `coaching_pace_agent.py` repeats the exact `sys.path.insert` hack
+  `tests/test_verification_skill.py` already uses, since the Skill's
+  required location (outside `src/`, for Antigravity workspace-manager
+  recognition) isn't on the normal editable-install import path. Flagged
+  in PRD §11 item 9 / Architecture §10 — worth revisiting if more Skills
+  get added.
+- **No `pytest --cov=src tests/` run yet**; `README.md` not started
+  (shared with the grounding-pipeline session's open items above).
+- Nothing from this session has been staged or committed — standing
+  workflow throughout was implement → test → ruff/black/mypy clean →
+  reconcile specs → report back → stop, per explicit user instruction
+  each time.
