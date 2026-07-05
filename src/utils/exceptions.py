@@ -54,3 +54,6 @@ class GroundingSourceCallError(Exception):
     irrelevant result both end up treated as "no live signal from this
     source" for confidence-ladder purposes, but only a call failure
     raises this exception internally before being caught and downgraded,
+    so the two cases stay distinguishable in logs/tests rather than
+    silently collapsing into one code path by accident.
+    """
