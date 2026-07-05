@@ -81,6 +81,10 @@ async def test_refresh_roles_cache_upserts_each_successfully_grounded_role(
     upsert_role_mock = MagicMock()
     monkeypatch.setattr(rr, "ground_role", _fake_ground_role)
     monkeypatch.setattr(rr, "upsert_role", upsert_role_mock)
+    # No prior roles_cache row for any role — this test is about the
+    # upsert-per-role orchestration, not significant-event diffing (see
+    # the dedicated create_patch_notes_for_significant_events tests below).
+    monkeypatch.setattr(rr, "get_role", lambda session, role_name: None)
 
     session = MagicMock()
     summary = await rr.refresh_roles_cache(session, rr.SEED_ROLES, REFERENCE_TIME)
@@ -89,6 +93,7 @@ async def test_refresh_roles_cache_upserts_each_successfully_grounded_role(
     assert upsert_role_mock.call_count == 4
     assert ground_role_mock.call_count == 4
     assert not summary.had_errors
+    assert all(result.patch_notes_created == 0 for result in summary.results)
 
 
 @pytest.mark.asyncio
@@ -120,6 +125,7 @@ async def test_refresh_roles_cache_continues_past_a_single_role_failure(
     upsert_role_mock = MagicMock()
     monkeypatch.setattr(rr, "ground_role", _fake_ground_role)
     monkeypatch.setattr(rr, "upsert_role", upsert_role_mock)
+    monkeypatch.setattr(rr, "get_role", lambda session, role_name: None)
 
     session = MagicMock()
     summary = await rr.refresh_roles_cache(session, rr.SEED_ROLES, REFERENCE_TIME)
@@ -201,6 +207,7 @@ async def test_refresh_roles_cache_times_out_a_hanging_ground_role_call(
     monkeypatch.setattr(rr, "ground_role", _hanging_ground_role)
     monkeypatch.setattr(rr, "ROLE_REFRESH_TIMEOUT_SECONDS", 0.01)
     monkeypatch.setattr(rr, "upsert_role", MagicMock())
+    monkeypatch.setattr(rr, "get_role", lambda session, role_name: None)
 
     session = MagicMock()
     summary = await rr.refresh_roles_cache(
@@ -209,6 +216,192 @@ async def test_refresh_roles_cache_times_out_a_hanging_ground_role_call(
 
     assert summary.results[0].status == "error"
     assert summary.had_errors
+
+
+# --- create_patch_notes_for_significant_events (via refresh_roles_cache) --
+
+
+def _previous_row(
+    core_skills: list[dict[str, str]], emerging_skills: list[dict[str, str]]
+) -> dict[str, object]:
+    return {
+        "role_name": "Backend Engineer",
+        "core_skills": core_skills,
+        "emerging_skills": emerging_skills,
+        "last_updated": datetime(2026, 6, 1),
+    }
+
+
+@pytest.mark.asyncio
+async def test_refresh_roles_cache_creates_patch_notes_for_an_upward_crossing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SQL strengthens medium -> high within the same (core_skills) bucket
+    — a significant event per outline/significant_event.py — so every user
+    with a completed "SQL" topic should get a pending patch-note.
+    """
+    previous_row = _previous_row(
+        core_skills=[
+            {"skill": "SQL", "source_url": "https://old", "confidence": "medium"}
+        ],
+        emerging_skills=[],
+    )
+
+    async def _fake_ground_role(
+        role_name: str, session: object, reference_time: datetime
+    ) -> rr.LiveGroundingResult:
+        return _live_result(role_name)  # SQL @ HIGH confidence
+
+    matching_topics = [
+        {"id": "topic-1", "user_id": "user-1"},
+        {"id": "topic-2", "user_id": "user-2"},
+    ]
+    get_completed_topics_mock = MagicMock(return_value=matching_topics)
+    create_patch_note_mock = MagicMock(return_value={})
+
+    monkeypatch.setattr(rr, "ground_role", _fake_ground_role)
+    monkeypatch.setattr(rr, "upsert_role", MagicMock())
+    monkeypatch.setattr(rr, "get_role", lambda session, role_name: previous_row)
+    monkeypatch.setattr(
+        rr, "get_completed_topics_matching_skill", get_completed_topics_mock
+    )
+    monkeypatch.setattr(rr, "create_patch_note", create_patch_note_mock)
+
+    session = MagicMock()
+    summary = await rr.refresh_roles_cache(
+        session, ["Backend Engineer"], REFERENCE_TIME
+    )
+
+    assert summary.results[0].patch_notes_created == 2
+    get_completed_topics_mock.assert_called_once_with(session, "SQL")
+    assert create_patch_note_mock.call_count == 2
+    called_user_ids = {
+        call.kwargs["user_id"] for call in create_patch_note_mock.call_args_list
+    }
+    assert called_user_ids == {"user-1", "user-2"}
+    for call in create_patch_note_mock.call_args_list:
+        assert call.kwargs["created_at"] == REFERENCE_TIME
+        assert call.kwargs["grounded_content"].extra["skill"] == "SQL"
+        assert call.kwargs["grounded_content"].confidence == ConfidenceTier.HIGH
+        assert (
+            isinstance(call.kwargs["new_content"], str) and call.kwargs["new_content"]
+        )
+
+
+@pytest.mark.asyncio
+async def test_refresh_roles_cache_generates_nothing_for_a_downward_crossing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SQL weakens high -> medium within the same bucket — a downward
+    crossing, discarded by outline/significant_event.py — this test only
+    confirms the wiring respects that existing behavior.
+    """
+    previous_row = _previous_row(
+        core_skills=[
+            {"skill": "SQL", "source_url": "https://old", "confidence": "high"}
+        ],
+        emerging_skills=[],
+    )
+    weakened_result = rr.LiveGroundingResult(
+        role_name="Backend Engineer",
+        skills=[
+            ValidatedGroundedContent(
+                source_url="https://new",
+                source_type="job_listing",
+                confidence=ConfidenceTier.MEDIUM,
+                extra={"skill": "SQL"},
+            )
+        ],
+        confidence=ConfidenceTier.MEDIUM,
+        has_conflict=False,
+        himalayas_status="signal",
+        tavily_status="signal",
+    )
+
+    async def _fake_ground_role(
+        role_name: str, session: object, reference_time: datetime
+    ) -> rr.LiveGroundingResult:
+        return weakened_result
+
+    get_completed_topics_mock = MagicMock()
+    create_patch_note_mock = MagicMock()
+    monkeypatch.setattr(rr, "ground_role", _fake_ground_role)
+    monkeypatch.setattr(rr, "upsert_role", MagicMock())
+    monkeypatch.setattr(rr, "get_role", lambda session, role_name: previous_row)
+    monkeypatch.setattr(
+        rr, "get_completed_topics_matching_skill", get_completed_topics_mock
+    )
+    monkeypatch.setattr(rr, "create_patch_note", create_patch_note_mock)
+
+    session = MagicMock()
+    summary = await rr.refresh_roles_cache(
+        session, ["Backend Engineer"], REFERENCE_TIME
+    )
+
+    assert summary.results[0].patch_notes_created == 0
+    get_completed_topics_mock.assert_not_called()
+    create_patch_note_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_refresh_roles_cache_first_ever_refresh_generates_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No pre-existing roles_cache row for this role — nothing to diff
+    against, so diffing is skipped entirely, not treated as an error.
+    """
+
+    async def _fake_ground_role(
+        role_name: str, session: object, reference_time: datetime
+    ) -> rr.LiveGroundingResult:
+        return _live_result(role_name)
+
+    create_patch_note_mock = MagicMock()
+    monkeypatch.setattr(rr, "ground_role", _fake_ground_role)
+    monkeypatch.setattr(rr, "upsert_role", MagicMock())
+    monkeypatch.setattr(rr, "get_role", lambda session, role_name: None)
+    monkeypatch.setattr(rr, "create_patch_note", create_patch_note_mock)
+
+    session = MagicMock()
+    summary = await rr.refresh_roles_cache(
+        session, ["Backend Engineer"], REFERENCE_TIME
+    )
+
+    assert summary.results[0].status == "upserted"
+    assert summary.results[0].patch_notes_created == 0
+    create_patch_note_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_refresh_roles_cache_generates_nothing_with_no_matching_completed_users(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SQL is brand-new (absent -> core_skills, significant), but nobody
+    has a completed topic named "SQL" — no patch-notes should be created.
+    """
+    previous_row = _previous_row(core_skills=[], emerging_skills=[])
+
+    async def _fake_ground_role(
+        role_name: str, session: object, reference_time: datetime
+    ) -> rr.LiveGroundingResult:
+        return _live_result(role_name)
+
+    create_patch_note_mock = MagicMock()
+    monkeypatch.setattr(rr, "ground_role", _fake_ground_role)
+    monkeypatch.setattr(rr, "upsert_role", MagicMock())
+    monkeypatch.setattr(rr, "get_role", lambda session, role_name: previous_row)
+    monkeypatch.setattr(
+        rr, "get_completed_topics_matching_skill", MagicMock(return_value=[])
+    )
+    monkeypatch.setattr(rr, "create_patch_note", create_patch_note_mock)
+
+    session = MagicMock()
+    summary = await rr.refresh_roles_cache(
+        session, ["Backend Engineer"], REFERENCE_TIME
+    )
+
+    assert summary.results[0].patch_notes_created == 0
+    create_patch_note_mock.assert_not_called()
 
 
 # --- get_stale_or_missing_roles / check_and_refresh_stale_roles -----------

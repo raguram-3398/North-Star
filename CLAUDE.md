@@ -71,12 +71,14 @@ north-star/
 │   │   ├── hierarchy.py                # insertion into existing hierarchy
 │   │   └── significant_event.py        # bucket/confidence-crossing diff
 │   ├── patches/
-│   │   └── patch_manager.py            # confidence branching, delivery ordering
+│   │   └── patch_manager.py            # confidence branching, delivery ordering (decide_patch_delivery), low-confidence learn-now-or-defer state machine (PatchDecisionState/resolve_patch_decision)
 │   ├── cron/
-│   │   └── refresh_roles.py            # refresh_roles_cache (shared) + get_stale_or_missing_roles/check_and_refresh_stale_roles (startup check) — GitHub Action (__main__ block) + startup check both call refresh_roles_cache
+│   │   └── refresh_roles.py            # refresh_roles_cache (shared, also wires in significant-event -> patch-note creation) + get_stale_or_missing_roles/check_and_refresh_stale_roles (startup check) — GitHub Action (__main__ block) + startup check both call refresh_roles_cache
 │   ├── data/
 │   │   ├── roles_cache.py              # roles_cache I/O
-│   │   └── progress_log.py             # progress_log I/O
+│   │   ├── progress_log.py             # progress_log I/O
+│   │   ├── outline_topics.py           # outline_topics I/O, including get_completed_topics_matching_skill
+│   │   └── patch_notes.py              # patch_notes I/O
 │   ├── models/
 │   │   └── schemas.py
 │   ├── db/

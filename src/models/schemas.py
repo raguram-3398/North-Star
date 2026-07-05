@@ -6,13 +6,15 @@ Field-level definitions are fleshed out incrementally, as each table's I/O
 module is implemented — a class with no columns below is still a
 docstring-only placeholder awaiting its own I/O module; `RolesCache` was
 the first to be fully mapped, alongside `src/data/roles_cache.py`.
-`OutlineTopic`/`ProgressLog`/`VerificationAttempt`/`PaceSnapshot` are
-fleshed out here alongside `src/data/outline_topics.py`,
-`src/data/progress_log.py`, `src/data/verification_log.py`, and
-`src/data/pace_snapshots.py`. `user_id`/`topic_id`/`origin_topic_id`
-columns below are plain UUID columns, not `ForeignKey`-constrained yet —
-`User` and `PatchNote` remain unmapped placeholders, and a FK to an
-unmapped table isn't possible; add the constraints once those are mapped.
+`OutlineTopic`/`ProgressLog`/`VerificationAttempt`/`PaceSnapshot`/`PatchNote`
+are fleshed out here alongside `src/data/outline_topics.py`,
+`src/data/progress_log.py`, `src/data/verification_log.py`,
+`src/data/pace_snapshots.py`, and `src/data/patch_notes.py`. `user_id`/
+`topic_id`/`origin_topic_id` columns below are plain UUID columns, not
+`ForeignKey`-constrained — `User` remains an unmapped placeholder, and a
+FK to an unmapped table isn't possible; `PatchNote.user_id` stays
+unconstrained for that reason even though `PatchNote` itself is now
+mapped. Add the constraints once `User` is mapped too.
 """
 
 import uuid
@@ -114,11 +116,25 @@ class VerificationAttempt(Base):
     created_at: Mapped[datetime] = mapped_column()
 
 
-class PatchNote:
+class PatchNote(Base):
     """`patch_notes` — market-driven updates to already-completed topics:
     origin topic, new content, source/confidence, status (pending /
     delivered / deferred).
     """
+
+    __tablename__ = "patch_notes"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    origin_topic_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True))
+    new_content: Mapped[str] = mapped_column()
+    source_url: Mapped[str] = mapped_column()
+    confidence: Mapped[str] = mapped_column()
+    status: Mapped[str] = mapped_column()
+    created_at: Mapped[datetime] = mapped_column()
+    resolved_at: Mapped[datetime | None] = mapped_column(default=None)
 
 
 class PaceSnapshot(Base):

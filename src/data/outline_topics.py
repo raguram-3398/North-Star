@@ -18,6 +18,7 @@ import uuid
 from datetime import UTC, datetime
 from typing import Any, Protocol, runtime_checkable
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from models.schemas import OutlineTopic
@@ -242,3 +243,41 @@ def insert_outline_topics(
     persisted = [_to_dict(row) for row in new_rows]
     session.commit()
     return persisted
+
+
+def get_completed_topics_matching_skill(
+    session: Session, skill_name: str
+) -> list[dict[str, Any]]:
+    """Find every completed (`completed` or `completed_test_out`)
+    `outline_topics` row, across all users, whose `topic_name` matches
+    `skill_name` — used by `src/cron/refresh_roles.py` to find which
+    users' already-completed topics are affected by a significant
+    `roles_cache` crossing for that skill (Architecture §9's "generates a
+    patch-note candidate for every user with a completed topic matching
+    that skill").
+
+    Matching is case-insensitive (`func.lower()` on the SQL side, `.lower()`
+    on the Python side — not `.casefold()`, unlike this codebase's usual
+    skill-matching convention elsewhere: this comparison must execute
+    inside the DB query, and Postgres's `lower()` only approximates ASCII
+    lowercasing, so pairing it with Python's more aggressive Unicode
+    `.casefold()` on the other side of the comparison risks a silent
+    mismatch for non-ASCII input. Skill names here are expected to be
+    plain ASCII tech terms, so this is a narrow, flagged judgment call,
+    not a correctness concern in practice) — outline topic names and
+    roles_cache skill names are populated by two different pipelines
+    (Gemini-sequenced topic hierarchy vs. Himalayas/Tavily-extracted skill
+    strings) with no guaranteed identical casing convention.
+
+    Not scoped to a single user — deliberately global, per Architecture
+    §9's "every user" wording.
+    """
+    rows = (
+        session.query(OutlineTopic)
+        .filter(
+            OutlineTopic.status.in_(_VALID_COMPLETION_STATUSES),
+            func.lower(OutlineTopic.topic_name) == skill_name.lower(),
+        )
+        .all()
+    )
+    return [_to_dict(row) for row in rows]

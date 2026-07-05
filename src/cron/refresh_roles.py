@@ -10,25 +10,32 @@ call sites still work.
 
 Deliberately not agentic: the trigger is wall-clock time (or startup
 staleness), not judgment. This module owns no grounding or cross-validation
-logic of its own — it orchestrates two already-tested functions:
+logic of its own — it orchestrates already-tested functions:
 `agents/research_outline_agent.py`'s `ground_role` (the real grounding
-pipeline) and `data/roles_cache.py`'s `upsert_role` (the write path).
-No LLM/Himalayas/Tavily call is made directly by this module; every such
-call happens inside `ground_role`, which already owns its own per-source
-timeout/error handling.
+pipeline), `data/roles_cache.py`'s `upsert_role` (the write path), and, per
+Architecture §9, `outline/significant_event.py`'s upward-crossing diff plus
+`data/outline_topics.py`'s `get_completed_topics_matching_skill` and
+`data/patch_notes.py`'s `create_patch_note` — closing the previously-open
+"nothing calls significant_event.py" gap. No LLM/Himalayas/Tavily call is
+made directly by this module; every such call happens inside `ground_role`,
+which already owns its own per-source timeout/error handling.
 """
 
 import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from sqlalchemy.orm import Session
 
 from agents.research_outline_agent import LiveGroundingResult, ground_role
 from data.grounding_fallback import CachedFallbackResult, GeneralKnowledgeFloorResult
+from data.outline_topics import get_completed_topics_matching_skill
+from data.patch_notes import create_patch_note
 from data.roles_cache import get_role, is_stale, upsert_role
+from outline.significant_event import SkillBucket, SkillSnapshot, is_significant_event
+from security.output_guard import ConfidenceTier, ValidatedGroundedContent
 
 logger = logging.getLogger(__name__)
 
@@ -70,11 +77,16 @@ class RoleRefreshResult:
     `"error"` — `ground_role` itself raised (a data-integrity error, or the
     outer `ROLE_REFRESH_TIMEOUT_SECONDS` timeout elapsed); `detail` carries
     `str(exception)`.
+
+    `patch_notes_created` is always 0 except on `"upserted"` — significant-
+    event diffing (see `refresh_roles_cache`'s docstring) only ever runs
+    once a fresh `LiveGroundingResult` has actually been written.
     """
 
     role_name: str
     status: Literal["upserted", "no_live_signal", "error"]
     detail: str | None = None
+    patch_notes_created: int = 0
 
 
 @dataclass(frozen=True)
@@ -133,6 +145,14 @@ async def refresh_roles_cache(
     `roles_cache`). Recorded as `"no_live_signal"` instead: the existing
     cache entry (if any) is left exactly as it was, staleness-checkable on
     its own honest timestamp.
+
+    Significant-event detection (Architecture §9), on the `"upserted"`
+    path only: the *pre-refresh* `roles_cache` row is fetched via
+    `get_role` before `upsert_role` overwrites it, then diffed against the
+    fresh `LiveGroundingResult` via `create_patch_notes_for_significant_events`
+    below. A role with no pre-existing row (first-ever refresh) has
+    nothing to diff against — diffing is skipped for that role, not
+    treated as an error.
     """
     results: list[RoleRefreshResult] = []
     for role_name in role_names:
@@ -147,13 +167,23 @@ async def refresh_roles_cache(
             continue
 
         if isinstance(grounding_result, LiveGroundingResult):
+            previous_row = get_role(session, role_name)
             upsert_role(
                 session,
                 role_name,
                 core_skills=grounding_result.skills,
                 emerging_skills=[],
             )
-            results.append(RoleRefreshResult(role_name, "upserted"))
+            patch_notes_created = 0
+            if previous_row is not None:
+                patch_notes_created = create_patch_notes_for_significant_events(
+                    session, role_name, previous_row, grounding_result, reference_time
+                )
+            results.append(
+                RoleRefreshResult(
+                    role_name, "upserted", patch_notes_created=patch_notes_created
+                )
+            )
         elif isinstance(
             grounding_result, (CachedFallbackResult, GeneralKnowledgeFloorResult)
         ):
@@ -166,6 +196,118 @@ async def refresh_roles_cache(
             results.append(RoleRefreshResult(role_name, "no_live_signal"))
 
     return RefreshSummary(results=results)
+
+
+def _build_skill_snapshot_map(
+    core_skills: list[dict[str, Any]], emerging_skills: list[dict[str, Any]]
+) -> dict[str, SkillSnapshot]:
+    """Build a casefolded-skill-name -> `SkillSnapshot` map from a
+    `roles_cache` row's `core_skills`/`emerging_skills` JSONB lists (each
+    entry: `{"skill":..., "source_url":..., "confidence":...}` — see
+    `data/roles_cache.py`'s `_to_skill_entry`).
+    """
+    snapshot_map: dict[str, SkillSnapshot] = {}
+    for entry in core_skills:
+        snapshot_map[str(entry["skill"]).casefold()] = SkillSnapshot(
+            bucket=SkillBucket.CORE_SKILLS,
+            confidence=ConfidenceTier(entry["confidence"]),
+        )
+    for entry in emerging_skills:
+        snapshot_map[str(entry["skill"]).casefold()] = SkillSnapshot(
+            bucket=SkillBucket.EMERGING_SKILLS,
+            confidence=ConfidenceTier(entry["confidence"]),
+        )
+    return snapshot_map
+
+
+# Judgment call, flagged prominently: this cron job is not an agent
+# (Architecture §3's "Cron job (not an agent)" section) and this task's
+# scope fence explicitly forbids any LLM call here — but Architecture §9
+# still requires *a* patch_notes row to exist the moment a significant
+# event is detected, and CLAUDE.md guardrail #1 requires every patch-note
+# to carry a real source_url/confidence (satisfied via `grounded_content`
+# in create_patch_notes_for_significant_events below). This deterministic,
+# mechanically-assembled sentence is a structurally-valid placeholder, not
+# real Agent-1-authored narrative content: Architecture §3 assigns
+# *content* authorship to Agent 1's reasoning, which this cron module
+# cannot invoke without violating the scope fence. Replacing this with an
+# actual Agent-1-generated explanation is real, named future work, not
+# solved here.
+def _build_patch_note_content(role_name: str, skill: ValidatedGroundedContent) -> str:
+    skill_name = skill.extra["skill"]
+    return (
+        f"Market data for {role_name!r} now shows {skill_name!r} at "
+        f"{skill.confidence.value!r} confidence — this topic's market "
+        "relevance has increased since you completed it."
+    )
+
+
+def create_patch_notes_for_significant_events(
+    session: Session,
+    role_name: str,
+    previous_row: dict[str, Any],
+    grounding_result: LiveGroundingResult,
+    created_at: datetime,
+) -> int:
+    """Diff `previous_row` (the pre-refresh `roles_cache` snapshot, from
+    `get_role`) against `grounding_result` (the just-grounded snapshot
+    `refresh_roles_cache` just wrote) via `outline/significant_event.py`'s
+    `is_significant_event` — not reimplemented here — and create a
+    `PENDING` patch-note (`data/patch_notes.py`'s `create_patch_note`) for
+    every user with a completed topic matching a skill that crossed
+    upward (Architecture §9). Returns the number of patch-notes created.
+
+    The "new" snapshot treats every skill in `grounding_result.skills` as
+    `SkillBucket.CORE_SKILLS`: this deliberately mirrors exactly what
+    `refresh_roles_cache` just wrote via `upsert_role`
+    (`core_skills=grounding_result.skills, emerging_skills=[]` — the same
+    degenerate-split workaround flagged in PRD Future Improvements #5,
+    since `LiveGroundingResult` has no real core/emerging split). Diffing
+    against anything other than what was actually persisted would make
+    this function's notion of "significant" disagree with the data
+    actually sitting in `roles_cache`.
+
+    A skill matches a completed topic by exact, case-insensitive name via
+    `data/outline_topics.py`'s `get_completed_topics_matching_skill` — not
+    reimplemented here either.
+    """
+    old_snapshots = _build_skill_snapshot_map(
+        previous_row["core_skills"], previous_row["emerging_skills"]
+    )
+    new_snapshots: dict[str, SkillSnapshot] = {}
+    new_skill_content: dict[str, ValidatedGroundedContent] = {}
+    for skill in grounding_result.skills:
+        key = str(skill.extra["skill"]).casefold()
+        new_snapshots[key] = SkillSnapshot(
+            bucket=SkillBucket.CORE_SKILLS, confidence=skill.confidence
+        )
+        new_skill_content[key] = skill
+
+    absent = SkillSnapshot(bucket=SkillBucket.ABSENT, confidence=None)
+    patch_notes_created = 0
+    for key in set(old_snapshots) | set(new_snapshots):
+        old_snapshot = old_snapshots.get(key, absent)
+        new_snapshot = new_snapshots.get(key, absent)
+        if not is_significant_event(old_snapshot, new_snapshot):
+            continue
+
+        # An upward crossing always means new_snapshot is not ABSENT, so
+        # `key` is always present in new_skill_content here.
+        skill_content = new_skill_content[key]
+        skill_name = str(skill_content.extra["skill"])
+        matching_topics = get_completed_topics_matching_skill(session, skill_name)
+        for topic in matching_topics:
+            create_patch_note(
+                session,
+                user_id=topic["user_id"],
+                origin_topic_id=topic["id"],
+                new_content=_build_patch_note_content(role_name, skill_content),
+                grounded_content=skill_content,
+                created_at=created_at,
+            )
+            patch_notes_created += 1
+
+    return patch_notes_created
 
 
 def get_stale_or_missing_roles(

@@ -255,6 +255,10 @@ Generated when a significant market event affects an already-completed topic. Ne
 
 **Test-out completions are patch-eligible** — patches don't care how a topic was completed, only that it is.
 
+**Resolved (`src/patches/patch_manager.py`'s `decide_patch_delivery`/`PatchDeliveryDecision`/`PatchDecisionState`/`resolve_patch_decision`; the delivery/surfacing-decision task — judgment call made and flagged during implementation, not specified above at the time of writing):** `decide_patch_delivery` surfaces at most one action per call — the earliest (hierarchy/dependency order, reusing `patch_manager.py`'s own existing `order_pending_items`) prioritized patch if any are pending, else the earliest needs-a-decision patch, else nothing; anything not chosen stays pending for a future call. `resolve_patch_decision` is the pure state transition for the "learn now or defer" choice itself (mirrors `security/input_gate.py`'s `OutlineConfirmationState` pattern) — it does not generate the conversational ask or call an LLM; that UI layer does not exist yet. See Architecture §9 for the full mechanism.
+
+**Known limitation (see Architecture §3's Cron job "Known limitation" for the full technical finding):** the patch-note candidates generated when a significant market event is detected (`src/cron/refresh_roles.py`) carry a deterministic, mechanically-assembled `new_content` sentence (role, skill, and new confidence tier only) — not real narrative content. This section's own framing assigns patch-note content to Agent 1's reasoning, but the cron job that detects the event is explicitly not an agent and cannot call an LLM (the significant-event-wiring task's scope fence forbade it). **Not resolved by this task:** a production version routes each detected event through Agent 1 to generate the real explanation before the patch-note is persisted.
+
 ### 7.10 Enrichment
 
 Triggered by sustained-ahead pace. Uses the **same outline-update insertion mechanism** as market-driven updates (additive, hierarchy-positioned), tagged as **extra credit**.

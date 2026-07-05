@@ -26,6 +26,7 @@ from data.outline_topics import (
     COMPLETED_STATUS,
     COMPLETED_TEST_OUT_STATUS,
     NOT_STARTED_STATUS,
+    get_completed_topics_matching_skill,
     insert_outline_topics,
     mark_topic_completed,
 )
@@ -212,3 +213,41 @@ def test_mark_topic_completed_rejects_an_unrecognized_status() -> None:
         mark_topic_completed(session, "t1", status="something_else")
 
     session.commit.assert_not_called()
+
+
+def test_get_completed_topics_matching_skill_matches_case_insensitively() -> None:
+    """Used by src/cron/refresh_roles.py's significant-event wiring —
+    outline topic names and roles_cache skill names come from two
+    different pipelines with no guaranteed identical casing.
+    """
+    row = SimpleNamespace(
+        id="topic-1",
+        user_id="user-1",
+        topic_name="sql",
+        hierarchy_position=3,
+        topic_group="Databases",
+        position_in_group=1,
+        source_url="https://example.com/sql",
+        source_type="job_listing",
+        confidence="high",
+        is_enrichment=False,
+        status=COMPLETED_STATUS,
+        completed_at=None,
+    )
+    session = MagicMock()
+    session.query.return_value.filter.return_value.all.return_value = [row]
+
+    result = get_completed_topics_matching_skill(session, "SQL")
+
+    assert len(result) == 1
+    assert result[0]["id"] == "topic-1"
+    assert result[0]["user_id"] == "user-1"
+
+
+def test_get_completed_topics_matching_skill_returns_empty_when_no_match() -> None:
+    session = MagicMock()
+    session.query.return_value.filter.return_value.all.return_value = []
+
+    result = get_completed_topics_matching_skill(session, "Kafka")
+
+    assert result == []
