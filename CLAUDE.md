@@ -73,7 +73,7 @@ north-star/
 │   ├── patches/
 │   │   └── patch_manager.py            # confidence branching, delivery ordering
 │   ├── cron/
-│   │   └── refresh_roles.py            # shared refresh function — GitHub Action + startup check both call this
+│   │   └── refresh_roles.py            # refresh_roles_cache (shared) + get_stale_or_missing_roles/check_and_refresh_stale_roles (startup check) — GitHub Action (__main__ block) + startup check both call refresh_roles_cache
 │   ├── data/
 │   │   ├── roles_cache.py              # roles_cache I/O
 │   │   └── progress_log.py             # progress_log I/O
@@ -82,7 +82,7 @@ north-star/
 │   ├── db/
 │   │   └── connection.py
 │   └── utils/
-│       ├── logger.py                   # includes tool-call audit logging
+│       ├── logger.py                   # NOT BUILT — explicitly descoped for this submission, see Cost & Usage Tracking below
 │       └── exceptions.py
 │
 ├── evaluation/
@@ -139,9 +139,10 @@ Never do these, even if a task seems to call for it — ask first:
 - **Capture the original input before a retry loop overwrites it.** E.g., `original_question_source = question_source` before any retry logic runs — a retry must never contaminate itself with a previous attempt's correction as if it were the original input.
 - **Pipeline order is non-negotiable where order affects correctness.** Input validation/reject-detection (`security/input_gate.py`) runs on raw user input *before* it reaches any clarify-gate LLM call — never after, since downstream processing could corrupt a pattern the gate needs to catch.
 
-## Cost & Usage Tracking
+## Cost & Usage Tracking (descoped for this hackathon submission — not a current requirement)
 
-- Every Gemini, Tavily, and Himalayas call is logged with cost/usage and a `request_id`, via `utils/logger.py` — traceable, not aggregate-only.
+**This section is kept for context only. `utils/logger.py` will not be built for this submission — do not implement it, and do not treat any bullet below as something still owed.** Decided as a real product-scope cut, not a Claude Code judgment call; see PRD §6 Non-Goals and Architecture §10 for the recorded decision. What a production version would do instead:
+
 - Use actual token/usage counts from the API response, never estimates.
 - Cost is recorded only on success, explicitly guarded (e.g. `if response is not None`) — a failed call produces no cost record, never a silently wrong `$0.00`.
 - Daily spend accumulates in a module-level tracker with a one-time threshold alert (a boolean flag prevents repeated firing). Document the reset-on-restart limitation in code comments and the README rather than solving it — out of scope for this timeline.
@@ -176,8 +177,7 @@ Caught and corrected in prior projects — avoid on first pass here, don't wait 
 ## What Goes in the README on Ship Day — Not Before
 
 Real, measured numbers — never estimates or "approximately":
-- Gemini/Tavily/Himalayas latency, pulled from actual logs
-- Cost per call, pulled from actual cost-tracker log entries
+- Gemini/Tavily/Himalayas latency and cost per call: **not measured for this submission** — `utils/logger.py` (the cost/usage tracker they'd be pulled from) was explicitly descoped; list this as one of the "what I did not build and why" scope cuts below, not as a required measured number.
 - Test coverage, from `pytest --cov=src tests/`
 - "What I did not build and why" — at least three explicit scope cuts (see PRD §6 Non-Goals, Architecture §10 Explicit Out-of-Scope), each naming what a production version would do instead
 - No vague claims — if a number can't be measured yet, the section stays unwritten until it can

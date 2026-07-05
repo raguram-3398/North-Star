@@ -49,6 +49,7 @@ The core value requires acting on live external state and remembering the user o
 - No distinct short-gap/pause handling separate from behind-pace-drift and 30-day dormancy (future improvement)
 - No live deployment requirement per hackathon rules — deployed anyway to HF Spaces for demo strength, but not required for judging
 - No classroom/cohort features — this is a single-individual skill-development tool, not a social or comparative platform
+- No cost/usage tracking or tool-call audit logging (`utils/logger.py`) for this submission — a real scope cut, decided during the cron-refresh task, not an oversight. Every Gemini/Tavily/Himalayas call proceeds without a cost/usage log entry or audit trail. A production version would add per-call cost/token logging (real API usage counts, not estimates) and a one-time daily-spend threshold alert; see Architecture §10 for the technical framing.
 
 ---
 

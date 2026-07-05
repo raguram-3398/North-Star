@@ -463,3 +463,178 @@ once (e.g. "do no stage ill handle git").
   workflow throughout was implement → test → ruff/black/mypy clean →
   reconcile specs → report back → stop, per explicit user instruction
   each time.
+
+---
+
+# Context Transfer — Session 3: outline_topics Insert Gap + Test-Out (Verification-First)
+
+Written at the end of a session covering two discrete tasks: closing the
+`outline_topics` insert gap flagged at the end of Session 2, and building
+test-out (verification-first) for `coaching_pace_agent.py` — including a
+real mid-session correction made after direct user pushback on the
+initial test-out design. Session narrative and judgment-call rationale
+only — nothing here duplicates CLAUDE.md.
+
+## What was accomplished this session
+
+1. **`data/outline_topics.py`'s `insert_outline_topics`** — the
+   previously-flagged persistence gap (Session 2's last open item):
+   persists `create_initial_outline`/`regenerate_outline_with_addition`'s
+   output into real rows. Replaces the user's entire prior row set
+   (delete-then-insert, never a partial upsert), refuses to touch a row
+   that has progressed past `not_started`, and structurally rejects a raw
+   dict via a same-module `@runtime_checkable` Protocol
+   (`SequencedOutlineTopic`). 5 new tests in `tests/test_outline_topics.py`.
+2. **Test-out (verification-first) in `coaching_pace_agent.py`** —
+   `submit_verification_answer` and `complete_topic_verification` both
+   gained an additive `is_test_out: bool = False` parameter;
+   `data/outline_topics.py`'s `mark_topic_completed` gained a `status`
+   parameter (validated against `{completed, completed_test_out}`, since
+   Architecture's schema lists them as distinct values, not synonyms);
+   new `TestOutResult`/`complete_topic_test_out` orchestrate a topic's
+   test-out completion.
+3. **A real design correction, made mid-session after direct user
+   pushback, not self-caught:** the first implementation of
+   `complete_topic_test_out` built `generate_gap_study_content` (a new
+   content-generation path) and wired it into the partial-pass branch,
+   scoped to the questions that only resolved at `HALF_CREDIT`. The user
+   pushed back with a specific question — had the interaction with
+   `submit_verification_answer`'s existing inline teach-in
+   (`_build_taught_answer_message`) actually been considered? It had not.
+   On inspection: a `HALF_CREDIT` slot is *only* reachable by failing all
+   3 attempts and receiving the teach-in, built from the identical
+   `grading_criteria` `generate_gap_study_content`'s prompt also used —
+   so the wiring was a genuine double-remediation bug (re-teaching the
+   same rubric a second time, in different words, in the same session),
+   not a richer second pass. Corrected: `complete_topic_test_out` no
+   longer calls `generate_gap_study_content` at all; a partial pass now
+   does exactly what a full pass does (mark `completed_test_out`) and
+   generates nothing further. The now-unused `_get_failed_questions_for_topic`
+   helper was deleted; `generate_gap_study_content` itself was kept
+   (function is sound, just wrong to call here), unwired, flagged as a
+   possible building block for a future non-test-out remediation feature.
+   Tests and both specs' "Resolved" blocks were rewritten to state this
+   finding directly (mechanism *and* why *and* what actually happens
+   instead), per explicit instruction — not left as an implicit "gap
+   content generation was descoped" gloss.
+4. Spec reconciliation for both tasks in PRD/Architecture, including the
+   corrected-not-just-descoped test-out narrative.
+
+## Key decisions and why
+
+**`insert_outline_topics`'s structural type-check, without an `agents/` import**
+- `SequencedOutlineTopic`, a `@runtime_checkable` `typing.Protocol` defined
+  in `data/outline_topics.py` itself, structurally matching
+  `agents/research_outline_agent.py`'s `InitialOutlineTopic` — chosen over
+  importing that dataclass directly because `agents/research_outline_agent.py`
+  already calls `data/outline_topics.py` as a tool; the reverse import
+  would invert that dependency direction and risks a real circular import
+  the moment a caller inside that agent module wires this function in.
+  Declared with read-only `@property` members (not plain attribute
+  annotations) specifically so a frozen dataclass satisfies it under
+  static type checking, not just at runtime — a plain `name: str`
+  Protocol attribute is implicitly read-write and a frozen dataclass
+  fails that check even though `isinstance` at runtime is fine.
+- A raw dict is rejected by the same mechanism (`isinstance` against the
+  Protocol fails — a dict has no `.topic_name` attribute) — satisfies
+  CLAUDE.md guardrail #12 without the import.
+
+**Regeneration-replaces-prior-unstarted-rows (a genuine, flagged judgment call)**
+- Neither PRD nor Architecture specify DB-level persistence semantics for
+  outline confirmation (only the conversational/regeneration behavior).
+  Resolved as: delete every existing row for the user, insert the new set,
+  in one transaction — safe because Outline Confirmation is provably
+  pre-Day-1, so no row can have progressed past `not_started` while this
+  is still possible. Not merely assumed: raises `ValueError` if it ever
+  finds an already-progressed row, rather than trusting that invariant
+  (CLAUDE.md guardrail #2 — never delete/overwrite started or completed
+  content). This same mechanism also answers "what if this is called
+  twice for the same user" (second call overwrites the first) — flagged
+  as revisable if double-submission ever needs distinguishing from
+  genuine regeneration.
+
+**IDs generated explicitly (`uuid.uuid4()`) inside `insert_outline_topics`**
+- Not left to `OutlineTopic.id`'s mapped-column `default=uuid.uuid4`,
+  because this module's tests use a mocked `Session` (matching
+  `data/roles_cache.py`'s established no-SQLite-substitute convention —
+  CLAUDE.md's Stack section forbids SQLite in place of Neon), which
+  cannot execute SQLAlchemy's own flush-time default-generation machinery.
+
+**Test-out's "full pass" / "partial pass" reuse the existing credit scale**
+- A slot counts as a full pass if it resolved at `FULL_CREDIT` (passed
+  within the retry cap, any attempt); a partial pass is any slot at
+  `HALF_CREDIT`. Chosen to mirror §7.7's own completion rule ("all 5
+  resolved, full or half credit, to complete") rather than invent a
+  second, competing definition of "passed" specific to test-out. This
+  reuse was *correct*; what was missing (see Traps below) was checking it
+  against the teach-in interaction before wiring a consumer to it.
+
+**`mark_topic_completed` gained a `status` parameter**
+- Checked directly against Architecture's schema (as the task explicitly
+  instructed) rather than assuming: `completed_test_out` is listed as a
+  distinct value from `completed`, not a synonym, so a test-out
+  completion must write that specific status. `complete_topic_verification`
+  always passes `status=` explicitly via a ternary on its own `is_test_out`
+  parameter — never relies on `mark_topic_completed`'s own default in
+  practice, even for the regular (non-test-out) path.
+
+## Traps / failed approaches — don't repeat
+
+- **Mapping a new requirement onto a readily-available existing concept
+  is a good instinct, but it is not a substitute for checking that
+  concept's interactions with every other mechanism already keyed off
+  it.** "Partial pass = any `HALF_CREDIT` slot" is a correct, minimal
+  definition on its own — the miss was not checking that `HALF_CREDIT`
+  is *only* ever reached via a path (`submit_verification_answer`'s
+  retry-cap teach-in) that already performs the exact remediation the
+  new partial-pass branch was about to perform a second time. When a
+  judgment call reuses an existing scale/enum/concept, explicitly trace
+  every other place that concept already drives behavior before wiring
+  a new consumer to it — don't stop at "this satisfies the PRD's literal
+  wording."
+- **This was caught by direct user pushback, not self-review.** The
+  original report described the redundancy risk only as a hypothetical
+  question to ask, correctly declining to guess — but the deeper lesson
+  is that the interaction should have been checked during design, before
+  writing the wiring, not surfaced only when asked to defend it.
+- **Removing a wired mechanism leaves a dead, always-`None` field if the
+  surrounding dataclass isn't revisited.** `TestOutResult.gap_study_content`
+  would have been permanently `None` after `complete_topic_test_out`
+  stopped calling `generate_gap_study_content` — deleted along with the
+  wiring rather than left as vestigial, per "no half-finished
+  implementations" applied to fields, not just functions.
+- **Removing code without re-scanning every prose sentence that described
+  it leaves specs silently wrong.** After un-wiring
+  `generate_gap_study_content`, an Architecture "Resolved" bullet ("gap-
+  content generation runs before the completion write, not after") was
+  initially left in place — accurate for the code that no longer existed,
+  describing an ordering guarantee for a step that had been deleted. Had
+  to be caught and rewritten in a second pass. When code that a spec bullet
+  describes changes or is removed, re-read that entire bullet for
+  continued accuracy, not just the bullet that named the removed function.
+
+## Open items
+
+- **`generate_gap_study_content` exists but is called from nowhere** —
+  kept as a possible building block for a future, non-test-out remediation
+  flow (e.g. a dedicated "review what you missed" feature), not wired
+  into anything.
+- **Neither `insert_outline_topics` nor `complete_topic_test_out` is wired
+  into a real caller.** No orchestration layer yet decides when to call
+  `ground_role` → `create_initial_outline` → `insert_outline_topics`, or
+  when to route a topic through test-out vs. regular day-by-day coaching
+  — both are UI/orchestration decisions with no home yet (no `main.py`
+  wiring, no Streamlit layer).
+- Everything already open at the end of Session 2 remains open and
+  untouched by this session: patch-note delivery/surfacing, enrichment
+  triggering/generation, goal-completion closing-note content
+  (`generate_closing_note` still `NotImplementedError`), acting on the
+  pace signal (`detect_sustained_drift` never called),
+  `agents/research_outline_agent.py`'s private Gemini/Tavily helpers now
+  have a fourth-plus consumer with no extraction attempted, the
+  `.agent/skills/` `sys.path` bootstrap duplication, no `pytest --cov`
+  run yet, `README.md` not started, `roles_cache`/`db/connection.py`
+  never exercised against a real Neon instance.
+- Nothing from this session has been staged or committed — same standing
+  workflow (implement → test → ruff/black/mypy clean → reconcile specs →
+  report → stop).
