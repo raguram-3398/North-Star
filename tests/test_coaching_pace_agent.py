@@ -619,3 +619,217 @@ def test_complete_topic_verification_does_not_call_detect_sustained_drift(
     )
 
     assert called == []
+
+
+# --- Test-out: verification-first (PRD §7.6's exception) ------------------
+
+
+def _resolved_attempt(
+    question_number: int,
+    credit: float,
+    question_text: str | None = None,
+    grading_criteria: str | None = None,
+) -> dict:
+    """Build one 'final attempt' fixture row, shaped like
+    `get_attempts_for_topic`'s real return value. `credit` drives
+    `passed`/`attempt_number` consistently with how
+    `submit_verification_answer` actually writes them: a full-credit slot
+    passed on some attempt (attempt_number doesn't matter for these
+    tests, so attempt 1 is used); a half-credit slot only resolved by
+    failing all the way to the retry cap.
+    """
+    passed = credit == cpa.FULL_CREDIT
+    attempt_number = 1 if passed else cpa.MAX_VERIFICATION_ATTEMPTS
+    return {
+        "question_number": question_number,
+        "attempt_number": attempt_number,
+        "question_text": question_text or f"Question {question_number}?",
+        "grading_criteria": grading_criteria
+        or f"Must explain concept {question_number}.",
+        "passed": passed,
+        "credit": credit,
+    }
+
+
+async def test_generate_gap_study_content_calls_gemini_and_returns_study_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_gemini(
+        monkeypatch,
+        responses=[
+            json.dumps({"study_content": "Rebase moves commits onto a new base."})
+        ],
+    )
+    failed_questions = [
+        cpa.VerificationQuestion(
+            question_text="What is a rebase?",
+            grading_criteria="Must define a rebase.",
+            source_url=SOURCE_URL,
+        )
+    ]
+
+    content = await cpa.generate_gap_study_content(failed_questions)
+
+    assert content == "Rebase moves commits onto a new base."
+
+
+async def test_generate_gap_study_content_rejects_empty_list() -> None:
+    with pytest.raises(ValueError):
+        await cpa.generate_gap_study_content([])
+
+
+async def test_test_out_full_pass_writes_completed_test_out_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Full pass (PRD §7.6): every slot resolved at FULL_CREDIT -> the
+    topic is marked the schema's distinct `completed_test_out` value
+    (not `completed`), and no study content is generated at all.
+    """
+    attempts = [_resolved_attempt(q, cpa.FULL_CREDIT) for q in range(1, 6)]
+    monkeypatch.setattr(
+        cpa, "get_attempts_for_topic", lambda session, topic_id: attempts
+    )
+    monkeypatch.setattr(cpa, "write_pace_snapshot", lambda *a, **k: None)
+    completed_calls: list[tuple] = []
+    monkeypatch.setattr(
+        cpa,
+        "mark_topic_completed",
+        lambda *args, **kwargs: completed_calls.append((args, kwargs)),
+    )
+    gap_content_calls: list[list] = []
+
+    async def fake_generate_gap_study_content(failed_questions):
+        gap_content_calls.append(failed_questions)
+        return "should never be reached"
+
+    monkeypatch.setattr(
+        cpa, "generate_gap_study_content", fake_generate_gap_study_content
+    )
+    session = MagicMock()
+
+    result = await cpa.complete_topic_test_out(
+        session, "u1", "t1", days_taken=3, days_expected=3
+    )
+
+    assert result.full_pass is True
+    assert gap_content_calls == []
+    assert len(completed_calls) == 1
+    assert completed_calls[0][0] == (session, "t1")
+    assert completed_calls[0][1] == {"status": cpa.COMPLETED_TEST_OUT_STATUS}
+
+
+async def test_test_out_partial_pass_relies_on_the_inline_teach_in_not_a_second_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """This is the key regression guard for a real interaction this task
+    got wrong on the first pass and corrected after review: a partial
+    pass's HALF_CREDIT slot(s) already received
+    `submit_verification_answer`'s inline teach-in
+    (`_build_taught_answer_message`), built from the identical
+    `grading_criteria`, during the retry-cap attempt itself — moments
+    before `complete_topic_test_out` is ever called. Calling
+    `generate_gap_study_content` here too would re-teach the same rubric
+    a second time in different words. `complete_topic_test_out` must
+    still mark the topic complete (`completed_test_out`, PRD §7.7's
+    completion rule doesn't distinguish full/half credit), but it must
+    call `generate_gap_study_content` exactly zero times, regardless of
+    how many slots are half-credit.
+    """
+    attempts = [
+        _resolved_attempt(1, cpa.FULL_CREDIT, "What is a commit?"),
+        _resolved_attempt(2, cpa.FULL_CREDIT, "What is a branch?"),
+        _resolved_attempt(3, cpa.HALF_CREDIT, "What is a rebase?"),
+        _resolved_attempt(4, cpa.FULL_CREDIT, "What is a merge?"),
+        _resolved_attempt(5, cpa.HALF_CREDIT, "What is a cherry-pick?"),
+    ]
+    monkeypatch.setattr(
+        cpa, "get_attempts_for_topic", lambda session, topic_id: attempts
+    )
+    monkeypatch.setattr(cpa, "write_pace_snapshot", lambda *a, **k: None)
+    completed_calls: list[tuple] = []
+    monkeypatch.setattr(
+        cpa,
+        "mark_topic_completed",
+        lambda *args, **kwargs: completed_calls.append((args, kwargs)),
+    )
+    gap_content_calls: list[list] = []
+
+    async def fake_generate_gap_study_content(failed_questions):
+        gap_content_calls.append(failed_questions)
+        return "should never be called from complete_topic_test_out"
+
+    monkeypatch.setattr(
+        cpa, "generate_gap_study_content", fake_generate_gap_study_content
+    )
+    session = MagicMock()
+
+    result = await cpa.complete_topic_test_out(
+        session, "u1", "t1", days_taken=3, days_expected=3
+    )
+
+    assert result.full_pass is False
+    assert gap_content_calls == []  # the inline teach-in already covered this
+    assert len(completed_calls) == 1
+    assert completed_calls[0][1] == {"status": cpa.COMPLETED_TEST_OUT_STATUS}
+
+
+async def test_submit_verification_answer_defaults_to_is_test_out_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression guard: adding the `is_test_out` parameter must not
+    change regular (non-test-out) verification's persisted behavior."""
+    _patch_verification_skill(monkeypatch, ["Q1"], [True])
+    written = _no_op_write_attempt(monkeypatch)
+    session = MagicMock()
+
+    state = await cpa.begin_verification_question(
+        "t1", 1, TOPIC_SOURCE_MATERIAL, SOURCE_URL
+    )
+    await cpa.submit_verification_answer(
+        state, "correct", session, TOPIC_SOURCE_MATERIAL, SOURCE_URL
+    )
+
+    assert written[0][1]["is_test_out"] is False
+
+
+async def test_test_out_reuses_the_identical_retry_cap_machinery_not_a_second_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test-out drives the exact same `begin_verification_question`/
+    `submit_verification_answer` functions and the exact same
+    `MAX_VERIFICATION_ATTEMPTS == 3` cap as regular verification —
+    `is_test_out` only changes what gets persisted per attempt, never the
+    retry-counting mechanism. If test-out had grown a second, parallel
+    retry-cap implementation instead of reusing this one, the
+    attempt/write counts below (identical to
+    `test_retry_cap_is_exactly_three_first_attempt_inside_the_counter`)
+    would diverge.
+    """
+    fake_generate, fake_grade = _patch_verification_skill(
+        monkeypatch, ["Q1", "Q2", "Q3"], [False, False, False]
+    )
+    written = _no_op_write_attempt(monkeypatch)
+    session = MagicMock()
+
+    state = await cpa.begin_verification_question(
+        topic_id="t1",
+        question_number=1,
+        topic_source_material=TOPIC_SOURCE_MATERIAL,
+        source_url=SOURCE_URL,
+    )
+    for _ in range(3):
+        state = await cpa.submit_verification_answer(
+            state,
+            "wrong",
+            session,
+            TOPIC_SOURCE_MATERIAL,
+            SOURCE_URL,
+            is_test_out=True,
+        )
+
+    assert state.resolved
+    assert state.credit == cpa.HALF_CREDIT
+    assert fake_generate.call_count == 3  # identical shape to regular verification
+    assert fake_grade.call_count == 3
+    assert len(written) == 3
+    assert all(kwargs["is_test_out"] is True for _, kwargs in written)

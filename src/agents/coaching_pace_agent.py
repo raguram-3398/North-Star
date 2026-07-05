@@ -18,15 +18,29 @@ closing note + enrichment source).
 **Scope for this task**: the 7-step hands-on-eligible day structure (and
 its conceptual-only, steps-3-4-omitted variant), verification retry-cap
 orchestration (exactly 3 attempts, half-credit teach-and-de-escalate at
-cap), and pace-signal computation + `pace_snapshots` persistence once a
-topic's 5 questions resolve. Explicitly NOT built here (deliberately
-deferred to the next task, not stubbed with a guessed shape): test-out
-(verification-first), patch-note delivery/surfacing, enrichment
-triggering/generation, goal-completion/closing-note content. Acting on
-the pace signal (extending pacing, triggering enrichment on sustained
-drift) is also deferred — this task only computes and persists the
-signal; `pace/calculator.py`'s `detect_sustained_drift` is not called
-here at all.
+cap), pace-signal computation + `pace_snapshots` persistence once a
+topic's 5 questions resolve, and test-out (verification-first — PRD's
+day-by-day coaching section's exception). Explicitly NOT built here
+(deliberately deferred to a later task, not stubbed with a guessed
+shape): patch-note delivery/surfacing, enrichment triggering/generation,
+goal-completion/closing-note content. Acting on the pace signal
+(extending pacing, triggering enrichment on sustained drift) is also
+deferred — this task only computes and persists the signal;
+`pace/calculator.py`'s `detect_sustained_drift` is not called here at
+all.
+
+**Test-out** (`complete_topic_test_out`, `generate_gap_study_content`)
+reuses the identical `begin_verification_question`/
+`submit_verification_answer` retry-cap machinery regular verification
+uses — no separate retry cap or attempt-counting shape — and
+`complete_topic_verification`'s existing pace-signal/completion path,
+extended with an `is_test_out` flag so a full pass writes the schema's
+distinct `completed_test_out` status rather than `completed`. Only a
+partial pass (>=1 question resolved via the retry-cap teach-and-
+de-escalate path) generates any content at all, and only
+`generate_gap_study_content` — a new, purpose-built path scoped strictly
+to the failed question(s), never `generate_day_content`'s 7-step
+structure.
 """
 
 import asyncio
@@ -50,7 +64,11 @@ from agents.research_outline_agent import (
     _call_gemini_json,
     _get_tavily_client,
 )
-from data.outline_topics import mark_topic_completed
+from data.outline_topics import (
+    COMPLETED_STATUS,
+    COMPLETED_TEST_OUT_STATUS,
+    mark_topic_completed,
+)
 from data.pace_snapshots import write_pace_snapshot
 from data.progress_log import log_progress_step
 from data.verification_log import get_attempts_for_topic, write_verification_attempt
@@ -59,7 +77,7 @@ from pace.calculator import (
     calculate_timing_ratio,
     calculate_topic_score,
 )
-from utils.exceptions import GroundingSourceCallError
+from utils.exceptions import GeminiCallError, GroundingSourceCallError
 
 # Reuses agents/research_outline_agent.py's private Gemini-call helper
 # directly, same flagged architectural seam as
@@ -231,6 +249,19 @@ PROMPT_REGISTRY: dict[str, str] = {
         'tomorrow, or an empty string if everything fit>"}}\n'
         "Size the depth/length of every field to genuinely fit within "
         "{minutes_available} minutes total for the whole lesson."
+    ),
+    "gap_study_content_v1": (
+        "A learner tried to test out of a topic by answering verification "
+        "questions before any study material was shown. They did not pass "
+        "the question(s) below outright — they only passed after being "
+        "taught the answer at the retry cap. Generate focused study "
+        "material that teaches ONLY the specific gap(s) below — do not "
+        "cover the whole topic, only what these question(s) actually "
+        "test.\n\n"
+        "{gaps}\n\n"
+        "Respond with ONLY a JSON object matching this shape: "
+        '{{"study_content": "<prose study material covering only these '
+        'specific gaps, citing the given source(s)>"}}.'
     ),
 }
 
@@ -535,11 +566,15 @@ async def submit_verification_answer(
     session: Session,
     topic_source_material: str,
     source_url: str,
+    is_test_out: bool = False,
 ) -> VerificationSlotState:
     """Grade the user's answer for `state`'s current attempt, and advance
     the slot — the exact same code path regardless of whether this is
     attempt 1, 2, or 3 (CLAUDE.md's named anti-pattern: never special-
-    case the first attempt outside the retry-counting logic).
+    case the first attempt outside the retry-counting logic), and
+    regardless of whether this is regular verification or test-out
+    (PRD's day-by-day coaching section's "verification-first" exception)
+    — test-out gets no separate retry cap or attempt-counting shape.
 
     - Pass (any attempt) -> full credit, `resolved=True`, no further
       generation call.
@@ -554,7 +589,14 @@ async def submit_verification_answer(
       — no 4th generation call.
 
     Every attempt (all 3, whether or not reached) is written to
-    `verification_attempts` as it happens.
+    `verification_attempts` as it happens. `is_test_out` is threaded
+    straight through to `write_verification_attempt`'s existing parameter
+    of the same name (Architecture §5's schema column, previously always
+    written `False` regardless of caller since nothing before this task
+    ever passed `True`) — the only thing test-out changes about this
+    function; the retry-cap mechanics themselves are identical either way.
+    Default `False` preserves this function's existing behavior for every
+    regular (non-test-out) caller.
     """
     passed = await grade_answer(state.current_question, user_answer)
     at_cap = state.attempt_number >= MAX_VERIFICATION_ATTEMPTS
@@ -572,7 +614,7 @@ async def submit_verification_answer(
         user_answer,
         passed=passed,
         credit=credit,
-        is_test_out=False,
+        is_test_out=is_test_out,
     )
 
     if passed:
@@ -633,11 +675,16 @@ class TopicCompletionResult:
     combined_pace_signal: float
 
 
-def _get_final_credits_per_question(session: Session, topic_id: str) -> list[float]:
-    """Read back the final (most recent) attempt's credit for each of
-    the 5 question slots, from `verification_attempts` — the single
-    source of truth, rather than trusting a caller-tracked list that
-    could drift from what was actually persisted.
+def _get_latest_attempt_per_question(
+    session: Session, topic_id: str
+) -> dict[int, dict[str, Any]]:
+    """Read back each of the 5 question slots' final (most recent)
+    attempt, from `verification_attempts` — the single source of truth,
+    rather than trusting a caller-tracked list that could drift from what
+    was actually persisted. Shared by `_get_final_credits_per_question`
+    (regular completion) and `_get_failed_questions_for_topic` (test-out's
+    gap detection) — both need "the final attempt per slot", just
+    different fields off of it.
 
     Raises `ValueError` if fewer than all 5 question slots have been
     attempted yet, or if any slot's most recent attempt is a failure
@@ -669,6 +716,15 @@ def _get_final_credits_per_question(session: Session, topic_id: str) -> list[flo
             f"(failed, but not at the retry cap): {sorted(unresolved)}"
         )
 
+    return latest_by_question
+
+
+def _get_final_credits_per_question(session: Session, topic_id: str) -> list[float]:
+    """Read back the final (most recent) attempt's credit for each of
+    the 5 question slots — see `_get_latest_attempt_per_question` for the
+    shared read/validation this delegates to.
+    """
+    latest_by_question = _get_latest_attempt_per_question(session, topic_id)
     return [latest_by_question[q]["credit"] for q in range(1, 6)]
 
 
@@ -678,16 +734,23 @@ def complete_topic_verification(
     topic_id: str,
     days_taken: int,
     days_expected: int,
+    is_test_out: bool = False,
 ) -> TopicCompletionResult:
     """Called once all 5 verification question slots for `topic_id` have
     resolved: computes `topic_score` from their final credits
     (`pace/calculator.py`), blends it with `timing_ratio` into the
     combined pace signal, persists a `pace_snapshots` row, and marks the
-    topic `completed` in `outline_topics` (PRD §7.7: "topic requires all
+    topic completed in `outline_topics` (PRD §7.7: "topic requires all
     5 questions passed... to complete").
 
+    `is_test_out`, when `True`, marks the topic `completed_test_out`
+    instead of `completed` (Architecture §5's schema: a distinct status
+    value, not a synonym) — `complete_topic_test_out` is the only caller
+    that passes `True`; every regular (non-test-out) caller is unaffected
+    by this parameter's default of `False`.
+
     Does NOT act on the resulting signal (extending pacing, triggering
-    enrichment) — that's the next task's job, per this task's explicit
+    enrichment) — that's a later task's job, per this task's explicit
     scope boundary; `pace/calculator.py`'s `detect_sustained_drift` is
     never called here.
 
@@ -706,13 +769,172 @@ def complete_topic_verification(
     write_pace_snapshot(
         session, user_id, topic_id, topic_score, timing_ratio, days_taken, days_expected
     )
-    mark_topic_completed(session, topic_id)
+    mark_topic_completed(
+        session,
+        topic_id,
+        status=COMPLETED_TEST_OUT_STATUS if is_test_out else COMPLETED_STATUS,
+    )
 
     return TopicCompletionResult(
         topic_score=topic_score,
         timing_ratio=timing_ratio,
         combined_pace_signal=combined_signal,
     )
+
+
+# --- Test-out: verification-first (PRD §7.6's exception) ---------------
+
+# Judgment call, flagged for review — resolved directly for this task,
+# not derivable from PRD/Architecture as written: "full pass" vs. "partial
+# pass" for test-out purposes is defined in terms of the *existing*
+# credit scale (`FULL_CREDIT`/`HALF_CREDIT`), not a new concept. A slot
+# that ultimately passed within the retry cap (on attempt 1, 2, or 3)
+# counts as a full pass for that question; a slot that only resolved via
+# the retry-cap teach-and-de-escalate path (`HALF_CREDIT`) counts as a
+# partial pass. "Full pass" for the whole topic means every one of the 5
+# slots individually full-passed. This mirrors PRD §7.7's own completion
+# rule ("all 5 questions passed, full or half credit, to complete") —
+# test-out does not introduce a second, competing definition of "passed."
+#
+# Reconsidered and corrected: a partial pass's `HALF_CREDIT` slot(s) are,
+# by construction, exactly the slot(s) that already fired
+# `_build_taught_answer_message` during `submit_verification_answer`'s own
+# 3rd-attempt de-escalation — there is no other way to reach `HALF_CREDIT`.
+# `generate_gap_study_content` was built, then deliberately NOT wired into
+# `complete_topic_test_out` below, because doing so would re-teach the
+# identical rubric (`grading_criteria`) a second time, worded differently,
+# in the same session, moments after the user already saw it — a genuine
+# double-remediation bug, not a richer second pass. `complete_topic_test_out`
+# relies entirely on that already-delivered teach-in; it generates nothing
+# further. `generate_gap_study_content` is kept, unwired, as a possible
+# building block for a future, non-test-out remediation flow (e.g. a
+# dedicated "review what you missed" feature outside the test-out path)
+# — not deleted, since it is not itself wrong, only wrong to call here.
+
+
+def _format_failed_questions_for_prompt(
+    failed_questions: list[VerificationQuestion],
+) -> str:
+    return "\n\n".join(
+        f"Gap {i}:\nQuestion: {q.question_text}\n"
+        f"What a correct answer needed: {q.grading_criteria}\n"
+        f"Source: {q.source_url}"
+        for i, q in enumerate(failed_questions, start=1)
+    )
+
+
+async def generate_gap_study_content(
+    failed_questions: list[VerificationQuestion],
+) -> str:
+    """Generate remedial study material scoped ONLY to specific
+    verification question(s) a user did not pass outright.
+
+    A new, purpose-built content path — distinct from
+    `generate_day_content`'s 7-step structure, which this function does
+    not call into or reuse in any way.
+
+    **Not currently called anywhere in this module.** It was built for
+    test-out's partial-pass path (PRD §7.6), then deliberately *not*
+    wired into `complete_topic_test_out` — see the module-level note
+    above this section for why: every question this function could be
+    given during test-out already received
+    `submit_verification_answer`'s inline teach-in
+    (`_build_taught_answer_message`) built from the exact same
+    `grading_criteria`, in the same session, moments earlier; calling
+    this function too would re-teach the identical rubric a second time
+    in different words, not add anything. Retained, unwired, as a
+    possible building block for a future *non*-test-out remediation flow
+    (e.g. a dedicated "review what you missed" feature) — not deleted,
+    since the function itself is sound, only wrong to call from
+    test-out.
+
+    Raises `ValueError` if `failed_questions` is empty. Raises
+    `GeminiCallError` if Gemini's response is malformed or has no usable
+    `study_content`.
+    """
+    if not failed_questions:
+        raise ValueError(
+            "generate_gap_study_content requires at least one failed question"
+        )
+    prompt = PROMPT_REGISTRY["gap_study_content_v1"].format(
+        gaps=_format_failed_questions_for_prompt(failed_questions)
+    )
+    parsed = await _call_gemini_json(
+        prompt, required_keys={"study_content"}, model=DAY_CONTENT_GEMINI_MODEL
+    )
+    content = parsed["study_content"]
+    if not isinstance(content, str) or not content.strip():
+        raise GeminiCallError(f"Gemini returned no usable 'study_content': {parsed!r}")
+    return content
+
+
+@dataclass(frozen=True)
+class TestOutResult:
+    """Result of a topic's test-out attempt (PRD §7.6's "verification-
+    first" exception: "for any topic, the user may trigger verification
+    first, before study content is generated").
+
+    `full_pass` is True exactly when every one of the 5 question slots
+    resolved at `FULL_CREDIT` (passed within the retry cap, on any
+    attempt) — see the module-level judgment-call note above this
+    section for why this reuses the existing credit scale rather than
+    introducing a new concept. When `full_pass` is False, the user has
+    already been taught the answer for the relevant slot(s) inline,
+    during the retry-cap attempts themselves (PRD §7.7) — this module
+    generates no further content for that case; see the module-level
+    note above for why a separate gap-study step was considered and
+    rejected as redundant.
+    """
+
+    completion: TopicCompletionResult
+    full_pass: bool
+
+
+async def complete_topic_test_out(
+    session: Session,
+    user_id: str,
+    topic_id: str,
+    days_taken: int,
+    days_expected: int,
+) -> TestOutResult:
+    """Resolve a topic via test-out (PRD §7.6's "verification-first"
+    exception): the user answers all 5 verification questions before any
+    study content is generated, using the identical
+    `begin_verification_question`/`submit_verification_answer` turn-based
+    path (same exactly-3-attempt retry cap, same attempt-counting shape)
+    regular verification uses — every attempt recorded with
+    `is_test_out=True`, not a separate mechanism. Call this once all 5
+    question slots have resolved (mirrors `complete_topic_verification`'s
+    own precondition, enforced the same way).
+
+    Full pass (every slot resolved at `FULL_CREDIT`) -> topic marked
+    `completed_test_out`, no study content generated at all (PRD §7.6).
+    Partial pass (>=1 slot resolved at `HALF_CREDIT`) -> topic still
+    marked `completed_test_out` (PRD §7.7's completion rule doesn't
+    distinguish full/half credit for completion purposes — test-out
+    doesn't either), and **this function generates nothing further**:
+    every `HALF_CREDIT` slot already received
+    `submit_verification_answer`'s inline teach-in
+    (`_build_taught_answer_message`) during the retry-cap attempt itself,
+    moments before this function is ever called. A separate gap-study
+    generation step (`generate_gap_study_content`, built but deliberately
+    left unwired here) was considered and rejected: it would have
+    re-derived prose from the identical `grading_criteria` the teach-in
+    already used, in the same session, teaching the same fact twice in
+    different words. See the module-level note above this section.
+
+    Raises `ValueError` (via `_get_final_credits_per_question`) if the
+    topic's 5 question slots aren't all genuinely resolved yet, or if
+    `days_expected` isn't positive.
+    """
+    credits = _get_final_credits_per_question(session, topic_id)
+    full_pass = all(credit == FULL_CREDIT for credit in credits)
+
+    completion = complete_topic_verification(
+        session, user_id, topic_id, days_taken, days_expected, is_test_out=True
+    )
+
+    return TestOutResult(completion=completion, full_pass=full_pass)
 
 
 def generate_closing_note(user_id: str) -> str:

@@ -23,12 +23,16 @@ from sqlalchemy.orm import Session
 from models.schemas import OutlineTopic
 from security.output_guard import ConfidenceTier
 
-# Matches Architecture §5's `status TEXT` column comment. Duplicated here
-# (not imported from `agents/research_outline_agent.py`, which also
-# defines `NOT_STARTED_STATUS`) deliberately: data/ modules do not import
-# from agents/ (see `SequencedOutlineTopic` below) — agents call this
-# module as a tool, never the other way around.
+# Match Architecture §5's `status TEXT` column comment
+# (`not_started | in_progress | completed | completed_test_out`) exactly.
+# `NOT_STARTED_STATUS` duplicated here rather than imported from
+# `agents/research_outline_agent.py` (which also defines it) deliberately:
+# data/ modules do not import from agents/ (see `SequencedOutlineTopic`
+# below) — agents call this module as a tool, never the other way around.
 NOT_STARTED_STATUS = "not_started"
+COMPLETED_STATUS = "completed"
+COMPLETED_TEST_OUT_STATUS = "completed_test_out"
+_VALID_COMPLETION_STATUSES = frozenset({COMPLETED_STATUS, COMPLETED_TEST_OUT_STATUS})
 
 
 @runtime_checkable
@@ -120,17 +124,33 @@ def get_topics_in_group(
     return [_to_dict(row) for row in rows]
 
 
-def mark_topic_completed(session: Session, topic_id: str) -> None:
-    """Mark a topic `completed` and stamp `completed_at` — called once
-    all 5 verification question slots have resolved (PRD §7.7).
+def mark_topic_completed(
+    session: Session, topic_id: str, status: str = COMPLETED_STATUS
+) -> None:
+    """Mark a topic completed and stamp `completed_at` — called once all
+    5 verification question slots have resolved (PRD §7.7), whether via
+    regular day-by-day coaching or test-out (PRD's day-by-day coaching
+    section's "verification-first" exception).
 
-    Raises `ValueError` if `topic_id` does not exist. Commits the
-    transaction.
+    `status` defaults to `COMPLETED_STATUS` ("completed"); the test-out
+    task added `COMPLETED_TEST_OUT_STATUS` ("completed_test_out") as an
+    explicit alternative — Architecture §5's schema lists it as a
+    distinct value from `completed`, not a synonym, so
+    `agents/coaching_pace_agent.py`'s test-out completion path passes it
+    explicitly rather than this function silently collapsing the two.
+
+    Raises `ValueError` if `topic_id` does not exist, or if `status` is
+    not one of the two recognized completion values.
     """
+    if status not in _VALID_COMPLETION_STATUSES:
+        raise ValueError(
+            f"status must be one of {sorted(_VALID_COMPLETION_STATUSES)}, "
+            f"got {status!r}"
+        )
     row = session.get(OutlineTopic, topic_id)
     if row is None:
         raise ValueError(f"outline topic {topic_id!r} not found")
-    row.status = "completed"
+    row.status = status
     row.completed_at = datetime.now(UTC).replace(tzinfo=None, microsecond=0)
     session.commit()
 

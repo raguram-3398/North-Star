@@ -9,8 +9,11 @@ for Neon Postgres, and `OutlineTopic.id` uses a Postgres-specific
 `sqlalchemy.dialects.postgresql.UUID` column type a SQLite engine
 couldn't run anyway.
 
-`get_topic`/`get_topics_in_group`/`mark_topic_completed` are pre-existing,
-untouched by this task, and out of scope here.
+`get_topic`/`get_topics_in_group` are pre-existing and out of scope here.
+`mark_topic_completed` gained an optional `status` parameter as part of
+the test-out (verification-first) task — see the dedicated tests below —
+but its pre-existing default-`"completed"` behavior is otherwise
+unchanged.
 """
 
 from types import SimpleNamespace
@@ -19,7 +22,13 @@ from unittest.mock import MagicMock
 import pytest
 
 from agents.research_outline_agent import InitialOutlineTopic
-from data.outline_topics import NOT_STARTED_STATUS, insert_outline_topics
+from data.outline_topics import (
+    COMPLETED_STATUS,
+    COMPLETED_TEST_OUT_STATUS,
+    NOT_STARTED_STATUS,
+    insert_outline_topics,
+    mark_topic_completed,
+)
 from security.output_guard import ConfidenceTier
 
 
@@ -165,4 +174,41 @@ def test_insert_outline_topics_rejects_a_raw_dict_in_place_of_a_topic_object() -
         insert_outline_topics(session, "user-1", [raw_dict_topic])  # type: ignore[list-item]
 
     session.add_all.assert_not_called()
+    session.commit.assert_not_called()
+
+
+def test_mark_topic_completed_defaults_to_completed_status() -> None:
+    session = MagicMock()
+    row = SimpleNamespace(status=NOT_STARTED_STATUS, completed_at=None)
+    session.get.return_value = row
+
+    mark_topic_completed(session, "t1")
+
+    assert row.status == COMPLETED_STATUS
+    assert row.completed_at is not None
+    session.commit.assert_called_once()
+
+
+def test_mark_topic_completed_accepts_completed_test_out_status() -> None:
+    """The test-out task's reason for adding this parameter: Architecture
+    §5 lists `completed_test_out` as a schema value distinct from
+    `completed`, not a synonym — a test-out full/partial pass must write
+    that specific value, not the regular one."""
+    session = MagicMock()
+    row = SimpleNamespace(status=NOT_STARTED_STATUS, completed_at=None)
+    session.get.return_value = row
+
+    mark_topic_completed(session, "t1", status=COMPLETED_TEST_OUT_STATUS)
+
+    assert row.status == COMPLETED_TEST_OUT_STATUS
+    session.commit.assert_called_once()
+
+
+def test_mark_topic_completed_rejects_an_unrecognized_status() -> None:
+    session = MagicMock()
+    session.get.return_value = SimpleNamespace(status=NOT_STARTED_STATUS)
+
+    with pytest.raises(ValueError):
+        mark_topic_completed(session, "t1", status="something_else")
+
     session.commit.assert_not_called()
