@@ -13,6 +13,12 @@ dependencies = [
     # Agent framework
     "google-adk>=2.3.0",
 
+    # MCP client SDK — google-adk's MCP toolset (google.adk.tools.mcp_tool)
+    # imports this directly (ClientSession, streamablehttp_client, etc.) but
+    # does not declare it as its own dependency; required explicitly for the
+    # Himalayas MCP connection (Architecture_North_Star.md §1/§6).
+    "mcp>=1.28.1",
+
     # LLM (Updated to Google's official unified GenAI SDK)
     "google-genai>=1.0.0",
 
