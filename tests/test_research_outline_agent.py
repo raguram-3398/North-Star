@@ -1,6 +1,8 @@
 """Tests for agents/research_outline_agent.py's `ground_role` — the
 cross-validation/grounding orchestrator (Architecture §3's "cross-
-validation normalization judgment").
+validation normalization judgment") — and its `begin_clarify_gate`/
+`advance_clarify_gate` — the Clarify Gate's conversational half (PRD
+§7.2).
 
 Himalayas MCP and Tavily are both mocked with small fake clients rather
 than a real McpToolset/TavilyClient, so these tests are fast, offline,
@@ -14,12 +16,22 @@ data/cross_validation.py's TAVILY_DISTINCT_SKILLS_TRUST_THRESHOLD (real
 vocabulary terms vs. generic prose), since that's what now decides
 Tavily's own signal, not `score`.
 
+The clarify-gate tests mock Gemini with a small fake client (`_FakeGemini*`
+below) rather than a real `google.genai.Client`, for the same reason —
+fast, offline, deterministic, and focused on this module's own
+orchestration logic (dispatch on ClarifyGateStage, context threading, the
+ACCEPT_OWN_WORDS original-goal-not-latest-message rule) rather than on
+Gemini's actual behavior. `ground_role` itself is mocked directly in
+these tests (it already has its own dedicated tests above) so the
+clarify-gate tests aren't re-exercising Himalayas/Tavily mocking too.
+
 Patches target `agents.research_outline_agent.<name>` (where each name is
 *used*), not where it's defined — CLAUDE.md's flagged
 wrong-patch-target anti-pattern.
 """
 
 import asyncio
+import json
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -29,7 +41,9 @@ from tavily.errors import InvalidAPIKeyError
 
 import agents.research_outline_agent as roa
 from data.grounding_fallback import CachedFallbackResult, GeneralKnowledgeFloorResult
+from security.input_gate import ClarifyGateStage, ClarifyGateState
 from security.output_guard import ConfidenceTier, ValidatedGroundedContent
+from utils.exceptions import ClarifyGateLLMError
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -525,3 +539,363 @@ async def test_safe_fetch_tavily_distinguishes_call_failed_from_no_signal(
     )
     _, signal_status = await roa._safe_fetch_tavily("Data Analyst")
     assert signal_status == "signal"
+
+
+# --- Clarify Gate conversational content: begin_clarify_gate / advance_clarify_gate ---
+
+
+class _FakeGeminiResponse:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
+class _FakeGeminiModels:
+    """Returns each of `responses` in order, one per call. Raises
+    `AssertionError` (a test-authoring bug, not a code-under-test bug) if
+    a test calls the fake client more times than it queued responses for.
+    """
+
+    def __init__(
+        self,
+        responses: list[str] | None = None,
+        raise_exc: Exception | None = None,
+        sleep_seconds: float = 0.0,
+    ) -> None:
+        self._responses = list(responses or [])
+        self._raise_exc = raise_exc
+        self._sleep_seconds = sleep_seconds
+        self.calls: list[dict] = []
+
+    async def generate_content(self, *, model: str, contents: str, config=None):
+        self.calls.append({"model": model, "contents": contents, "config": config})
+        if self._sleep_seconds:
+            await asyncio.sleep(self._sleep_seconds)
+        if self._raise_exc is not None:
+            raise self._raise_exc
+        if not self._responses:
+            raise AssertionError(
+                "_FakeGeminiModels ran out of queued responses — the test "
+                "queued fewer canned responses than the code under test "
+                "actually calls Gemini"
+            )
+        return _FakeGeminiResponse(self._responses.pop(0))
+
+
+class _FakeGeminiAio:
+    def __init__(self, models: _FakeGeminiModels) -> None:
+        self.models = models
+
+
+class _FakeGeminiClient:
+    def __init__(
+        self,
+        responses: list[str] | None = None,
+        raise_exc: Exception | None = None,
+        sleep_seconds: float = 0.0,
+    ) -> None:
+        self.aio = _FakeGeminiAio(
+            _FakeGeminiModels(responses, raise_exc, sleep_seconds)
+        )
+
+
+def _patch_gemini(
+    monkeypatch: pytest.MonkeyPatch,
+    responses: list[str] | None = None,
+    raise_exc: Exception | None = None,
+    sleep_seconds: float = 0.0,
+) -> _FakeGeminiClient:
+    client = _FakeGeminiClient(
+        responses=responses, raise_exc=raise_exc, sleep_seconds=sleep_seconds
+    )
+    monkeypatch.setattr(roa, "_get_gemini_client", lambda: client)
+    return client
+
+
+def _agent_turn(content: str) -> dict:
+    return {"role": "agent", "content": content}
+
+
+def _user_turn(content: str) -> dict:
+    return {"role": "user", "content": content}
+
+
+REFERENCE_TIME = datetime(2026, 7, 5, 12, 0, 0)
+
+
+async def test_begin_clarify_gate_real_role_resolves_without_any_gemini_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PRD §7.2: 'Clearly real role -> accept, proceed to Research' — no
+    LLM call is needed at all, since classification is fully deterministic
+    (security/input_gate.py).
+    """
+    client = _patch_gemini(monkeypatch, responses=[])
+
+    turn = await roa.begin_clarify_gate("Data Analyst")
+
+    assert turn.gate_state.stage is ClarifyGateStage.RESOLVED
+    assert turn.resolved_role == "Data Analyst"
+    assert not turn.exited
+    assert client.aio.models.calls == []
+
+
+async def test_begin_clarify_gate_nonsense_loops_back_without_any_gemini_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PRD §7.2: nonsense routes to 'ask to clarify' — a loop, not an
+    exit — and does not consume a narrowing round.
+    """
+    client = _patch_gemini(monkeypatch, responses=[])
+
+    turn = await roa.begin_clarify_gate("asdkjfh")
+
+    assert turn.gate_state.stage is ClarifyGateStage.NARROWING
+    assert turn.gate_state.narrowing_rounds_used == 0
+    assert turn.resolved_role is None
+    assert not turn.exited
+    assert turn.message == roa.CLARIFY_GATE_NONSENSE_REPROMPT
+    assert client.aio.models.calls == []
+
+
+async def test_begin_clarify_gate_vague_asks_one_narrowing_question(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PRD §7.2: vague-but-genuine enters the narrowing loop with one
+    question at a time.
+    """
+    client = _patch_gemini(
+        monkeypatch, responses=["What kind of apps do you want to build?"]
+    )
+
+    turn = await roa.begin_clarify_gate("I want to make apps")
+
+    assert turn.gate_state.stage is ClarifyGateStage.NARROWING
+    assert turn.gate_state.narrowing_rounds_used == 0
+    assert turn.message == "What kind of apps do you want to build?"
+    assert turn.context.original_stated_goal == "I want to make apps"
+    assert len(client.aio.models.calls) == 1
+
+
+async def test_advance_clarify_gate_narrowing_round_resolves_immediately(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A narrowing answer that resolves a concrete role moves straight to
+    RESOLVED regardless of rounds used so far (mirrors
+    tests/test_input_gate.py's `advance_after_narrowing_round` case).
+    """
+    _patch_gemini(
+        monkeypatch,
+        responses=[json.dumps({"resolved": True, "role": "Backend Engineer"})],
+    )
+    gate_state = roa.ClarifyGateState(
+        stage=ClarifyGateStage.NARROWING, narrowing_rounds_used=0
+    )
+    context = roa.ClarifyGateContext(original_stated_goal="I want to make apps")
+    conversation = [_agent_turn("What kind of apps?")]
+
+    turn = await roa.advance_clarify_gate(
+        gate_state,
+        context,
+        conversation,
+        "Backend stuff, APIs and databases",
+        session=MagicMock(),
+        reference_time=REFERENCE_TIME,
+    )
+
+    assert turn.gate_state.stage is ClarifyGateStage.RESOLVED
+    assert turn.resolved_role == "Backend Engineer"
+
+
+async def test_full_clarify_gate_sequence_rejects_proposal_and_explanation_then_exits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end Gherkin: vague goal -> two unresolved narrowing rounds
+    (bound reached) -> best-guess proposal rejected -> explanation
+    rejected -> grounding check on the user's ORIGINAL words -> zero
+    market signal -> exit, no outline built.
+    """
+    client = _patch_gemini(
+        monkeypatch,
+        responses=[
+            "What area of app development interests you?",  # narrowing Q1
+            json.dumps({"resolved": False, "role": None}),  # eval answer 1
+            "Do you prefer frontend or backend work?",  # narrowing Q2
+            json.dumps({"resolved": False, "role": None}),  # eval answer 2
+            json.dumps(
+                {
+                    "role": "Backend Engineer",
+                    "message": "Sounds like Backend Engineer — right?",
+                }
+            ),  # best-guess proposal
+            json.dumps({"accepted": False}),  # proposal rejected
+            "Backend engineers build server-side logic and APIs.",  # explanation
+            json.dumps({"accepted": False}),  # explanation rejected
+        ],
+    )
+    ground_role_mock = MagicMock(
+        return_value=roa.GeneralKnowledgeFloorResult(
+            role_name="I want to make apps",
+            confidence=ConfidenceTier.GENERAL_KNOWLEDGE_ONLY,
+            label="No cached or live market data is available.",
+        )
+    )
+
+    async def _fake_ground_role(role_name, session, reference_time):
+        return ground_role_mock(role_name, session, reference_time)
+
+    monkeypatch.setattr(roa, "ground_role", _fake_ground_role)
+
+    turn = await roa.begin_clarify_gate("I want to make apps")
+    assert turn.gate_state.stage is ClarifyGateStage.NARROWING
+    assert turn.gate_state.narrowing_rounds_used == 0
+    conversation = [_agent_turn(turn.message)]
+
+    turn = await roa.advance_clarify_gate(
+        turn.gate_state,
+        turn.context,
+        conversation,
+        "I don't really know yet",
+        session=MagicMock(),
+        reference_time=REFERENCE_TIME,
+    )
+    assert turn.gate_state.stage is ClarifyGateStage.NARROWING
+    assert turn.gate_state.narrowing_rounds_used == 1
+    conversation += [_user_turn("I don't really know yet"), _agent_turn(turn.message)]
+
+    turn = await roa.advance_clarify_gate(
+        turn.gate_state,
+        turn.context,
+        conversation,
+        "still not sure",
+        session=MagicMock(),
+        reference_time=REFERENCE_TIME,
+    )
+    assert turn.gate_state.stage is ClarifyGateStage.PROPOSE_BEST_GUESS
+    assert turn.gate_state.narrowing_rounds_used == 2
+    assert turn.context.proposed_role == "Backend Engineer"
+    conversation += [_user_turn("still not sure"), _agent_turn(turn.message)]
+
+    turn = await roa.advance_clarify_gate(
+        turn.gate_state,
+        turn.context,
+        conversation,
+        "no, that's not it",
+        session=MagicMock(),
+        reference_time=REFERENCE_TIME,
+    )
+    assert turn.gate_state.stage is ClarifyGateStage.EXPLAIN_ROLE
+    conversation += [_user_turn("no, that's not it"), _agent_turn(turn.message)]
+
+    turn = await roa.advance_clarify_gate(
+        turn.gate_state,
+        turn.context,
+        conversation,
+        "nope, still not right",
+        session=MagicMock(),
+        reference_time=REFERENCE_TIME,
+    )
+
+    assert turn.gate_state.stage is ClarifyGateStage.EXITED
+    assert turn.exited is True
+    assert turn.resolved_role is None
+    assert "I want to make apps" in turn.message
+    ground_role_mock.assert_called_once()
+    assert ground_role_mock.call_args.args[0] == "I want to make apps"
+    assert len(client.aio.models.calls) == 8
+
+
+async def test_advance_clarify_gate_resolves_at_low_confidence_on_weak_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same rejection path, but any market signal (even weak) resolves at
+    low confidence instead of exiting (PRD §7.2), grounding the user's
+    ORIGINAL stated goal, never the most recent message."""
+    _patch_gemini(monkeypatch, responses=[json.dumps({"accepted": False})])
+
+    async def _fake_ground_role(role_name, session, reference_time):
+        assert role_name == "something with computers"
+        return roa.LiveGroundingResult(
+            role_name=role_name,
+            skills=[],
+            confidence=ConfidenceTier.LOW,
+            has_conflict=False,
+            himalayas_status="no_signal",
+            tavily_status="signal",
+        )
+
+    monkeypatch.setattr(roa, "ground_role", _fake_ground_role)
+
+    gate_state = ClarifyGateState(
+        stage=ClarifyGateStage.EXPLAIN_ROLE, narrowing_rounds_used=2
+    )
+    context = roa.ClarifyGateContext(
+        original_stated_goal="something with computers",
+        proposed_role="Computer Repair Technician",
+    )
+    conversation = [_agent_turn("Computer repair techs fix hardware. Sound right?")]
+
+    turn = await roa.advance_clarify_gate(
+        gate_state,
+        context,
+        conversation,
+        "not really",
+        session=MagicMock(),
+        reference_time=REFERENCE_TIME,
+    )
+
+    assert turn.gate_state.stage is ClarifyGateStage.RESOLVED
+    assert turn.resolved_role == "something with computers"
+    assert not turn.exited
+
+
+async def test_advance_clarify_gate_rejects_terminal_stage() -> None:
+    resolved_state = ClarifyGateState(
+        stage=ClarifyGateStage.RESOLVED, narrowing_rounds_used=1
+    )
+    context = roa.ClarifyGateContext(original_stated_goal="Data Analyst")
+
+    with pytest.raises(ValueError):
+        await roa.advance_clarify_gate(
+            resolved_state,
+            context,
+            [],
+            "anything",
+            session=MagicMock(),
+            reference_time=REFERENCE_TIME,
+        )
+
+
+async def test_last_agent_message_raises_without_a_prior_agent_turn() -> None:
+    with pytest.raises(ValueError):
+        roa._last_agent_message([_user_turn("hello")])
+
+
+async def test_gemini_json_helper_raises_clarify_gate_llm_error_on_malformed_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_gemini(monkeypatch, responses=["not valid json at all"])
+
+    with pytest.raises(ClarifyGateLLMError):
+        await roa._evaluate_acceptance("some proposal", "yes")
+
+
+async def test_gemini_json_helper_raises_clarify_gate_llm_error_on_missing_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_gemini(monkeypatch, responses=[json.dumps({"unexpected": "shape"})])
+
+    with pytest.raises(ClarifyGateLLMError):
+        await roa._evaluate_acceptance("some proposal", "yes")
+
+
+async def test_gemini_timeout_raises_clarify_gate_llm_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explicit timeout-path test (CLAUDE.md testing expectations), mirroring
+    test_himalayas_timeout_raises_grounding_source_call_error /
+    test_tavily_timeout_raises_grounding_source_call_error above."""
+    monkeypatch.setattr(roa, "EXTERNAL_CALL_TIMEOUT_SECONDS", 0.01)
+    _patch_gemini(monkeypatch, responses=["irrelevant"], sleep_seconds=0.2)
+
+    with pytest.raises(ClarifyGateLLMError):
+        await roa._generate_narrowing_question("Data stuff", [])

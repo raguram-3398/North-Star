@@ -1,22 +1,33 @@
-"""Clarify-gate bound/loop state and structural reject detection.
+"""Clarify-gate bound/loop state, first-pass stated-goal classification,
+and structural reject detection.
 
 Pure, deterministic, no LLM calls, no side effects (CLAUDE.md: pure
 functions stay pure). Per LLM Call Discipline, this runs on raw user
 input before it reaches any clarify-gate LLM call — never after any
 content-processing step that could corrupt the pattern it needs to catch.
 
-Tracks only the bounded-loop *mechanics* of PRD §7.2's Clarify Gate:
-narrowing rounds (bounded to ~2), then propose-best-guess -> explain-role
--> accept-own-words -> zero-signal-exit. The *content* of each narrowing
-question, proposal, and explanation is Agent 1's reasoning job
-(Architecture §3) — this module only knows what stage the loop is in, how
-many rounds have been used, and when it must terminate. Semantic
-classification of a stated goal (real / vague / nonsense) and of a user's
-free-text response (accepted / rejected) is likewise Agent 1's job; the
-booleans this module's functions take as input are assumed already
-decided by that reasoning step.
+Tracks the bounded-loop *mechanics* of PRD §7.2's Clarify Gate: narrowing
+rounds (bounded to ~2), then propose-best-guess -> explain-role ->
+accept-own-words -> zero-signal-exit. It also owns `classify_stated_goal`,
+the deterministic, lexical/plausibility first-pass classification of a raw
+stated goal into real / vague-but-genuine / nonsense (PRD §7.2) — a
+vocabulary- and pattern-based judgment call, never an LLM call and never a
+market-existence check: a niche-but-real role must never be gate-rejected
+just because this module hasn't seen it before (see
+`classify_stated_goal`'s docstring for the mechanism).
+
+Everything downstream of that first classification stays Agent 1's job
+(Architecture §3): the *content* of each narrowing question, proposal, and
+explanation, and — critically — interpreting whether a user's free-text
+reply to one of those *accepted or rejected* it. That interpretation is
+genuinely open-ended natural language, unlike the bounded first-pass
+classification above, which is why it stays an LLM reasoning task rather
+than being pulled into this module. The booleans this module's `advance_*`
+functions take as input are assumed already decided by that reasoning
+step.
 """
 
+import re
 from dataclasses import dataclass
 from enum import Enum
 
@@ -34,6 +45,16 @@ class ClarifyGateStage(Enum):
     EXITED = "exited"
 
 
+class GoalClassification(Enum):
+    """The first-pass, deterministic classification of a raw stated goal
+    (PRD §7.2's Gate behavior list) — see `classify_stated_goal`.
+    """
+
+    REAL = "real"
+    VAGUE = "vague"
+    NONSENSE = "nonsense"
+
+
 @dataclass(frozen=True)
 class ClarifyGateState:
     """Immutable snapshot of the clarify gate's loop state."""
@@ -43,14 +64,295 @@ class ClarifyGateState:
 
 
 def detect_reject(raw_input: str) -> bool:
-    """Detect a structural reject condition in raw user input — blank or
-    whitespace-only text with no content to narrow on — per PRD §7.2.
+    """Detect blank/whitespace-only raw input — the narrowest possible
+    reject condition, with no content to classify at all.
 
-    This is deliberately narrow: semantic judgment of whether a
-    *non-blank* stated goal is a real role, vague-but-genuine, or clearly
-    nonsense is Agent 1's reasoning job, not this module's.
+    Used as `classify_stated_goal`'s first check; kept as its own function
+    since it is also meaningful on its own wherever only a blank/non-blank
+    distinction is needed, not a full classification.
     """
     return not raw_input.strip()
+
+
+_VOWELS = frozenset("aeiou")
+
+# Real short tech/professional acronyms that would otherwise fail the
+# consonant-run check below purely for lacking a vowel — a phonetic
+# heuristic alone can't distinguish "UX" from keyboard mash without an
+# allowlist. Judgment call; extend as real usage surfaces gaps.
+_VOWELLESS_REAL_WORDS = frozenset(
+    {
+        "ux",
+        "ui",
+        "it",
+        "hr",
+        "qa",
+        "pr",
+        "db",
+        "os",
+        "vr",
+        "ar",
+        "ci",
+        "cd",
+        "sdk",
+        "api",
+        "css",
+        "sql",
+        "http",
+        "url",
+        "vp",
+    }
+)
+
+# A run of this many consecutive consonants is treated as implausible for
+# genuine English (rare real exceptions like "strengths" exist, but this
+# is a narrow, low-stakes lexical filter, not a dictionary) — the
+# mechanism that catches "asdkjfh"-style mash even though it contains a
+# vowel and so cannot be caught by a bare vowel-presence check alone.
+_MAX_PLAUSIBLE_CONSONANT_RUN = 4
+
+# Single-word inputs that signal genuine (if vague) tech/career interest —
+# accepted into the narrowing loop rather than rejected as an unrelated
+# non-goal word (PRD §7.2's "AI", "coding" examples). Includes bare
+# occupation nouns (a lone "Engineer" or "Analyst" is a vague-but-genuine
+# goal, not nonsense) and a few of the most commonly stated single-word
+# skills. Coarse, vocabulary-based judgment call — same status as
+# data/tavily_parser.py's TECH_SKILL_VOCABULARY, flagged for tuning as
+# real usage is observed, not presented as exhaustive.
+_ROLE_NOUN_SUFFIXES = frozenset(
+    {
+        "engineer",
+        "developer",
+        "analyst",
+        "manager",
+        "officer",
+        "specialist",
+        "designer",
+        "architect",
+        "scientist",
+        "administrator",
+        "consultant",
+        "coordinator",
+        "director",
+        "technician",
+        "strategist",
+        "lead",
+        "advocate",
+        "programmer",
+    }
+)
+
+_VAGUE_TECH_SINGLE_WORDS = frozenset(
+    {
+        "ai",
+        "ml",
+        "coding",
+        "code",
+        "coder",
+        "programming",
+        "software",
+        "hardware",
+        "tech",
+        "technology",
+        "data",
+        "it",
+        "computers",
+        "computer",
+        "computing",
+        "web",
+        "apps",
+        "app",
+        "development",
+        "developer",
+        "dev",
+        "devops",
+        "cybersecurity",
+        "cyber",
+        "security",
+        "networking",
+        "networks",
+        "robotics",
+        "automation",
+        "cloud",
+        "database",
+        "databases",
+        "hacking",
+        "engineering",
+        "python",
+        "java",
+        "javascript",
+        "html",
+        "css",
+    }
+    | _ROLE_NOUN_SUFFIXES
+)
+
+# Additional keywords (beyond the single-word set above) that mark a
+# longer, multi-word phrase as genuine vague tech interest — e.g.
+# "something with computers", "fixing things on my laptop".
+_VAGUE_TECH_PHRASE_KEYWORDS = _VAGUE_TECH_SINGLE_WORDS | frozenset(
+    {
+        "laptop",
+        "laptops",
+        "phone",
+        "phones",
+        "gadget",
+        "gadgets",
+        "internet",
+        "website",
+        "websites",
+        "program",
+        "programs",
+        "electronics",
+        "circuits",
+        "machine",
+        "machines",
+        "algorithm",
+        "algorithms",
+    }
+)
+
+# Vocabulary that marks an otherwise title-shaped phrase as a joke/
+# fabricated title rather than a real one (PRD §7.2's "Dragon Whisperer",
+# "Chief Vibes Officer") — lexical-implausibility judgment only, never a
+# market-existence check. Necessarily a small, curated, non-exhaustive
+# denylist: a fabricated title this list doesn't recognize fails open to
+# REAL rather than wrongly rejecting an unfamiliar-but-real title, which
+# is the safer failure direction per PRD §7.2's explicit instruction to
+# never gate-reject a niche/obscure real role.
+_FABRICATED_TITLE_MARKERS = frozenset(
+    {
+        "vibes",
+        "vibe",
+        "dragon",
+        "whisperer",
+        "wizard",
+        "wizardry",
+        "ninja",
+        "guru",
+        "rockstar",
+        "unicorn",
+        "jedi",
+        "sorcerer",
+        "overlord",
+        "superhero",
+        "magic",
+        "magician",
+        "sparkle",
+        "fairy",
+        "genie",
+    }
+)
+
+
+def _looks_like_a_word(token: str) -> bool:
+    """Crude lexical plausibility check: does `token` read as an actual
+    word rather than keyboard mash?
+
+    A token with no vowel anywhere is mash unless it's a known vowelless
+    acronym (`_VOWELLESS_REAL_WORDS`). A token *with* a vowel can still be
+    mash — "asdkjfh" contains one 'a' — so this also rejects any run of
+    `_MAX_PLAUSIBLE_CONSONANT_RUN`-or-more consecutive consonants, which a
+    bare vowel-presence check alone cannot catch.
+    """
+    folded = token.casefold()
+    if folded in _VOWELLESS_REAL_WORDS:
+        return True
+    if not any(c in _VOWELS for c in folded):
+        return False
+    consonant_run = 0
+    for char in folded:
+        if char.isalpha() and char not in _VOWELS:
+            consonant_run += 1
+            if consonant_run >= _MAX_PLAUSIBLE_CONSONANT_RUN:
+                return False
+        else:
+            consonant_run = 0
+    return True
+
+
+def classify_stated_goal(raw_input: str) -> GoalClassification:
+    """First-pass, deterministic classification of a raw stated career
+    goal (PRD §7.2's Gate behavior list) into `REAL` / `VAGUE` / `NONSENSE`.
+
+    Purely lexical/plausibility judgment — no LLM call, no market-existence
+    check. In particular this must never be used to decide whether a role
+    actually exists in the job market: that determination is deferred to
+    live grounding downstream (`data/cross_validation.py`), per PRD §7.2's
+    explicit instruction that real-but-obscure or niche job titles must
+    never be gate-rejected here however unfamiliar they are.
+
+    Classification mechanism, in order:
+    1. Blank/whitespace-only, or no alphabetic character at all (pure
+       digits/symbols/emoji, e.g. "1234!!!", emoji-only) -> `NONSENSE`.
+    2. No token in the input reads as an actual word at all (all tokens
+       are keyboard mash per `_looks_like_a_word`, e.g. "asdkjfh") ->
+       `NONSENSE`.
+    3. A single-word input: `VAGUE` if the word is in the tech/career
+       vocabulary (`_VAGUE_TECH_SINGLE_WORDS`, e.g. "AI", "coding", a bare
+       occupation noun like "Engineer"); otherwise `NONSENSE` — a single
+       real word with no tech/career connection at all (PRD §7.2's
+       "banana", "purple" examples).
+    4. A multi-word input ending in a recognized occupation noun
+       (`_ROLE_NOUN_SUFFIXES`, e.g. "...Engineer", "...Analyst") is
+       title-shaped: `NONSENSE` if it also contains a fabricated-title
+       marker (`_FABRICATED_TITLE_MARKERS`, e.g. "Chief Vibes Officer"),
+       else `REAL` — this is what lets a title this module has never seen
+       before (e.g. "Site Reliability Engineer") through as real rather
+       than nonsense or vague, per PRD §7.2's niche-title instruction.
+    5. Not title-shaped, but contains a fabricated-title marker anyway
+       (e.g. "Dragon Whisperer", which doesn't end in an occupation noun
+       at all) -> `NONSENSE`.
+    6. Not title-shaped, no fabricated marker, but contains a recognized
+       tech/career keyword anywhere (`_VAGUE_TECH_PHRASE_KEYWORDS`, e.g.
+       "something with computers", "data stuff") -> `VAGUE`.
+    7. None of the above: a well-formed multi-word phrase with no title
+       structure and no lexical connection to the product's domain at
+       all. Not covered by any of PRD §7.2's worked examples; treated as
+       `NONSENSE` rather than silently starting a narrowing loop on a
+       statement with no domain connection whatsoever. Flagged as a
+       genuine, revisable judgment call for this uncovered case, not a
+       settled reading.
+    """
+    if detect_reject(raw_input):
+        return GoalClassification.NONSENSE
+
+    text = raw_input.strip()
+    if not any(c.isalpha() for c in text):
+        return GoalClassification.NONSENSE
+
+    words = re.findall(r"[A-Za-z']+", text)
+    if not words:
+        return GoalClassification.NONSENSE
+
+    folded_words = [w.casefold() for w in words]
+
+    if not any(_looks_like_a_word(w) for w in folded_words):
+        return GoalClassification.NONSENSE
+
+    if len(folded_words) == 1:
+        single = folded_words[0]
+        if single in _VAGUE_TECH_SINGLE_WORDS:
+            return GoalClassification.VAGUE
+        return GoalClassification.NONSENSE
+
+    ends_with_role_noun = folded_words[-1] in _ROLE_NOUN_SUFFIXES
+    has_fabricated_marker = any(w in _FABRICATED_TITLE_MARKERS for w in folded_words)
+
+    if ends_with_role_noun:
+        return (
+            GoalClassification.NONSENSE
+            if has_fabricated_marker
+            else GoalClassification.REAL
+        )
+
+    if has_fabricated_marker:
+        return GoalClassification.NONSENSE
+
+    if any(w in _VAGUE_TECH_PHRASE_KEYWORDS for w in folded_words):
+        return GoalClassification.VAGUE
+
+    return GoalClassification.NONSENSE
 
 
 def start_clarify_gate() -> ClarifyGateState:

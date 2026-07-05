@@ -57,3 +57,16 @@ class GroundingSourceCallError(Exception):
     so the two cases stay distinguishable in logs/tests rather than
     silently collapsing into one code path by accident.
     """
+
+
+class ClarifyGateLLMError(Exception):
+    """Raised by agents/research_outline_agent.py's clarify-gate turn
+    functions when a Gemini call itself fails (connection error,
+    non-success response, or exceeding its explicit timeout) or when the
+    response cannot be parsed into the structured shape the caller
+    requires (e.g. malformed JSON, or a required field missing from an
+    otherwise-parsed object). Distinct from a genuinely ambiguous or
+    negative *interpretation* of the model's output (e.g. the model
+    honestly reports it could not resolve a role) — that is expected,
+    handled conversational content, not an error.
+    """

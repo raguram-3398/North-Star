@@ -1,0 +1,47 @@
+## Salary Data for "frontend engineer"
+
+**Frontend Engineer** (Senior) — United States
+  💰 Min: $85,000 | Median: $167,600 | Max: $250,200 USD/year
+  📊 Based on 64 data points
+
+**Frontend Engineer** (Mid-level) — Italy
+  💰 Min: $45,541 | Median: $54,080 | Max: $62,619 USD/year
+  📊 Based on 4 data points
+
+**Frontend Engineer** (Mid-level) — United States
+  💰 Min: $120,000 | Median: $160,000 | Max: $200,000 USD/year
+  📊 Based on 2 data points
+
+**Frontend Engineer** (Entry-level) — Italy
+  💰 Min: $45,541 | Median: $54,080 | Max: $62,619 USD/year
+  📊 Based on 2 data points
+
+**Frontend Engineer** (Mid-level) — Spain
+  💰 Min: $39,848 | Median: $51,233 | Max: $62,619 USD/year
+  📊 Based on 8 data points
+
+**Frontend Engineer** (Mid-level) — United Kingdom
+  💰 Min: $59,383 | Median: $92,373 | Max: $125,364 USD/year
+  📊 Based on 10 data points
+
+**Frontend Engineer** (Mid-level) — Greece
+  💰 Min: $39,848 | Median: $48,387 | Max: $56,926 USD/year
+  📊 Based on 2 data points
+
+**Frontend Engineer** (Senior) — Spain
+  💰 Min: $45,541 | Median: $59,772 | Max: $74,004 USD/year
+  📊 Based on 2 data points
+
+**Frontend Engineer** (Senior) — Switzerland
+  💰 Min: $110,000 | Median: $110,000 | Max: $110,000 USD/year
+  📊 Based on 1 data points
+
+**Frontend Engineer** (Senior) — India
+  💰 Min: $34,972 | Median: $34,972 | Max: $34,972 USD/year
+  📊 Based on 1 data points
+
+**Frontend Engineer** (Senior) — Malta
+  💰 Min: $60,000 | Median: $60,000 | Max: $60,000 USD/year
+  📊 Based on 1 data points
+
+💰 **Explore more salaries:** https://himalayas.app/salaries?utm_source=mcp&utm_medium=api&utm_campaign=get_salary_data
