@@ -41,7 +41,12 @@ from tavily.errors import InvalidAPIKeyError
 
 import agents.research_outline_agent as roa
 from data.grounding_fallback import CachedFallbackResult, GeneralKnowledgeFloorResult
-from security.input_gate import ClarifyGateStage, ClarifyGateState
+from security.input_gate import (
+    ClarifyGateStage,
+    ClarifyGateState,
+    OutlineConfirmationStage,
+    OutlineConfirmationState,
+)
 from security.output_guard import ConfidenceTier, ValidatedGroundedContent
 from utils.exceptions import GeminiCallError
 
@@ -1139,3 +1144,389 @@ def test_build_grounded_skill_map_raises_on_duplicate_skill_name() -> None:
     duplicate = _grounded("Git", "https://git.example/2")
     with pytest.raises(ValueError):
         roa._build_grounded_skill_map([GIT_SKILL], [duplicate])
+
+
+# --- Outline Confirmation: begin_outline_confirmation / handle_review_turn ---
+
+
+async def _build_sample_topics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[roa.InitialOutlineTopic]:
+    """5 real topics across 3 groups (Git, Python, Django), built via the
+    already-tested create_initial_outline + the existing well-formed
+    hierarchy fixture above — avoids hand-constructing InitialOutlineTopic
+    instances that could drift from what the real function actually
+    produces.
+    """
+    _patch_gemini(monkeypatch, responses=[_WELL_FORMED_HIERARCHY_RESPONSE])
+    return await roa.create_initial_outline(
+        "Backend Engineer", [GIT_SKILL, PYTHON_SKILL], [DJANGO_SKILL]
+    )
+
+
+def _topic_explanations_response(topics: list[roa.InitialOutlineTopic]) -> str:
+    return json.dumps(
+        {
+            "topic_explanations": [
+                {
+                    "topic_name": t.topic_name,
+                    "explanation": f"Because of {t.topic_name}.",
+                }
+                for t in topics
+            ]
+        }
+    )
+
+
+async def test_begin_outline_confirmation_presents_grounded_why_reasoning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    topics = await _build_sample_topics(monkeypatch)
+
+    _patch_gemini(monkeypatch, responses=[_topic_explanations_response(topics)])
+    turn = await roa.begin_outline_confirmation("Backend Engineer", topics)
+
+    assert turn.state.stage is OutlineConfirmationStage.REVIEWING
+    assert turn.state.rounds_used == 0
+    assert turn.topics == topics
+    assert not turn.concluded
+    # every topic's real source_url must appear in the presentation —
+    # never fabricated, never dropped (CLAUDE.md guardrail #1)
+    for topic in topics:
+        assert topic.topic_name in turn.message
+        assert topic.source_url in turn.message
+
+
+async def test_generate_topic_explanations_raises_on_uncovered_topic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    topics = await _build_sample_topics(monkeypatch)
+    incomplete_response = json.dumps(
+        {
+            "topic_explanations": [
+                {"topic_name": topics[0].topic_name, "explanation": "Because reasons."}
+            ]
+        }
+    )
+    _patch_gemini(monkeypatch, responses=[incomplete_response])
+
+    with pytest.raises(GeminiCallError):
+        await roa._generate_topic_explanations("Backend Engineer", topics)
+
+
+async def test_generate_topic_explanations_raises_on_unknown_topic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    topics = await _build_sample_topics(monkeypatch)
+    response_with_fabricated_topic = json.dumps(
+        {
+            "topic_explanations": [
+                {"topic_name": t.topic_name, "explanation": "Because reasons."}
+                for t in topics
+            ]
+            + [{"topic_name": "Not A Real Topic", "explanation": "Made up."}]
+        }
+    )
+    _patch_gemini(monkeypatch, responses=[response_with_fabricated_topic])
+
+    with pytest.raises(GeminiCallError):
+        await roa._generate_topic_explanations("Backend Engineer", topics)
+
+
+async def test_handle_review_turn_question_does_not_consume_round(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    topics = await _build_sample_topics(monkeypatch)
+    state = OutlineConfirmationState(
+        stage=OutlineConfirmationStage.REVIEWING, rounds_used=0
+    )
+
+    _patch_gemini(
+        monkeypatch,
+        responses=[
+            json.dumps({"action": "question"}),
+            "Git is foundational for version control in this role.",
+        ],
+    )
+    turn = await roa.handle_review_turn(
+        state, "Backend Engineer", topics, "Why is Git in here?"
+    )
+
+    assert turn.state.stage is OutlineConfirmationStage.REVIEWING
+    assert turn.state.rounds_used == 0
+    assert turn.topics == topics
+    assert not turn.concluded
+
+
+async def test_handle_review_turn_question_never_consumes_a_round_even_repeated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    topics = await _build_sample_topics(monkeypatch)
+    state = OutlineConfirmationState(
+        stage=OutlineConfirmationStage.REVIEWING, rounds_used=0
+    )
+
+    for _ in range(4):
+        _patch_gemini(
+            monkeypatch,
+            responses=[json.dumps({"action": "question"}), "Here's the answer."],
+        )
+        turn = await roa.handle_review_turn(
+            state, "Backend Engineer", topics, "Another question?"
+        )
+        assert turn.state.rounds_used == 0
+        assert turn.state.stage is OutlineConfirmationStage.REVIEWING
+        state = turn.state
+
+
+async def test_handle_review_turn_concern_consumes_a_round(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    topics = await _build_sample_topics(monkeypatch)
+    state = OutlineConfirmationState(
+        stage=OutlineConfirmationStage.REVIEWING, rounds_used=0
+    )
+
+    _patch_gemini(
+        monkeypatch,
+        responses=[
+            json.dumps({"action": "concern"}),
+            "That's a fair point — here's some clarification.",
+        ],
+    )
+    turn = await roa.handle_review_turn(
+        state, "Backend Engineer", topics, "I'm worried this is too much Django."
+    )
+
+    assert turn.state.stage is OutlineConfirmationStage.REVIEWING
+    assert turn.state.rounds_used == 1
+    assert not turn.concluded
+
+
+async def test_handle_review_turn_addition_request_consumes_round_without_regenerating(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """handle_review_turn classifies and consumes the round for an
+    addition request, but does NOT regenerate the outline itself — topics
+    must come back unchanged; regeneration is a separate, explicit call
+    (regenerate_outline_with_addition) once the addition is grounded.
+    """
+    topics = await _build_sample_topics(monkeypatch)
+    state = OutlineConfirmationState(
+        stage=OutlineConfirmationStage.REVIEWING, rounds_used=0
+    )
+
+    _patch_gemini(monkeypatch, responses=[json.dumps({"action": "addition_request"})])
+    turn = await roa.handle_review_turn(
+        state, "Backend Engineer", topics, "Can you add GraphQL?"
+    )
+
+    assert turn.state.stage is OutlineConfirmationStage.REVIEWING
+    assert turn.state.rounds_used == 1
+    assert turn.topics == topics
+    assert not turn.concluded
+
+
+async def test_handle_review_turn_confirm_ends_review_immediately(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    topics = await _build_sample_topics(monkeypatch)
+    state = OutlineConfirmationState(
+        stage=OutlineConfirmationStage.REVIEWING, rounds_used=1
+    )
+
+    _patch_gemini(monkeypatch, responses=[json.dumps({"action": "confirm"})])
+    turn = await roa.handle_review_turn(
+        state, "Backend Engineer", topics, "Looks great, let's start!"
+    )
+
+    assert turn.state.stage is OutlineConfirmationStage.CONFIRMED
+    assert turn.concluded
+    assert turn.message == roa.OUTLINE_CONFIRMATION_CONFIRMED_MESSAGE
+
+
+async def test_handle_review_turn_round_bound_reached_after_two_concerns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bound-exhausted exit: after exactly 2 round-consuming actions, the
+    loop concludes and the response is framed 'starting here, refine as
+    we go' — never exceeding the 2-round bound.
+    """
+    topics = await _build_sample_topics(monkeypatch)
+    state = OutlineConfirmationState(
+        stage=OutlineConfirmationStage.REVIEWING, rounds_used=0
+    )
+
+    _patch_gemini(
+        monkeypatch,
+        responses=[json.dumps({"action": "concern"}), "First response."],
+    )
+    turn = await roa.handle_review_turn(
+        state, "Backend Engineer", topics, "First concern"
+    )
+    assert turn.state.rounds_used == 1
+    assert not turn.concluded
+
+    _patch_gemini(
+        monkeypatch,
+        responses=[json.dumps({"action": "concern"}), "Second response."],
+    )
+    turn = await roa.handle_review_turn(
+        turn.state, "Backend Engineer", topics, "Second concern"
+    )
+
+    assert turn.state.stage is OutlineConfirmationStage.BOUND_REACHED
+    assert turn.state.rounds_used == 2
+    assert turn.concluded
+    assert roa.OUTLINE_CONFIRMATION_BOUND_REACHED_MESSAGE in turn.message
+    assert "Second response." in turn.message
+
+
+async def test_handle_review_turn_rejects_wrong_stage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    topics = await _build_sample_topics(monkeypatch)
+    confirmed_state = OutlineConfirmationState(
+        stage=OutlineConfirmationStage.CONFIRMED, rounds_used=1
+    )
+
+    with pytest.raises(ValueError):
+        await roa.handle_review_turn(
+            confirmed_state, "Backend Engineer", topics, "anything"
+        )
+
+
+async def test_classify_review_turn_raises_on_unrecognized_action(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    topics = await _build_sample_topics(monkeypatch)
+    _patch_gemini(monkeypatch, responses=[json.dumps({"action": "not_a_real_action"})])
+
+    with pytest.raises(GeminiCallError):
+        await roa._classify_review_turn("Backend Engineer", topics, "hello")
+
+
+async def test_regenerate_outline_with_addition_produces_valid_sourced_outline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Accepted addition: regenerate via create_initial_outline (never
+    outline/hierarchy.py's insertion logic), producing a fully valid,
+    fully sourced outline — strictly-increasing hierarchy positions,
+    every topic's sourcing traceable to an input skill (reusing the same
+    checks as tests/test_pipeline_integration.py's
+    _assert_valid_outline)."""
+    topics = await _build_sample_topics(monkeypatch)
+    state = OutlineConfirmationState(
+        stage=OutlineConfirmationStage.REVIEWING, rounds_used=1
+    )
+    new_skill = _grounded("GraphQL", "https://graphql.example/1")
+
+    new_response = json.dumps(
+        {
+            "groups": [
+                {
+                    "topic_group": "Git",
+                    "topics": [{"topic_name": "Git basics", "source_skill": "Git"}],
+                },
+                {
+                    "topic_group": "Python",
+                    "topics": [
+                        {
+                            "topic_name": "Python syntax and variables",
+                            "source_skill": "Python",
+                        },
+                        {"topic_name": "Python functions", "source_skill": "Python"},
+                        {
+                            "topic_name": "Python object-oriented programming",
+                            "source_skill": "Python",
+                        },
+                    ],
+                },
+                {
+                    "topic_group": "Django",
+                    "topics": [
+                        {
+                            "topic_name": "Django framework basics",
+                            "source_skill": "Django",
+                        }
+                    ],
+                },
+                {
+                    "topic_group": "GraphQL",
+                    "topics": [
+                        {"topic_name": "GraphQL basics", "source_skill": "GraphQL"}
+                    ],
+                },
+            ]
+        }
+    )
+    _patch_gemini(monkeypatch, responses=[new_response])
+
+    turn = await roa.regenerate_outline_with_addition(
+        state, "Backend Engineer", [GIT_SKILL, PYTHON_SKILL], [DJANGO_SKILL], new_skill
+    )
+
+    assert not turn.concluded
+    assert "GraphQL" in turn.message
+    new_topics = turn.topics
+    assert len(new_topics) == len(topics) + 1
+
+    positions = [t.hierarchy_position for t in new_topics]
+    assert positions == list(range(1, len(new_topics) + 1))
+
+    valid_source_tuples = {
+        (s.source_url, s.source_type, s.confidence)
+        for s in (GIT_SKILL, PYTHON_SKILL, DJANGO_SKILL, new_skill)
+    }
+    for topic in new_topics:
+        assert topic.source_url
+        assert topic.confidence
+        assert (
+            topic.source_url,
+            topic.source_type,
+            topic.confidence,
+        ) in valid_source_tuples
+        assert topic.is_enrichment is False
+        assert topic.status == "not_started"
+
+    # unchanged topics' sourcing must be untouched by regeneration
+    old_by_name = {t.topic_name: t for t in topics}
+    for topic in new_topics:
+        if topic.topic_name in old_by_name:
+            old_topic = old_by_name[topic.topic_name]
+            assert topic.source_url == old_topic.source_url
+            assert topic.source_type == old_topic.source_type
+            assert topic.confidence == old_topic.confidence
+
+
+async def test_regenerate_outline_with_addition_frames_bound_reached_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = OutlineConfirmationState(
+        stage=OutlineConfirmationStage.BOUND_REACHED, rounds_used=2
+    )
+    new_skill = _grounded("GraphQL", "https://graphql.example/1")
+    response = json.dumps(
+        {
+            "groups": [
+                {
+                    "topic_group": "Git",
+                    "topics": [{"topic_name": "Git basics", "source_skill": "Git"}],
+                },
+                {
+                    "topic_group": "GraphQL",
+                    "topics": [
+                        {"topic_name": "GraphQL basics", "source_skill": "GraphQL"}
+                    ],
+                },
+            ]
+        }
+    )
+    _patch_gemini(monkeypatch, responses=[response])
+
+    turn = await roa.regenerate_outline_with_addition(
+        state, "Backend Engineer", [GIT_SKILL], [], new_skill
+    )
+
+    assert turn.concluded
+    assert roa.OUTLINE_CONFIRMATION_BOUND_REACHED_MESSAGE in turn.message

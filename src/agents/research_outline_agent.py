@@ -76,12 +76,17 @@ from security.input_gate import (
     ClarifyGateStage,
     ClarifyGateState,
     GoalClassification,
+    OutlineConfirmationStage,
+    OutlineConfirmationState,
+    OutlineReviewAction,
     advance_after_explanation_response,
     advance_after_narrowing_round,
     advance_after_proposal_response,
+    advance_after_review_turn,
     classify_stated_goal,
     resolve_after_grounding_check,
     start_clarify_gate,
+    start_outline_confirmation,
 )
 from security.output_guard import (
     ConfidenceTier,
@@ -157,14 +162,20 @@ def _get_tavily_client() -> TavilyClient:
     return _tavily_client
 
 
-# --- Shared Gemini call infrastructure (used by both the Clarify Gate ---
-# --- and initial outline creation below) --------------------------------
+# --- Shared Gemini call infrastructure (used by the Clarify Gate, -------
+# --- initial outline creation, and outline confirmation below) ----------
 
 # Judgment call: "flash" tier chosen for short, low-latency conversational
 # turns (a handful of sentences at most) rather than long grounded
-# generation — distinct from any future model choice for outline/
-# hierarchy sequencing, which may warrant a stronger tier.
-CLARIFY_GATE_GEMINI_MODEL = "gemini-2.5-flash"
+# generation. Used by every frequent, short Gemini-backed turn in this
+# module (clarify-gate narrowing/proposal/acceptance turns, outline-
+# confirmation turn classification/question/concern responses) — renamed
+# from `CLARIFY_GATE_GEMINI_MODEL` once outline confirmation became a
+# second consumer, since it was never actually clarify-gate-specific,
+# only clarify-gate-first. Distinct from `OUTLINE_HIERARCHY_GEMINI_MODEL`
+# below, which is deliberately a stronger tier for less frequent, more
+# substantive one-time generation.
+SHORT_TURN_GEMINI_MODEL = "gemini-2.5-flash"
 
 # Judgment call: a stronger tier than the clarify gate's, deliberately.
 # Initial outline creation is a one-time call per user (not a per-turn
@@ -291,6 +302,43 @@ PROMPT_REGISTRY: dict[str, str] = {
         "Groups must appear in prerequisite order; topics within each "
         "group must appear in prerequisite order."
     ),
+    "outline_confirmation_topic_explanations_v1": (
+        "You are presenting a learning outline to a user for role "
+        "{role!r}, before they begin. For each topic below, write a "
+        "short (1-2 sentence), friendly explanation of why it's included "
+        "in their plan — grounded strictly in the source/confidence "
+        "information given for that topic; do not state facts about the "
+        "topic that aren't supported by that information.\n\n"
+        "Topics:\n{topic_list}\n\n"
+        "Respond with ONLY a JSON object matching this shape: "
+        '{{"topic_explanations": [{{"topic_name": "<exact topic name '
+        'from the list above>", "explanation": "<short why-explanation>"'
+        "}}, ...]}}. Every topic listed above must appear exactly once; "
+        "never invent a topic not in the list above."
+    ),
+    "outline_review_turn_classification_v1": (
+        "A user is reviewing their learning outline for role {role!r} "
+        "before starting it. Classify their latest message into exactly "
+        "one of: 'question' (asking about the outline without requesting "
+        "any change), 'concern' (expressing a worry or objection about "
+        "something in the outline), 'addition_request' (asking for a new "
+        "topic or skill to be added), or 'confirm' (explicitly satisfied "
+        "and ready to proceed, e.g. 'looks good', 'let's start').\n\n"
+        "Current outline topics: {topic_names}\n"
+        "User's message: {user_message!r}\n\n"
+        "Respond with ONLY a JSON object matching this shape: "
+        '{{"action": "question" | "concern" | "addition_request" | '
+        '"confirm"}}.'
+    ),
+    "outline_review_response_v1": (
+        "A user asked a question or raised a concern about their "
+        "learning outline for role {role!r}. Respond directly and "
+        "helpfully, grounded strictly in the actual outline topics given "
+        "— do not invent topics or facts not present below.\n\n"
+        "Current outline topics: {topic_list}\n"
+        "User's message: {user_message!r}\n\n"
+        "Respond with only the response text, nothing else."
+    ),
 }
 
 # Fixed, non-LLM re-prompt for a nonsense-classified stated goal (PRD
@@ -389,7 +437,7 @@ def _last_agent_message(conversation: ConversationHistory) -> str:
     )
 
 
-async def _call_gemini_text(prompt: str, model: str = CLARIFY_GATE_GEMINI_MODEL) -> str:
+async def _call_gemini_text(prompt: str, model: str = SHORT_TURN_GEMINI_MODEL) -> str:
     """Call Gemini with a plain-text prompt and return the response text,
     stripped. Raises `GeminiCallError` if the call fails, times out, or
     returns no text at all.
@@ -423,7 +471,7 @@ async def _call_gemini_text(prompt: str, model: str = CLARIFY_GATE_GEMINI_MODEL)
 async def _call_gemini_json(
     prompt: str,
     required_keys: set[str],
-    model: str = CLARIFY_GATE_GEMINI_MODEL,
+    model: str = SHORT_TURN_GEMINI_MODEL,
 ) -> dict[str, Any]:
     """Call Gemini requesting a JSON object response and return it parsed.
 
@@ -1161,3 +1209,307 @@ async def create_initial_outline(
         )
 
     return topics
+
+
+# --- Outline Confirmation (PRD §7.5) -------------------------------------
+
+# Fixed, non-LLM framing for the round-bound-exhausted exit — the same
+# framing pattern PRD §7.5 explicitly says to reuse from the clarify
+# gate's own low-confidence exit. Not LLM-generated: the outcome (bound
+# reached, proceed with the current outline) is already fully decided
+# deterministically by security.input_gate.advance_after_review_turn.
+OUTLINE_CONFIRMATION_BOUND_REACHED_MESSAGE = (
+    "We've covered as much as we can before starting — starting here, "
+    "we'll refine as we go."
+)
+
+# Fixed, non-LLM acknowledgment for an explicit confirmation.
+OUTLINE_CONFIRMATION_CONFIRMED_MESSAGE = "Great — let's get started!"
+
+# Fixed, non-LLM acknowledgment that an addition request was received.
+# The actual "why this is now included" reasoning comes from the
+# re-shown outline after regeneration (`_generate_topic_explanations`),
+# not from this immediate acknowledgment.
+OUTLINE_CONFIRMATION_ADDITION_ACK_MESSAGE_TEMPLATE = (
+    "Got it — I'll add {addition!r} and update your outline."
+)
+
+
+@dataclass(frozen=True)
+class OutlineConfirmationTurn:
+    """One turn of outline-confirmation output: the caller renders
+    `message` and persists `state`/`topics` to carry into the next turn.
+
+    `concluded` is True once `state.stage` is `CONFIRMED` or
+    `BOUND_REACHED` — no further outline editing occurs past that point
+    (PRD §7.5's "one-time, pre-start window only"); the caller proceeds
+    to Day 1 with `topics` exactly as they stand on this turn.
+    """
+
+    state: OutlineConfirmationState
+    message: str
+    topics: list[InitialOutlineTopic]
+    concluded: bool = False
+
+
+def _format_topic_list_for_prompt(topics: list[InitialOutlineTopic]) -> str:
+    return "\n".join(
+        f"- {t.topic_name} (group: {t.topic_group}, source: {t.source_url}, "
+        f"confidence: {t.confidence.value})"
+        for t in topics
+    )
+
+
+async def _generate_topic_explanations(
+    resolved_role: str, topics: list[InitialOutlineTopic]
+) -> dict[str, str]:
+    """Generate a short why-explanation per topic, grounded in each
+    topic's real source/confidence metadata (PRD §7.5).
+
+    Raises `GeminiCallError` if any topic is left uncovered, an unknown
+    topic is invented, or an entry has no usable explanation — the same
+    coverage-check discipline as `create_initial_outline`'s skill
+    coverage, applied to topic names instead of skill names.
+    """
+    prompt = PROMPT_REGISTRY["outline_confirmation_topic_explanations_v1"].format(
+        role=resolved_role,
+        topic_list=_format_topic_list_for_prompt(topics),
+    )
+    parsed = await _call_gemini_json(
+        prompt,
+        required_keys={"topic_explanations"},
+        model=OUTLINE_HIERARCHY_GEMINI_MODEL,
+    )
+    entries = parsed["topic_explanations"]
+    if not isinstance(entries, list) or not entries:
+        raise GeminiCallError(
+            f"'topic_explanations' must be a non-empty list: {parsed!r}"
+        )
+
+    valid_topic_names = {t.topic_name for t in topics}
+    explanations: dict[str, str] = {}
+    for entry in entries:
+        if (
+            not isinstance(entry, dict)
+            or "topic_name" not in entry
+            or "explanation" not in entry
+        ):
+            raise GeminiCallError(f"malformed topic_explanations entry: {entry!r}")
+        topic_name, explanation = entry["topic_name"], entry["explanation"]
+        if topic_name not in valid_topic_names:
+            raise GeminiCallError(
+                f"topic_explanations entry references unknown topic "
+                f"{topic_name!r}, which is not in the current outline"
+            )
+        if not isinstance(explanation, str) or not explanation.strip():
+            raise GeminiCallError(
+                f"topic {topic_name!r} has no usable 'explanation': {entry!r}"
+            )
+        explanations[topic_name] = explanation
+
+    missing = valid_topic_names - explanations.keys()
+    if missing:
+        raise GeminiCallError(
+            f"the following topics were never explained: {sorted(missing)}"
+        )
+    return explanations
+
+
+def _format_outline_presentation(
+    resolved_role: str,
+    topics: list[InitialOutlineTopic],
+    explanations: dict[str, str],
+) -> str:
+    """Deterministically assemble the user-facing outline presentation.
+
+    The `source_url`/`confidence` shown per topic always comes from
+    `topics` directly, never from anything Gemini said — Gemini only
+    supplied the why-explanation prose (`_generate_topic_explanations`),
+    the same sourcing-safety split `create_initial_outline` already uses.
+    """
+    lines = [f"Here's your learning plan for {resolved_role}:", ""]
+    current_group: str | None = None
+    for topic in topics:
+        if topic.topic_group != current_group:
+            current_group = topic.topic_group
+            lines.append(f"## {current_group}")
+        lines.append(
+            f"- {topic.topic_name}: {explanations[topic.topic_name]} "
+            f"(source: {topic.source_url}, confidence: {topic.confidence.value})"
+        )
+    return "\n".join(lines)
+
+
+async def _classify_review_turn(
+    resolved_role: str, topics: list[InitialOutlineTopic], user_message: str
+) -> OutlineReviewAction:
+    """Classify a user's outline-review message into one of
+    `OutlineReviewAction`'s four values (PRD §7.5) — genuinely
+    open-ended natural-language interpretation, mirroring the clarify
+    gate's accept/reject interpretation, hence an LLM call rather than a
+    heuristic.
+
+    Raises `GeminiCallError` if Gemini's response doesn't parse into one
+    of the four recognized action values.
+    """
+    prompt = PROMPT_REGISTRY["outline_review_turn_classification_v1"].format(
+        role=resolved_role,
+        topic_names=", ".join(t.topic_name for t in topics),
+        user_message=user_message,
+    )
+    parsed = await _call_gemini_json(prompt, required_keys={"action"})
+    raw_action = parsed["action"]
+    try:
+        return OutlineReviewAction(raw_action)
+    except ValueError as exc:
+        raise GeminiCallError(
+            f"Gemini returned an unrecognized review action: {raw_action!r}"
+        ) from exc
+
+
+async def _respond_to_review_message(
+    resolved_role: str, topics: list[InitialOutlineTopic], user_message: str
+) -> str:
+    """Respond to a question or concern about the outline (PRD §7.5) —
+    shared by both, since the underlying generation task (answer/respond,
+    grounded in the real topic list) is the same regardless of which one
+    consumes a round; only round-consumption differs, and that's decided
+    by `_classify_review_turn` + `security.input_gate`, not here.
+    """
+    prompt = PROMPT_REGISTRY["outline_review_response_v1"].format(
+        role=resolved_role,
+        topic_list=_format_topic_list_for_prompt(topics),
+        user_message=user_message,
+    )
+    return await _call_gemini_text(prompt)
+
+
+async def begin_outline_confirmation(
+    resolved_role: str, topics: list[InitialOutlineTopic]
+) -> OutlineConfirmationTurn:
+    """Show the outline for the first time, with grounded "why" reasoning
+    per topic (PRD §7.5)."""
+    explanations = await _generate_topic_explanations(resolved_role, topics)
+    message = _format_outline_presentation(resolved_role, topics, explanations)
+    return OutlineConfirmationTurn(
+        state=start_outline_confirmation(), message=message, topics=topics
+    )
+
+
+async def handle_review_turn(
+    state: OutlineConfirmationState,
+    resolved_role: str,
+    topics: list[InitialOutlineTopic],
+    user_message: str,
+) -> OutlineConfirmationTurn:
+    """Handle one user turn during outline confirmation (PRD §7.5):
+    classify it, then dispatch.
+
+    For `ADDITION_REQUEST`, this function only classifies and consumes
+    the round — it does NOT regenerate the outline itself, since folding
+    in a new addition requires that addition to already be a properly
+    *grounded* `ValidatedGroundedContent` (a live grounding lookup for
+    the user's specific requested topic, not something this function can
+    invent per CLAUDE.md guardrail #1 — never fabricate a source_url).
+    The caller is responsible for grounding the request and then calling
+    `regenerate_outline_with_addition`. This is a genuine scope boundary,
+    not an oversight: how a raw addition request gets grounded (e.g. a
+    live single-skill lookup) is a separate, unaddressed design question
+    — see this task's spec reconciliation note.
+
+    Raises `ValueError` if `state.stage` is not `REVIEWING`.
+    """
+    if state.stage is not OutlineConfirmationStage.REVIEWING:
+        raise ValueError(
+            f"handle_review_turn called outside REVIEWING stage: {state.stage}"
+        )
+
+    action = await _classify_review_turn(resolved_role, topics, user_message)
+
+    if action is OutlineReviewAction.CONFIRM:
+        next_state = advance_after_review_turn(state, action)
+        return OutlineConfirmationTurn(
+            state=next_state,
+            message=OUTLINE_CONFIRMATION_CONFIRMED_MESSAGE,
+            topics=topics,
+            concluded=True,
+        )
+
+    if action is OutlineReviewAction.QUESTION:
+        response = await _respond_to_review_message(resolved_role, topics, user_message)
+        next_state = advance_after_review_turn(state, action)
+        return OutlineConfirmationTurn(
+            state=next_state, message=response, topics=topics, concluded=False
+        )
+
+    if action is OutlineReviewAction.CONCERN:
+        response = await _respond_to_review_message(resolved_role, topics, user_message)
+        next_state = advance_after_review_turn(state, action)
+        concluded = next_state.stage is OutlineConfirmationStage.BOUND_REACHED
+        if concluded:
+            response = f"{response} {OUTLINE_CONFIRMATION_BOUND_REACHED_MESSAGE}"
+        return OutlineConfirmationTurn(
+            state=next_state, message=response, topics=topics, concluded=concluded
+        )
+
+    # ADDITION_REQUEST
+    next_state = advance_after_review_turn(state, action)
+    concluded = next_state.stage is OutlineConfirmationStage.BOUND_REACHED
+    message = OUTLINE_CONFIRMATION_ADDITION_ACK_MESSAGE_TEMPLATE.format(
+        addition=user_message
+    )
+    if concluded:
+        message = f"{message} {OUTLINE_CONFIRMATION_BOUND_REACHED_MESSAGE}"
+    return OutlineConfirmationTurn(
+        state=next_state, message=message, topics=topics, concluded=concluded
+    )
+
+
+async def regenerate_outline_with_addition(
+    state: OutlineConfirmationState,
+    resolved_role: str,
+    core_skills: list[ValidatedGroundedContent],
+    emerging_skills: list[ValidatedGroundedContent],
+    new_addition: ValidatedGroundedContent,
+) -> OutlineConfirmationTurn:
+    """Regenerate the full outline via `create_initial_outline` — never
+    `outline/hierarchy.py`'s insertion logic (this pre-Day-1 window is
+    the only time an outline is still being drafted rather than already
+    being progressed through; confirmed directly for this task, not
+    inferred) — folding `new_addition` into the input skill set (PRD
+    §7.5).
+
+    `new_addition` must already be a grounded `ValidatedGroundedContent`
+    — see `handle_review_turn`'s docstring for why grounding the raw
+    request is the caller's responsibility, not this function's. The new
+    addition is folded into `emerging_skills`, not `core_skills`: an ad
+    hoc, user-requested addition is not part of the role's already-
+    established core grounding, which is the judgment call this default
+    reflects.
+
+    Reuses `create_initial_outline`'s existing sourcing-safety mechanism
+    directly rather than building a second one: every topic in the
+    regenerated outline, including unchanged ones, still has its
+    source_url/source_type/confidence re-attached by exact skill-name
+    match against the (now-larger) input list, exactly as before.
+
+    `state` must already reflect this addition's round having been
+    consumed (via `handle_review_turn`) — this function does not itself
+    call `advance_after_review_turn` again.
+    """
+    updated_emerging_skills = [*emerging_skills, new_addition]
+    new_topics = await create_initial_outline(
+        resolved_role, core_skills, updated_emerging_skills
+    )
+
+    addition_name = new_addition.extra.get("skill", "the requested topic")
+    message = f"Updated your outline to include {addition_name}."
+    if state.stage is OutlineConfirmationStage.BOUND_REACHED:
+        message = f"{message} {OUTLINE_CONFIRMATION_BOUND_REACHED_MESSAGE}"
+
+    return OutlineConfirmationTurn(
+        state=state,
+        message=message,
+        topics=new_topics,
+        concluded=state.stage is OutlineConfirmationStage.BOUND_REACHED,
+    )

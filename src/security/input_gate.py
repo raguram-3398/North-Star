@@ -1,30 +1,47 @@
-"""Clarify-gate bound/loop state, first-pass stated-goal classification,
-and structural reject detection.
+"""Bounded-loop state/round-counting for every interactive loop in this
+codebase (CLAUDE.md guardrail #8: "the clarify gate and outline
+confirmation are both bounded (~2 rounds)... any new interactive loop
+needs the same treatment") — plus first-pass stated-goal classification
+and structural reject detection, which are Clarify-Gate-specific.
 
 Pure, deterministic, no LLM calls, no side effects (CLAUDE.md: pure
-functions stay pure). Per LLM Call Discipline, this runs on raw user
-input before it reaches any clarify-gate LLM call — never after any
-content-processing step that could corrupt the pattern it needs to catch.
+functions stay pure). Per LLM Call Discipline, `classify_stated_goal` runs
+on raw user input before it reaches any clarify-gate LLM call — never
+after any content-processing step that could corrupt the pattern it needs
+to catch.
 
-Tracks the bounded-loop *mechanics* of PRD §7.2's Clarify Gate: narrowing
-rounds (bounded to ~2), then propose-best-guess -> explain-role ->
-accept-own-words -> zero-signal-exit. It also owns `classify_stated_goal`,
-the deterministic, lexical/plausibility first-pass classification of a raw
-stated goal into real / vague-but-genuine / nonsense (PRD §7.2) — a
-vocabulary- and pattern-based judgment call, never an LLM call and never a
-market-existence check: a niche-but-real role must never be gate-rejected
-just because this module hasn't seen it before (see
-`classify_stated_goal`'s docstring for the mechanism).
+Two independent bounded loops live here, each with its own state type,
+sharing no fields (they are unrelated flows that happen to share the same
+"~2 rounds, then a graceful exit" mechanical shape):
 
-Everything downstream of that first classification stays Agent 1's job
-(Architecture §3): the *content* of each narrowing question, proposal, and
-explanation, and — critically — interpreting whether a user's free-text
-reply to one of those *accepted or rejected* it. That interpretation is
-genuinely open-ended natural language, unlike the bounded first-pass
-classification above, which is why it stays an LLM reasoning task rather
-than being pulled into this module. The booleans this module's `advance_*`
-functions take as input are assumed already decided by that reasoning
-step.
+1. **Clarify Gate** (PRD §7.2, `ClarifyGateState`/`ClarifyGateStage`):
+   narrowing rounds (bounded to ~2), then propose-best-guess ->
+   explain-role -> accept-own-words -> zero-signal-exit. Also owns
+   `classify_stated_goal`, the deterministic, lexical/plausibility
+   first-pass classification of a raw stated goal into real /
+   vague-but-genuine / nonsense — a vocabulary- and pattern-based
+   judgment call, never an LLM call and never a market-existence check: a
+   niche-but-real role must never be gate-rejected just because this
+   module hasn't seen it before (see `classify_stated_goal`'s docstring
+   for the mechanism).
+2. **Outline Confirmation** (PRD §7.5, `OutlineConfirmationState`/
+   `OutlineConfirmationStage`): a single reviewing stage the user can
+   loop on by raising concerns or requesting additions (each consuming
+   one of 2 bounded rounds) or asking free, unbounded questions (never
+   consuming a round), until they explicitly confirm or the round bound
+   is reached.
+
+Everything downstream of the first-pass decisions above stays Agent 1's
+job (Architecture §3): the *content* of each narrowing question,
+proposal, explanation, outline "why" presentation, and question/concern
+response, and — critically — interpreting a user's free-text reply into
+one of this module's already-defined action/outcome values (accepted/
+rejected for the clarify gate; `OutlineReviewAction` for outline
+confirmation). That interpretation is genuinely open-ended natural
+language, unlike the bounded classification/action vocabulary itself,
+which is why interpretation stays an LLM reasoning task rather than being
+pulled into this module. The values this module's `advance_*` functions
+take as input are assumed already decided by that reasoning step.
 """
 
 import re
@@ -32,6 +49,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 MAX_NARROWING_ROUNDS = 2
+MAX_OUTLINE_CONFIRMATION_ROUNDS = 2
 
 
 class ClarifyGateStage(Enum):
@@ -61,6 +79,40 @@ class ClarifyGateState:
 
     stage: ClarifyGateStage
     narrowing_rounds_used: int = 0
+
+
+class OutlineConfirmationStage(Enum):
+    """A stage in the PRD §7.5 Outline Confirmation bounded loop."""
+
+    REVIEWING = "reviewing"
+    CONFIRMED = "confirmed"
+    BOUND_REACHED = "bound_reached"
+
+
+class OutlineReviewAction(Enum):
+    """How Agent 1 classified a user's turn during outline confirmation
+    (PRD §7.5) — see `advance_after_review_turn`.
+
+    `QUESTION` is free and never advances the round bound. `CONCERN` and
+    `ADDITION_REQUEST` both consume one of the 2 bounded rounds.
+    `CONFIRM` ends the review immediately, regardless of rounds used so
+    far. Classification itself is Agent 1's reasoning job (interpreting
+    open-ended free text) — this module only tracks what happens to the
+    loop once that classification is already decided.
+    """
+
+    QUESTION = "question"
+    CONCERN = "concern"
+    ADDITION_REQUEST = "addition_request"
+    CONFIRM = "confirm"
+
+
+@dataclass(frozen=True)
+class OutlineConfirmationState:
+    """Immutable snapshot of the outline confirmation loop's state."""
+
+    stage: OutlineConfirmationStage
+    rounds_used: int = 0
 
 
 def detect_reject(raw_input: str) -> bool:
@@ -466,3 +518,59 @@ def resolve_after_grounding_check(
     return ClarifyGateState(
         stage=next_stage, narrowing_rounds_used=state.narrowing_rounds_used
     )
+
+
+def start_outline_confirmation() -> OutlineConfirmationState:
+    """Return the initial outline-confirmation state: the reviewing
+    stage, zero rounds used (PRD §7.5).
+    """
+    return OutlineConfirmationState(
+        stage=OutlineConfirmationStage.REVIEWING, rounds_used=0
+    )
+
+
+def has_reached_outline_confirmation_bound(
+    rounds_used: int, max_rounds: int = MAX_OUTLINE_CONFIRMATION_ROUNDS
+) -> bool:
+    """Determine whether the outline-confirmation round bound (exactly
+    2, same as the clarify gate — confirmed directly, not inferred from
+    PRD §7.5, which left the exact number unspecified) has been reached.
+    """
+    return rounds_used >= max_rounds
+
+
+def advance_after_review_turn(
+    state: OutlineConfirmationState, action: OutlineReviewAction
+) -> OutlineConfirmationState:
+    """Advance the outline-confirmation loop given Agent 1's
+    classification of the user's latest review-turn message (PRD §7.5).
+
+    - `CONFIRM` -> `CONFIRMED` immediately, regardless of rounds used so
+      far (the user is explicitly done).
+    - `QUESTION` -> the state is returned unchanged (same stage, same
+      round count) — questions are free and unbounded, confirmed
+      directly rather than inferred from PRD §7.5, which left this
+      unspecified.
+    - `CONCERN` / `ADDITION_REQUEST` -> both consume one of the 2 bounded
+      rounds; moves to `BOUND_REACHED` once the bound is reached, or
+      stays in `REVIEWING` for another round.
+
+    Raises ValueError if called outside the REVIEWING stage.
+    """
+    if state.stage is not OutlineConfirmationStage.REVIEWING:
+        raise ValueError(
+            f"advance_after_review_turn called outside REVIEWING stage: {state.stage}"
+        )
+    if action is OutlineReviewAction.CONFIRM:
+        return OutlineConfirmationState(
+            stage=OutlineConfirmationStage.CONFIRMED, rounds_used=state.rounds_used
+        )
+    if action is OutlineReviewAction.QUESTION:
+        return state
+    rounds_used = state.rounds_used + 1
+    next_stage = (
+        OutlineConfirmationStage.BOUND_REACHED
+        if has_reached_outline_confirmation_bound(rounds_used)
+        else OutlineConfirmationStage.REVIEWING
+    )
+    return OutlineConfirmationState(stage=next_stage, rounds_used=rounds_used)

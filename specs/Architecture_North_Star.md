@@ -35,6 +35,7 @@ Per course guidance on DAG orchestration and "Shift Intelligence Left": agents h
 
 - Confidence-ladder tier assignment and source/schema validation (`security/output_guard.py`)
 - Clarify-gate bound-counting, loop-termination, and first-pass real/vague/nonsense stated-goal classification (`security/input_gate.py`)
+- Outline-confirmation bound-counting and loop-termination (`security/input_gate.py`'s `OutlineConfirmationState` — a second, independent bounded loop living alongside the clarify gate's, per CLAUDE.md guardrail #8's explicit naming of both)
 - Significant-event detection — bucket/confidence-crossing diff (`outline/significant_event.py`)
 - Pace calculation — topic_score, timing_ratio, the 80/20 blend, sustained-drift threshold check (`pace/calculator.py`)
 - Patch-note confidence branching (prioritize vs. ask-user, a threshold lookup on an already-computed value) (`patches/patch_manager.py`) — implemented as `branch_by_confidence` returning the literal `"prioritize"` / `"needs_user_decision"` (only `high` confidence prioritizes; see PRD §7.9 for the resolved cutoff)
@@ -69,6 +70,17 @@ Two real agents, consistent with the "don't inflate agent count for rubric-check
 - **Shared Gemini-call rename:** `utils.exceptions.ClarifyGateLLMError` renamed to `GeminiCallError`, and `_call_gemini_text`/`_call_gemini_json` (`src/agents/research_outline_agent.py`) gained an explicit `model` parameter — both were clarify-gate-specific in name/behavior only by accident of being built first; this task reuses them for outline sequencing rather than duplicating the call/timeout/error-handling logic.
 - **Model choice:** `gemini-2.5-pro` for outline-hierarchy sequencing specifically — a stronger tier than the clarify gate's `gemini-2.5-flash`, deliberately: this is a one-time call per user (not a per-turn conversational cost), and correctness of prerequisite ordering across potentially dozens of skills matters more here than low latency.
 - **`PROMPT_REGISTRY`:** one new versioned prompt, `outline_hierarchy_sequencing_v1` — the exact prompt CLAUDE.md's LLM Call Discipline section names as required.
+
+**Resolved (`src/security/input_gate.py`'s `OutlineConfirmationState`/`OutlineReviewAction`, `src/agents/research_outline_agent.py`'s `begin_outline_confirmation`/`handle_review_turn`/`regenerate_outline_with_addition`; PRD §7.5's three ambiguities — round bound, question-exemption, regeneration-not-insertion — were confirmed directly for this task, not inferred; see PRD §7.5 for the exact resolutions):**
+- **Bounded-loop mechanics placement confirmed, not just assumed:** `security/input_gate.py` is the correct home for `OutlineConfirmationState` — CLAUDE.md guardrail #8 already names outline confirmation as the second of exactly two existing bounded loops, alongside the clarify gate, so this isn't a new judgment call about where bounded-loop mechanics belong, just applying the already-established placement. The module's own docstring is broadened accordingly (it now hosts two independent, unrelated bounded loops that happen to share the same "~2 rounds, then a graceful exit" shape, not one loop plus a second bolted on).
+- **A fourth action value, `CONFIRM`, needed beyond the three PRD §7.5 names (question/concern/addition-request):** PRD §7.5 describes "if not resolved within the bound" as one path to conclusion, implying a second path — the user explicitly confirming before the bound is reached — that has to be its own classifiable action distinct from the other three, or there would be no way to end the loop early. `OutlineReviewAction.CONFIRM` ends the review immediately regardless of rounds used, mirroring the clarify gate's `RESOLVED` outcome.
+- **Question/concern response generation shares one prompt and function (`_respond_to_review_message`, `outline_review_response_v1`), not two:** both are "answer/respond to the user's message, grounded in the real topic list" — the same underlying generation task. Only round-consumption differs, and that's decided by `_classify_review_turn` + `security/input_gate.py`, not by which response prompt runs. Avoids duplicating two near-identical LLM calls.
+- **Flagged scope boundary, not solved by this task:** how a user's raw addition-request text (e.g. "can you add GraphQL?") becomes a properly *grounded* `ValidatedGroundedContent` (a real `source_url`) is not addressed here. `handle_review_turn` classifies the request and consumes the round, but does not itself ground anything — grounding the specific requested skill (e.g. a live lookup) and then calling `regenerate_outline_with_addition` with an already-grounded object is left to the caller. This boundary exists specifically so this task never has to let an LLM invent a source_url (CLAUDE.md guardrail #1); it is a genuine, unaddressed design question, not an oversight.
+- **A new addition folds into `emerging_skills`, not `core_skills`:** an ad hoc, user-requested addition is not part of the role's already-established core grounding — a judgment call, not specified by PRD §7.5.
+- **Regeneration reuses `create_initial_outline`'s sourcing-safety mechanism directly, unmodified:** no second mechanism was built. Every topic in a regenerated outline — including topics unchanged from before the addition — still has its `source_url`/`source_type`/`confidence` re-attached by exact skill-name match against the (now-larger) input list, exactly as `create_initial_outline` already guarantees; regeneration cannot silently drop or alter sourcing on unchanged topics because it is, mechanically, the identical function call with one more input skill.
+- **Model choice:** the per-turn functions (`_classify_review_turn`, `_respond_to_review_message`) use `SHORT_TURN_GEMINI_MODEL` (frequent, short turns); `_generate_topic_explanations` (processes the whole outline at once, closer in shape to hierarchy sequencing) uses the stronger `OUTLINE_HIERARCHY_GEMINI_MODEL`.
+- **`SHORT_TURN_GEMINI_MODEL` rename, continued:** this is the second reuse of the constant previously named `CLARIFY_GATE_GEMINI_MODEL` (already renamed once for outline-hierarchy sequencing) — confirms the earlier rename was the right call rather than a one-off.
+- **`PROMPT_REGISTRY`:** three new versioned prompts — `outline_confirmation_topic_explanations_v1`, `outline_review_turn_classification_v1`, `outline_review_response_v1`.
 
 ### Agent 2 — Coaching & Pace Agent
 **Owns (reasoning/generation only):** day-by-day content generation (summary, theory framing, hands-on exercise design, reflection prompts), goal-completion closing-note composition.
@@ -252,6 +264,8 @@ Deterministic diff on `roles_cache` between refreshes: for each skill, compare b
 - No admin dashboard for `roles_cache` — cron script output is sufficient for v1
 - Full skill-graduation tier system, adversarial red-teaming, and canary rollout (see §7) — noted as future work
 - `outline/hierarchy.py` only supports must-follow (prerequisite) positioning constraints, not must-precede — see code comment in `insert_new_topic` for detail. Flagged during implementation, not from original design.
+- `agents/research_outline_agent.py`'s `create_initial_outline` has no way to receive an accurate core/emerging skill split for a *live* grounding result — `ground_role`'s `LiveGroundingResult` returns one flat skill list; only the cached-fallback path (`data/grounding_fallback.py`'s `CachedFallbackResult`) already has the split. Worked around with a degenerate split, not solved. Flagged during implementation, not from original design.
+- `agents/research_outline_agent.py`'s `handle_review_turn`/`regenerate_outline_with_addition` have no mechanism to ground a user's raw outline-confirmation addition request into a real, sourced skill — that grounding step (e.g. a live single-skill lookup) is left to the caller, entirely unbuilt here. Flagged during implementation, not from original design.
 
 ## 11. Non-negotiable Guardrails (carry into CLAUDE.md)
 
@@ -301,10 +315,10 @@ north-star/
 ├── src/
 │   ├── main.py
 │   ├── agents/
-│   │   ├── research_outline_agent.py   # reasoning/generation only: ground_role (cross-validation orchestrator), begin_clarify_gate/advance_clarify_gate (clarify-gate conversational content), create_initial_outline (hierarchy sequencing) — see §3/§8
+│   │   ├── research_outline_agent.py   # reasoning/generation only: ground_role (cross-validation orchestrator), begin_clarify_gate/advance_clarify_gate (clarify-gate conversational content), create_initial_outline (hierarchy sequencing), begin_outline_confirmation/handle_review_turn/regenerate_outline_with_addition (outline confirmation) — see §3/§8
 │   │   └── coaching_pace_agent.py      # reasoning/generation only — see §3
 │   ├── security/
-│   │   ├── input_gate.py               # clarify-gate bound/loop state, first-pass real/vague/nonsense classification, reject detection — see §3
+│   │   ├── input_gate.py               # clarify-gate bound/loop state + first-pass real/vague/nonsense classification, outline-confirmation bound/loop state, reject detection — see §3
 │   │   └── output_guard.py             # confidence-ladder enforcement, source validation — the structural gate
 │   ├── pace/
 │   │   └── calculator.py               # topic_score, timing_ratio, 80/20 blend, sustained-drift check

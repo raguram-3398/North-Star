@@ -1,5 +1,6 @@
 """Tests for security/input_gate.py — clarify-gate bound/loop state,
-first-pass stated-goal classification, and structural reject detection.
+outline-confirmation bound/loop state, first-pass stated-goal
+classification, and structural reject detection.
 """
 
 import pytest
@@ -8,14 +9,20 @@ from security.input_gate import (
     ClarifyGateStage,
     ClarifyGateState,
     GoalClassification,
+    OutlineConfirmationStage,
+    OutlineConfirmationState,
+    OutlineReviewAction,
     advance_after_explanation_response,
     advance_after_narrowing_round,
     advance_after_proposal_response,
+    advance_after_review_turn,
     classify_stated_goal,
     detect_reject,
+    has_reached_outline_confirmation_bound,
     has_reached_round_bound,
     resolve_after_grounding_check,
     start_clarify_gate,
+    start_outline_confirmation,
 )
 
 
@@ -323,3 +330,136 @@ def test_narrowing_loop_never_exceeds_round_bound_under_repeated_non_resolution(
 
     assert state.stage is ClarifyGateStage.PROPOSE_BEST_GUESS
     assert state.narrowing_rounds_used == 2
+
+
+# --- Outline Confirmation (PRD §7.5) bounded loop --------------------------
+
+
+def test_start_outline_confirmation_begins_reviewing_with_zero_rounds() -> None:
+    state = start_outline_confirmation()
+
+    assert state.stage is OutlineConfirmationStage.REVIEWING
+    assert state.rounds_used == 0
+
+
+@pytest.mark.parametrize(
+    ("rounds_used", "expected"),
+    [(0, False), (1, False), (2, True), (3, True)],
+)
+def test_has_reached_outline_confirmation_bound_default_max(
+    rounds_used: int, expected: bool
+) -> None:
+    assert has_reached_outline_confirmation_bound(rounds_used) is expected
+
+
+def test_question_never_consumes_a_round() -> None:
+    """A free question must leave stage and round count completely
+    unchanged — including when asked repeatedly, well past what would be
+    the bound for a round-consuming action.
+    """
+    state = start_outline_confirmation()
+
+    for _ in range(5):
+        state = advance_after_review_turn(state, OutlineReviewAction.QUESTION)
+        assert state.stage is OutlineConfirmationStage.REVIEWING
+        assert state.rounds_used == 0
+
+
+def test_concern_consumes_a_round() -> None:
+    state = start_outline_confirmation()
+
+    state = advance_after_review_turn(state, OutlineReviewAction.CONCERN)
+
+    assert state.stage is OutlineConfirmationStage.REVIEWING
+    assert state.rounds_used == 1
+
+
+def test_addition_request_consumes_a_round() -> None:
+    state = start_outline_confirmation()
+
+    state = advance_after_review_turn(state, OutlineReviewAction.ADDITION_REQUEST)
+
+    assert state.stage is OutlineConfirmationStage.REVIEWING
+    assert state.rounds_used == 1
+
+
+def test_confirm_ends_review_immediately_regardless_of_rounds_used() -> None:
+    state = OutlineConfirmationState(
+        stage=OutlineConfirmationStage.REVIEWING, rounds_used=0
+    )
+
+    state = advance_after_review_turn(state, OutlineReviewAction.CONFIRM)
+
+    assert state.stage is OutlineConfirmationStage.CONFIRMED
+
+
+def test_confirm_ends_review_even_after_a_round_already_used() -> None:
+    state = OutlineConfirmationState(
+        stage=OutlineConfirmationStage.REVIEWING, rounds_used=1
+    )
+
+    state = advance_after_review_turn(state, OutlineReviewAction.CONFIRM)
+
+    assert state.stage is OutlineConfirmationStage.CONFIRMED
+
+
+def test_round_bound_reached_after_exactly_two_consuming_actions() -> None:
+    """Gherkin-style bound test, mirroring the clarify gate's: mix
+    concerns and addition requests (both round-consuming) and confirm the
+    bound is reached at exactly 2, never before, never exceeded."""
+    state = start_outline_confirmation()
+
+    state = advance_after_review_turn(state, OutlineReviewAction.CONCERN)
+    assert state.stage is OutlineConfirmationStage.REVIEWING
+    assert state.rounds_used == 1
+
+    state = advance_after_review_turn(state, OutlineReviewAction.ADDITION_REQUEST)
+    assert state.stage is OutlineConfirmationStage.BOUND_REACHED
+    assert state.rounds_used == 2
+
+
+def test_questions_interleaved_with_consuming_actions_never_advance_bound_early() -> (
+    None
+):
+    """Interleave free questions between the two round-consuming actions
+    and confirm the bound is still reached only after exactly 2
+    consuming actions, unaffected by however many questions were asked in
+    between."""
+    state = start_outline_confirmation()
+
+    for _ in range(3):
+        state = advance_after_review_turn(state, OutlineReviewAction.QUESTION)
+    state = advance_after_review_turn(state, OutlineReviewAction.CONCERN)
+    for _ in range(3):
+        state = advance_after_review_turn(state, OutlineReviewAction.QUESTION)
+    assert state.stage is OutlineConfirmationStage.REVIEWING
+    assert state.rounds_used == 1
+
+    state = advance_after_review_turn(state, OutlineReviewAction.ADDITION_REQUEST)
+
+    assert state.stage is OutlineConfirmationStage.BOUND_REACHED
+    assert state.rounds_used == 2
+
+
+def test_advance_after_review_turn_rejects_wrong_stage() -> None:
+    confirmed_state = OutlineConfirmationState(
+        stage=OutlineConfirmationStage.CONFIRMED, rounds_used=1
+    )
+
+    with pytest.raises(ValueError):
+        advance_after_review_turn(confirmed_state, OutlineReviewAction.QUESTION)
+
+
+def test_outline_confirmation_loop_never_exceeds_round_bound_under_stress() -> None:
+    """Stress-test companion to the clarify gate's equivalent: hammer the
+    loop with round-consuming actions well past the bound and confirm it
+    never advances beyond MAX_OUTLINE_CONFIRMATION_ROUNDS."""
+    state = start_outline_confirmation()
+    for _ in range(10):
+        if state.stage is not OutlineConfirmationStage.REVIEWING:
+            break
+        state = advance_after_review_turn(state, OutlineReviewAction.CONCERN)
+        assert state.rounds_used <= 2
+
+    assert state.stage is OutlineConfirmationStage.BOUND_REACHED
+    assert state.rounds_used == 2
