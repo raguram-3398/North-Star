@@ -12,7 +12,7 @@ Companion to PRD_North_Star.md. This document defines *how* the system is built:
 | UI | **Streamlit** | Native multi-step session-state model fits the intake→outline-confirm→day-by-day flow better than a single input/output demo tool; deploys natively on HF Spaces |
 | Persistence | **Neon (Postgres)** | Free-tier, external — avoids HF Spaces' ephemeral local disk entirely |
 | DB access | SQLAlchemy (or SQLModel) | Standard, avoids hand-rolled SQL string management |
-| Market data (structured) | **Himalayas MCP server** | Consumed via ADK's MCP tool integration; free, no-auth |
+| Market data (Himalayas) | **Himalayas MCP server** | Consumed via ADK's MCP tool integration; free, no-auth. Despite the name, its tool responses are **not** structured JSON — see resolved detail below |
 | Market data (search) | **Tavily API** | Agent-native structured search results; free tier; single API key, no CSE setup |
 | LLM | Gemini (via ADK) | Per course |
 | Deployment | HF Spaces (Streamlit SDK) | Public link satisfies project-link requirement with no login |
@@ -24,6 +24,7 @@ Companion to PRD_North_Star.md. This document defines *how* the system is built:
 - **Neon timeouts** (CLAUDE.md guardrail #14 requires an explicit timeout on every external call, but names no duration): `connect_timeout=10` seconds (TCP handshake) and `statement_timeout=10` seconds (per-query, set via a Postgres connection option) — both generous-but-bounded defaults for a free-tier instance, to be tuned once real latency is measured (ship-day README requirement).
 - **Engine lifecycle**: the Engine is a lazy-but-memoized module-level singleton in `db/connection.py` (created on first use, cached, never recreated) rather than instantiated at raw import time — this avoids making `NEON_CONNECTION_STRING` a hard import-time requirement (e.g. in CI/test contexts with no DB configured) while still satisfying "one client per module."
 - **`mcp` (the official Python MCP SDK) is a required explicit dependency, not something `google-adk` pulls in on its own.** `google.adk.tools.mcp_tool.mcp_toolset` imports `mcp` directly (`ClientSession`, `streamablehttp_client`, etc.), but `google-adk`'s own package metadata does not declare it — importing ADK's MCP toolset fails with `ModuleNotFoundError: No module named 'mcp'` until `mcp` is installed and added to `pyproject.toml` separately. Discovered during the Himalayas MCP connectivity spike (`tests/spike_grounding_connectivity.py`); resolved by adding `mcp>=1.28.1` to `pyproject.toml`.
+- **Himalayas MCP's tool responses are not structured JSON, contrary to this table's original "structured" description.** Every tool call (`search_jobs`, `get_salary_data`, etc.) returns `{"content": [{"type": "text", "text": "<markdown/emoji-formatted prose>"}], "isError": bool}` — a human/LLM-readable text blob, not named fields. `search_jobs`'s text is a series of `🚀`-prefixed listing blocks, each with a title, company, an optional "🛠️ Key Skills:" line (bullet-separated, `+N more` truncation suffix on the last item), and an "Apply on Himalayas" URL. `src/data/himalayas_parser.py` is the deterministic pattern-extraction module that turns this text into structured `ParsedJobListing` objects (`title`, `company`, `skills`, `source_url`) for Agent 1's cross-validation to consume — see that module's docstring and `tests/fixtures/himalayas_search_jobs_*.txt` (real captured samples across 4 seed roles) for the full shape. `get_salary_data`'s text has a different, aggregate-statistics shape with no skills and no per-entry URL (only one shared URL for the whole response) — parsing that is out of scope for `himalayas_parser.py`, which targets `search_jobs` only.
 
 ---
 
@@ -286,7 +287,9 @@ north-star/
 │   │   └── refresh_roles.py            # shared refresh function — called by GitHub Action and startup check
 │   ├── data/
 │   │   ├── roles_cache.py              # roles_cache I/O
-│   │   └── progress_log.py             # progress_log I/O
+│   │   ├── progress_log.py             # progress_log I/O
+│   │   ├── grounding_fallback.py       # cached-fallback + general-knowledge-only floor rungs
+│   │   ├── himalayas_parser.py         # search_jobs text-blob -> ParsedJobListing(title, company, skills, source_url) — see §1
 │   ├── models/
 │   │   └── schemas.py                  # SQLAlchemy models, mirrors §4 exactly
 │   ├── db/
