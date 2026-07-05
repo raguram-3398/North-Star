@@ -26,7 +26,10 @@ from data.outline_topics import (
     COMPLETED_STATUS,
     COMPLETED_TEST_OUT_STATUS,
     NOT_STARTED_STATUS,
+    get_all_topics_for_user,
     get_completed_topics_matching_skill,
+    has_pending_enrichment_topic,
+    insert_new_outline_topic,
     insert_outline_topics,
     mark_topic_completed,
 )
@@ -251,3 +254,133 @@ def test_get_completed_topics_matching_skill_returns_empty_when_no_match() -> No
     result = get_completed_topics_matching_skill(session, "Kafka")
 
     assert result == []
+
+
+def _topic_row(
+    topic_id: str,
+    hierarchy_position: int,
+    topic_name: str = "X",
+    topic_group: str = "G",
+    position_in_group: int = 1,
+    status: str = NOT_STARTED_STATUS,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=topic_id,
+        user_id="user-1",
+        topic_name=topic_name,
+        hierarchy_position=hierarchy_position,
+        topic_group=topic_group,
+        position_in_group=position_in_group,
+        source_url="https://example.com/x",
+        source_type="job_listing",
+        confidence="high",
+        is_enrichment=False,
+        status=status,
+        completed_at=None,
+    )
+
+
+def test_get_all_topics_for_user_returns_every_row() -> None:
+    row = _topic_row("t1", 1, topic_name="SQL")
+    session = MagicMock()
+    session.query.return_value.filter.return_value.all.return_value = [row]
+
+    result = get_all_topics_for_user(session, "user-1")
+
+    assert len(result) == 1
+    assert result[0]["topic_name"] == "SQL"
+
+
+def test_has_pending_enrichment_topic_true_when_an_unresolved_one_exists() -> None:
+    session = MagicMock()
+    session.query.return_value.filter.return_value.first.return_value = _topic_row(
+        "t1", 1
+    )
+
+    assert has_pending_enrichment_topic(session, "user-1") is True
+
+
+def test_has_pending_enrichment_topic_false_when_none_exists() -> None:
+    session = MagicMock()
+    session.query.return_value.filter.return_value.first.return_value = None
+
+    assert has_pending_enrichment_topic(session, "user-1") is False
+
+
+def test_insert_new_outline_topic_inserts_after_prerequisite_and_renumbers() -> None:
+    """old-1 (position 1) is the sole prerequisite, old-2 (position 2) is
+    not — the new topic must land immediately after old-1 (position 2),
+    pushing old-2 to position 3. old-1 itself is untouched.
+    """
+    old1 = _topic_row("old-1", 1)
+    old2 = _topic_row("old-2", 2)
+    session = MagicMock()
+    session.query.return_value.filter.return_value.all.return_value = [old1, old2]
+
+    result = insert_new_outline_topic(
+        session,
+        user_id="user-1",
+        topic_name="GraphQL",
+        topic_group="GraphQL (Enrichment)",
+        position_in_group=1,
+        source_url="https://example.com/graphql",
+        source_type="roles_cache-cached",
+        confidence=ConfidenceTier.MEDIUM,
+        is_enrichment=True,
+        prerequisite_topic_ids=frozenset({"old-1"}),
+    )
+
+    assert old1.hierarchy_position == 1
+    assert old2.hierarchy_position == 3
+    assert result["hierarchy_position"] == 2
+    assert result["topic_name"] == "GraphQL"
+    assert result["topic_group"] == "GraphQL (Enrichment)"
+    assert result["is_enrichment"] is True
+    assert result["confidence"] == "medium"
+    assert result["status"] == NOT_STARTED_STATUS
+    session.add.assert_called_once()
+    session.commit.assert_called_once()
+
+
+def test_insert_new_outline_topic_with_no_prerequisites_inserts_at_the_start() -> None:
+    old1 = _topic_row("old-1", 1)
+    session = MagicMock()
+    session.query.return_value.filter.return_value.all.return_value = [old1]
+
+    result = insert_new_outline_topic(
+        session,
+        user_id="user-1",
+        topic_name="gRPC",
+        topic_group="gRPC (Enrichment)",
+        position_in_group=1,
+        source_url="https://example.com/grpc",
+        source_type="roles_cache-cached",
+        confidence=ConfidenceTier.LOW,
+        is_enrichment=True,
+    )
+
+    assert result["hierarchy_position"] == 1
+    assert old1.hierarchy_position == 2
+
+
+def test_insert_new_outline_topic_rejects_unknown_prerequisite_id() -> None:
+    old1 = _topic_row("old-1", 1)
+    session = MagicMock()
+    session.query.return_value.filter.return_value.all.return_value = [old1]
+
+    with pytest.raises(ValueError):
+        insert_new_outline_topic(
+            session,
+            user_id="user-1",
+            topic_name="gRPC",
+            topic_group="gRPC (Enrichment)",
+            position_in_group=1,
+            source_url="https://example.com/grpc",
+            source_type="roles_cache-cached",
+            confidence=ConfidenceTier.LOW,
+            is_enrichment=True,
+            prerequisite_topic_ids=frozenset({"nonexistent"}),
+        )
+
+    session.add.assert_not_called()
+    session.commit.assert_not_called()

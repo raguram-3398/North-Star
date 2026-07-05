@@ -22,6 +22,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from models.schemas import OutlineTopic
+from outline.hierarchy import insert_new_topic
 from security.output_guard import ConfidenceTier
 
 # Match Architecture §5's `status TEXT` column comment
@@ -281,3 +282,111 @@ def get_completed_topics_matching_skill(
         .all()
     )
     return [_to_dict(row) for row in rows]
+
+
+def get_all_topics_for_user(session: Session, user_id: str) -> list[dict[str, Any]]:
+    """Read every `outline_topics` row for `user_id`, regardless of status
+    or `topic_group` — used as the `existing_topics` input to
+    `outline/hierarchy.py`'s `insert_new_topic` (not reimplemented here),
+    which needs the user's whole existing hierarchy to renumber against,
+    and by enrichment selection to check which skill names are already in
+    use.
+    """
+    rows = session.query(OutlineTopic).filter(OutlineTopic.user_id == user_id).all()
+    return [_to_dict(row) for row in rows]
+
+
+def has_pending_enrichment_topic(session: Session, user_id: str) -> bool:
+    """True if `user_id` already has an `is_enrichment=True` topic that
+    has not yet resolved (`status` not in `{completed, completed_test_out}`).
+
+    Used to prevent a second sustained-ahead trigger from inserting a
+    second enrichment topic while one is still pending (PRD §7.10) —
+    `agents/coaching_pace_agent.py`'s `maybe_trigger_enrichment` checks
+    this before selecting a candidate skill.
+    """
+    row = (
+        session.query(OutlineTopic)
+        .filter(
+            OutlineTopic.user_id == user_id,
+            OutlineTopic.is_enrichment.is_(True),
+            OutlineTopic.status.notin_(_VALID_COMPLETION_STATUSES),
+        )
+        .first()
+    )
+    return row is not None
+
+
+def insert_new_outline_topic(
+    session: Session,
+    user_id: str,
+    topic_name: str,
+    topic_group: str,
+    position_in_group: int,
+    source_url: str,
+    source_type: str,
+    confidence: ConfidenceTier,
+    is_enrichment: bool,
+    prerequisite_topic_ids: frozenset[str] = frozenset(),
+) -> dict[str, Any]:
+    """Insert one new topic into `user_id`'s existing hierarchy via
+    `outline/hierarchy.py`'s `insert_new_topic` (not reimplemented here) —
+    the single insertion mechanism intended for any additive, hierarchy-
+    positioned update (market-driven patch content, PRD §7.9; enrichment,
+    PRD §7.10), not a second insertion path. Renumbers `hierarchy_position`
+    on every existing row that shifts as a result, then persists the new
+    row. Commits the transaction.
+
+    `prerequisite_topic_ids` is passed straight through to
+    `insert_new_topic` — e.g. the single just-completed topic that
+    triggered an enrichment insertion, so the new topic lands immediately
+    after the user's current position rather than at the very start of
+    the whole hierarchy (`insert_new_topic`'s behavior with no
+    prerequisites at all).
+
+    Raises `ValueError` (via `insert_new_topic`) if any id in
+    `prerequisite_topic_ids` is not found in `user_id`'s existing topics.
+    """
+    existing_rows = (
+        session.query(OutlineTopic).filter(OutlineTopic.user_id == user_id).all()
+    )
+    existing_topics = [_to_dict(row) for row in existing_rows]
+
+    new_topic_id = uuid.uuid4()
+    new_topic_candidate = {
+        "id": new_topic_id,
+        "topic_name": topic_name,
+        "topic_group": topic_group,
+        "position_in_group": position_in_group,
+        "source_url": source_url,
+        "source_type": source_type,
+        "confidence": confidence.value,
+        "is_enrichment": is_enrichment,
+        "status": NOT_STARTED_STATUS,
+    }
+    renumbered = insert_new_topic(
+        existing_topics, new_topic_candidate, prerequisite_topic_ids
+    )
+    renumbered_by_id = {topic["id"]: topic for topic in renumbered}
+
+    for existing_row in existing_rows:
+        existing_row.hierarchy_position = renumbered_by_id[existing_row.id][
+            "hierarchy_position"
+        ]
+
+    new_row = OutlineTopic(
+        id=new_topic_id,
+        user_id=user_id,
+        topic_name=topic_name,
+        hierarchy_position=renumbered_by_id[new_topic_id]["hierarchy_position"],
+        topic_group=topic_group,
+        position_in_group=position_in_group,
+        source_url=source_url,
+        source_type=source_type,
+        confidence=confidence.value,
+        is_enrichment=is_enrichment,
+        status=NOT_STARTED_STATUS,
+    )
+    session.add(new_row)
+    session.commit()
+    return _to_dict(new_row)

@@ -22,12 +22,26 @@ cap), pace-signal computation + `pace_snapshots` persistence once a
 topic's 5 questions resolve, and test-out (verification-first — PRD's
 day-by-day coaching section's exception). Explicitly NOT built here
 (deliberately deferred to a later task, not stubbed with a guessed
-shape): patch-note delivery/surfacing, enrichment triggering/generation,
-goal-completion/closing-note content. Acting on the pace signal
-(extending pacing, triggering enrichment on sustained drift) is also
-deferred — this task only computes and persists the signal;
-`pace/calculator.py`'s `detect_sustained_drift` is not called here at
-all.
+shape): patch-note delivery/surfacing, goal-completion/closing-note
+content.
+
+**Acting on the pace signal (the sustained-drift-wiring task — closes
+this module's own previously-flagged "detect_sustained_drift is not
+called here at all" gap):** `complete_topic_verification`, immediately
+after writing a topic's `pace_snapshots` entry (and only when
+`is_enrichment=False` — enrichment topics never feed pace at all, PRD
+§7.10's isolation rule), reads the user's full pace-snapshot history
+(`data/pace_snapshots.py`'s `get_pace_snapshot_history`), recomputes each
+row's combined pace signal (`calculate_combined_pace_signal` — not
+reimplemented), and calls `pace/calculator.py`'s `detect_sustained_drift`
+unmodified. `"ahead"` -> `maybe_trigger_enrichment` (PRD §7.10, selects an
+unused `roles_cache` emerging skill and inserts it via
+`outline/hierarchy.py`'s existing `insert_new_topic`). `"behind"` ->
+`data/users.py`'s `extend_pacing` (a new `users.pace_extension_days`
+column — see Architecture §5's "Resolved" block for why this schema
+addition was needed). `"on_track"` -> no action. See the dedicated
+"Resolved" block near `complete_topic_verification` below for the full
+set of judgment calls.
 
 **Test-out** (`complete_topic_test_out`, `generate_gap_study_content`)
 reuses the identical `begin_verification_question`/
@@ -47,7 +61,7 @@ import asyncio
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from sqlalchemy.orm import Session
 from tavily.errors import (
@@ -64,19 +78,27 @@ from agents.research_outline_agent import (
     _call_gemini_json,
     _get_tavily_client,
 )
+from data.grounding_fallback import CACHED_SOURCE_TYPE
 from data.outline_topics import (
     COMPLETED_STATUS,
     COMPLETED_TEST_OUT_STATUS,
+    get_all_topics_for_user,
+    has_pending_enrichment_topic,
+    insert_new_outline_topic,
     mark_topic_completed,
 )
-from data.pace_snapshots import write_pace_snapshot
+from data.pace_snapshots import get_pace_snapshot_history, write_pace_snapshot
 from data.progress_log import log_progress_step
+from data.roles_cache import get_role
+from data.users import extend_pacing, get_user
 from data.verification_log import get_attempts_for_topic, write_verification_attempt
 from pace.calculator import (
     calculate_combined_pace_signal,
     calculate_timing_ratio,
     calculate_topic_score,
+    detect_sustained_drift,
 )
+from security.output_guard import validate_output_object
 from utils.exceptions import GeminiCallError, GroundingSourceCallError
 
 # Reuses agents/research_outline_agent.py's private Gemini-call helper
@@ -662,17 +684,145 @@ async def submit_verification_answer(
 # --- Pace signal computation + persistence (PRD §7.8) ------------------
 
 
+# Judgment call, flagged: enrichment topics get their own singleton
+# topic_group — the selected skill's own name plus this suffix, not
+# folded into any existing topic-group — so
+# `compute_hands_on_intensity`'s existing `group_size == 1` special case
+# (full intensity immediately, not a permanently-conceptual-only day)
+# applies naturally: an enrichment topic is always exactly one day, never
+# part of a multi-day ramping sequence. The suffix (not just the bare
+# skill name) avoids colliding with a core topic-group that happens to
+# already use the same string.
+ENRICHMENT_TOPIC_GROUP_SUFFIX = " (Enrichment)"
+ENRICHMENT_POSITION_IN_GROUP = 1
+
+# Judgment call, flagged for tuning — not specified anywhere in PRD/
+# Architecture: how many days a single sustained-behind trigger adds to
+# a user's effective pacing baseline. 2 is a small, conservative bump
+# (roughly matching a week's worth of one extra half-day of slack every
+# few topics) rather than a large jump; unvalidated against real usage,
+# same status as pace/calculator.py's own threshold constants.
+PACE_EXTENSION_DAYS_PER_TRIGGER = 2
+
+
 @dataclass(frozen=True)
 class TopicCompletionResult:
     """The pace signal computed once a topic's 5 verification question
-    slots have all resolved (PRD §7.8). Acting on this signal (extending
-    pacing, triggering enrichment on sustained drift) is explicitly out
-    of scope for this task — `pace/calculator.py`'s
-    `detect_sustained_drift` is never called here."""
+    slots have all resolved (PRD §7.8), plus what (if anything) acting on
+    it did this call.
+
+    `drift` is `None` exactly when `is_enrichment=True` — enrichment
+    completions never write a `pace_snapshots` row at all (PRD §7.10's
+    isolation rule), so drift is never even evaluated for them, not just
+    evaluated-and-ignored. For a non-enrichment completion, `drift` is
+    always one of `detect_sustained_drift`'s three literal values.
+
+    `enrichment_topic` is populated only when `drift == "ahead"` **and**
+    `maybe_trigger_enrichment` actually inserted a topic (it can return
+    `None` on "ahead" too — see that function's docstring for the cases
+    where nothing gets inserted despite sustained-ahead drift).
+
+    `pace_extension_applied` is populated only when `drift == "behind"` —
+    the new total `users.pace_extension_days` after this trigger.
+    """
 
     topic_score: float
     timing_ratio: float
     combined_pace_signal: float
+    drift: Literal["ahead", "behind", "on_track"] | None = None
+    enrichment_topic: dict[str, Any] | None = None
+    pace_extension_applied: int | None = None
+
+
+def _select_enrichment_skill(
+    emerging_skills: list[dict[str, Any]], existing_topic_names: frozenset[str]
+) -> dict[str, Any] | None:
+    """Judgment call, flagged: pick the first `roles_cache` `emerging_skills`
+    entry (in the order already stored there) whose skill name doesn't
+    already match an existing outline topic for this user (case-
+    insensitive) — "first not-yet-used", not a weighted/ranked pick,
+    since `emerging_skills`' stored order carries no other selection
+    signal (demand strength, recency) to prefer one entry over another.
+
+    Returns `None` if every entry is already used, or the list is empty.
+    """
+    for skill_entry in emerging_skills:
+        if skill_entry["skill"].casefold() not in existing_topic_names:
+            return skill_entry
+    return None
+
+
+def maybe_trigger_enrichment(
+    session: Session,
+    user_id: str,
+    resolved_role: str,
+    origin_topic_id: str,
+) -> dict[str, Any] | None:
+    """Sustained-ahead branch (PRD §7.10): select an unused emerging skill
+    from `resolved_role`'s `roles_cache` entry and insert it as a new,
+    `is_enrichment=True` outline topic immediately after `origin_topic_id`
+    (the topic whose completion triggered this check) — additive,
+    hierarchy-positioned, via `outline/hierarchy.py`'s existing
+    `insert_new_topic` (`data/outline_topics.py`'s `insert_new_outline_topic`,
+    not reimplemented here), never reducing existing content.
+
+    Source fields (`source_url`/`confidence`) are carried through from
+    the selected `roles_cache` entry, re-validated via
+    `security/output_guard.py`'s `validate_output_object` (CLAUDE.md
+    guardrail #12) rather than trusted as an already-safe dict — the same
+    structural-sourcing-safety pattern `data/grounding_fallback.py`'s
+    `_rehydrate_skill_entry` already uses for cached-fallback skills.
+    Unlike that function, the persisted `confidence` is **not** overridden
+    to `cached-low`: this isn't standing in for a failed live lookup, it's
+    a legitimate reference to an already-graded emerging skill for
+    enrichment selection, so the original tier stays meaningful.
+    `source_type` is stamped `CACHED_SOURCE_TYPE` (re-imported from
+    `data/grounding_fallback.py`) for the same reason that module already
+    established: `roles_cache` never persists a per-skill `source_type`.
+
+    Returns the inserted topic dict, or `None` if nothing was inserted:
+    the user already has a pending (unresolved) enrichment topic
+    (`has_pending_enrichment_topic`), the role has no `roles_cache` entry
+    or an empty `emerging_skills` list, or every emerging skill already
+    matches an existing outline topic for this user.
+    """
+    if has_pending_enrichment_topic(session, user_id):
+        return None
+
+    role = get_role(session, resolved_role)
+    if role is None or not role["emerging_skills"]:
+        return None
+
+    existing_topics = get_all_topics_for_user(session, user_id)
+    existing_topic_names = frozenset(
+        topic["topic_name"].casefold() for topic in existing_topics
+    )
+
+    selected = _select_enrichment_skill(role["emerging_skills"], existing_topic_names)
+    if selected is None:
+        return None
+
+    grounded = validate_output_object(
+        {
+            "source_url": selected["source_url"],
+            "source_type": CACHED_SOURCE_TYPE,
+            "confidence": selected["confidence"],
+            "skill": selected["skill"],
+        }
+    )
+
+    return insert_new_outline_topic(
+        session,
+        user_id=user_id,
+        topic_name=selected["skill"],
+        topic_group=f"{selected['skill']}{ENRICHMENT_TOPIC_GROUP_SUFFIX}",
+        position_in_group=ENRICHMENT_POSITION_IN_GROUP,
+        source_url=grounded.source_url,
+        source_type=grounded.source_type,
+        confidence=grounded.confidence,
+        is_enrichment=True,
+        prerequisite_topic_ids=frozenset({origin_topic_id}),
+    )
 
 
 def _get_latest_attempt_per_question(
@@ -735,13 +885,15 @@ def complete_topic_verification(
     days_taken: int,
     days_expected: int,
     is_test_out: bool = False,
+    is_enrichment: bool = False,
 ) -> TopicCompletionResult:
     """Called once all 5 verification question slots for `topic_id` have
     resolved: computes `topic_score` from their final credits
     (`pace/calculator.py`), blends it with `timing_ratio` into the
-    combined pace signal, persists a `pace_snapshots` row, and marks the
-    topic completed in `outline_topics` (PRD §7.7: "topic requires all
-    5 questions passed... to complete").
+    combined pace signal, persists a `pace_snapshots` row, acts on
+    sustained drift if any, and marks the topic completed in
+    `outline_topics` (PRD §7.7: "topic requires all 5 questions passed...
+    to complete").
 
     `is_test_out`, when `True`, marks the topic `completed_test_out`
     instead of `completed` (Architecture §5's schema: a distinct status
@@ -749,10 +901,32 @@ def complete_topic_verification(
     that passes `True`; every regular (non-test-out) caller is unaffected
     by this parameter's default of `False`.
 
-    Does NOT act on the resulting signal (extending pacing, triggering
-    enrichment) — that's a later task's job, per this task's explicit
-    scope boundary; `pace/calculator.py`'s `detect_sustained_drift` is
-    never called here.
+    `is_enrichment`, when `True`, is a **structural, unconditional skip**
+    of the entire pace-snapshot-write-and-act block below (PRD §7.10:
+    "isolated from pace/verification consequences... never feeds the
+    pace formula") — not a comment or a caller-side convention; the write
+    call itself is inside the `if not is_enrichment:` guard, so there is
+    no code path by which an enrichment completion can write a
+    `pace_snapshots` row or influence `detect_sustained_drift`'s window
+    for any other topic. The topic still gets marked
+    completed/completed_test_out either way, purely for future
+    closing-note credit (goal-completion closing-note content itself is a
+    separate, later task).
+
+    When a `pace_snapshots` row *is* written (i.e. `is_enrichment=False`),
+    this function also reads the user's full pace-snapshot history
+    (`data/pace_snapshots.py`'s `get_pace_snapshot_history` — which now
+    includes the row just written), recomputes each entry's combined pace
+    signal (`calculate_combined_pace_signal`, not reimplemented), and
+    calls `pace/calculator.py`'s `detect_sustained_drift` unmodified
+    (cold-start/window-size gating is entirely that function's own
+    responsibility — not duplicated here). `"ahead"` calls
+    `maybe_trigger_enrichment` (skipped, logged as `enrichment_topic=None`,
+    if the user's `users.resolved_role` is missing — a data-integrity gap
+    upstream, not something this function raises over). `"behind"` calls
+    `data/users.py`'s `extend_pacing` by `PACE_EXTENSION_DAYS_PER_TRIGGER`.
+    `"on_track"` (including every cold-start call, fewer than
+    `DRIFT_WINDOW_SIZE` snapshots) does nothing further.
 
     Raises `ValueError` (via `_get_final_credits_per_question` or
     `pace/calculator.py`) if the topic's 5 question slots aren't all
@@ -766,9 +940,38 @@ def complete_topic_verification(
     timing_ratio = calculate_timing_ratio(days_taken, days_expected)
     combined_signal = calculate_combined_pace_signal(topic_score, timing_ratio)
 
-    write_pace_snapshot(
-        session, user_id, topic_id, topic_score, timing_ratio, days_taken, days_expected
-    )
+    drift: Literal["ahead", "behind", "on_track"] | None = None
+    enrichment_topic: dict[str, Any] | None = None
+    pace_extension_applied: int | None = None
+
+    if not is_enrichment:
+        write_pace_snapshot(
+            session,
+            user_id,
+            topic_id,
+            topic_score,
+            timing_ratio,
+            days_taken,
+            days_expected,
+        )
+        history = get_pace_snapshot_history(session, user_id)
+        pace_signals = [
+            calculate_combined_pace_signal(row["topic_score"], row["timing_ratio"])
+            for row in history
+        ]
+        drift = detect_sustained_drift(pace_signals)
+
+        if drift == "ahead":
+            user = get_user(session, user_id)
+            if user is not None and user["resolved_role"]:
+                enrichment_topic = maybe_trigger_enrichment(
+                    session, user_id, user["resolved_role"], topic_id
+                )
+        elif drift == "behind":
+            pace_extension_applied = extend_pacing(
+                session, user_id, PACE_EXTENSION_DAYS_PER_TRIGGER
+            )
+
     mark_topic_completed(
         session,
         topic_id,
@@ -779,6 +982,9 @@ def complete_topic_verification(
         topic_score=topic_score,
         timing_ratio=timing_ratio,
         combined_pace_signal=combined_signal,
+        drift=drift,
+        enrichment_topic=enrichment_topic,
+        pace_extension_applied=pace_extension_applied,
     )
 
 
@@ -896,6 +1102,7 @@ async def complete_topic_test_out(
     topic_id: str,
     days_taken: int,
     days_expected: int,
+    is_enrichment: bool = False,
 ) -> TestOutResult:
     """Resolve a topic via test-out (PRD §7.6's "verification-first"
     exception): the user answers all 5 verification questions before any
@@ -906,6 +1113,14 @@ async def complete_topic_test_out(
     `is_test_out=True`, not a separate mechanism. Call this once all 5
     question slots have resolved (mirrors `complete_topic_verification`'s
     own precondition, enforced the same way).
+
+    `is_enrichment`, threaded straight through to
+    `complete_topic_verification`, structurally skips the
+    `pace_snapshots` write/drift-detection block exactly as it does for
+    regular verification (PRD §7.10) — nothing in this codebase's test-out
+    logic restricts it to non-enrichment topics, so this combination
+    (test-out an enrichment topic) is treated as genuinely possible, not
+    assumed impossible.
 
     Full pass (every slot resolved at `FULL_CREDIT`) -> topic marked
     `completed_test_out`, no study content generated at all (PRD §7.6).
@@ -931,7 +1146,13 @@ async def complete_topic_test_out(
     full_pass = all(credit == FULL_CREDIT for credit in credits)
 
     completion = complete_topic_verification(
-        session, user_id, topic_id, days_taken, days_expected, is_test_out=True
+        session,
+        user_id,
+        topic_id,
+        days_taken,
+        days_expected,
+        is_test_out=True,
+        is_enrichment=is_enrichment,
     )
 
     return TestOutResult(completion=completion, full_pass=full_pass)

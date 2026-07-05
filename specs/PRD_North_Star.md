@@ -237,6 +237,10 @@ Timing ratio: `days_taken / days_expected`, benchmarked against the **user's own
 
 **Initial pace expectation:** background/experience sets the *starting* pace-expectation profile (used pre-calibration); actual hierarchy-position skipping only ever happens via test-out, never via background-based assumption.
 
+**Resolved (`src/agents/coaching_pace_agent.py`'s `complete_topic_verification` drift wiring; the sustained-drift-wiring task — closes this section's own previously-flagged "detect_sustained_drift is not called" gap — judgment calls made and flagged during implementation, not specified above at the time of writing):**
+- **Wiring point:** immediately after a topic's `pace_snapshots` row is written (never for an enrichment topic — see §7.10's isolation rule), the user's full snapshot history is re-read, each entry's combined signal is recomputed via the existing blend function, and `detect_sustained_drift` is called completely unmodified — no drift-window or threshold logic is duplicated here. Cold-start gating (weeks 1-2 / fewer than `DRIFT_WINDOW_SIZE` snapshots never triggers anything) was confirmed to already be built into `detect_sustained_drift` itself; no second calibration check was added.
+- **"Ahead" -> enrichment (§7.10); "behind" -> pacing-extension mechanism, a new judgment call** — see §7.10's own "Resolved" block for enrichment, and Architecture §5's "Resolved" block for the pacing-extension mechanism (a new `users.pace_extension_days` column, incremented by a flagged, unvalidated constant each time behind fires). Consuming that accumulated value in a future `days_expected` calculation is not built by this task — only the accumulation mechanism itself.
+
 ### 7.9 Patch-Notes
 
 Generated when a significant market event affects an already-completed topic. Never reopens or alters the original topic's completion/verification status — always a separate, small, independently-assessed unit.
@@ -266,6 +270,14 @@ Triggered by sustained-ahead pace. Uses the **same outline-update insertion mech
 - Gets the full day-content treatment (theory, hands-on ramping, reflection) — same structure as core topics
 - **Isolated from pace/verification consequences** — struggling on enrichment never triggers anything, never feeds the pace formula
 - Still requires its own pass/fail verification, purely for closing-note credit (not for pace)
+
+**Resolved (`src/agents/coaching_pace_agent.py`'s `maybe_trigger_enrichment`/`_select_enrichment_skill`, `data/outline_topics.py`'s `get_all_topics_for_user`/`has_pending_enrichment_topic`/`insert_new_outline_topic`; the sustained-drift-wiring task — judgment calls made and flagged during implementation, not specified above at the time of writing):**
+- **Candidate source: the resolved role's own `roles_cache` `emerging_skills` bucket**, not the user's own live grounding result — `emerging_skills` already carries the real core/emerging split `roles_cache` maintains; a live `LiveGroundingResult` (Architecture §3) only ever returns one flat skill list, per the already-flagged degenerate-split limitation (Future Improvements #5).
+- **Selection rule, a genuine judgment call:** the first `emerging_skills` entry (in `roles_cache`'s own stored order) whose skill name doesn't already match an existing outline topic for the user (case-insensitive) — "first not-yet-used," not a weighted or ranked pick, since that list carries no other ordering signal (demand strength, recency) to prefer one entry over another.
+- **One pending enrichment topic at a time, a judgment call not unambiguous from the schema alone:** a user with any `outline_topics` row that is `is_enrichment=True` and not yet resolved (`status` not in `{completed, completed_test_out}`) gets no second enrichment topic inserted on a later "ahead" trigger, regardless of which topic completion triggered it.
+- **Insertion mechanism, actually wired for the first time by this task:** `outline/hierarchy.py`'s existing `insert_new_topic` — not a second insertion path. The new topic's sole prerequisite is the just-completed topic that triggered the check, so it lands immediately after the user's current position (matching this section's own "additive, hierarchy-positioned" framing), never at the very start of the whole hierarchy.
+- **Isolation is structural, not advisory:** `complete_topic_verification`'s entire `pace_snapshots`-write-and-drift-detection block sits inside a single `if not is_enrichment:` guard — an enrichment topic's completion is architecturally incapable of writing a `pace_snapshots` row or influencing a future `detect_sustained_drift` call, regardless of credit earned, satisfying this section's "never feeds the pace formula" as an unconditional code-level guarantee rather than a caller convention.
+- **Test-out + enrichment is treated as a real, possible combination** (both converge on the identical `complete_topic_verification` completion path) — built and tested, not assumed impossible.
 
 ### 7.11 Goal Completion
 

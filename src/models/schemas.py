@@ -6,15 +6,21 @@ Field-level definitions are fleshed out incrementally, as each table's I/O
 module is implemented — a class with no columns below is still a
 docstring-only placeholder awaiting its own I/O module; `RolesCache` was
 the first to be fully mapped, alongside `src/data/roles_cache.py`.
-`OutlineTopic`/`ProgressLog`/`VerificationAttempt`/`PaceSnapshot`/`PatchNote`
-are fleshed out here alongside `src/data/outline_topics.py`,
+`OutlineTopic`/`ProgressLog`/`VerificationAttempt`/`PaceSnapshot`/`PatchNote`/
+`User` are fleshed out here alongside `src/data/outline_topics.py`,
 `src/data/progress_log.py`, `src/data/verification_log.py`,
-`src/data/pace_snapshots.py`, and `src/data/patch_notes.py`. `user_id`/
-`topic_id`/`origin_topic_id` columns below are plain UUID columns, not
-`ForeignKey`-constrained — `User` remains an unmapped placeholder, and a
-FK to an unmapped table isn't possible; `PatchNote.user_id` stays
-unconstrained for that reason even though `PatchNote` itself is now
-mapped. Add the constraints once `User` is mapped too.
+`src/data/pace_snapshots.py`, `src/data/patch_notes.py`, and
+`src/data/users.py`. `user_id`/`topic_id`/`origin_topic_id` columns below
+remain plain UUID columns, not `ForeignKey`-constrained, even now that
+every referenced table is mapped — no migration/schema-push mechanism
+exists yet at all (see §5's "Known limitation"), so adding FK constraints
+now would be premature relative to the tables actually being creatable in
+a real database; revisit once that gap closes.
+
+`User.pace_extension_days` (the sustained-behind pacing-extension task)
+is a schema addition beyond Architecture §5's original `users` SQL block
+at the time `User` was still an unmapped placeholder — see that section's
+"Resolved" block for the judgment call.
 """
 
 import uuid
@@ -29,11 +35,31 @@ class Base(DeclarativeBase):
     """Shared declarative base for all SQLAlchemy models in this project."""
 
 
-class User:
+class User(Base):
     """`users` — user profile: background, current job, years of
     experience, prior self-study, resolved role, role confidence, pacing
-    profile.
+    profile, plus `pace_extension_days` (see module docstring).
     """
+
+    __tablename__ = "users"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    background: Mapped[str | None] = mapped_column(default=None)
+    current_job: Mapped[str | None] = mapped_column(default=None)
+    years_experience: Mapped[int | None] = mapped_column(default=None)
+    prior_self_study: Mapped[str | None] = mapped_column(default=None)
+    available_time_per_week: Mapped[int | None] = mapped_column(default=None)
+    resolved_role: Mapped[str | None] = mapped_column(default=None)
+    role_confidence: Mapped[str | None] = mapped_column(default=None)
+    pacing_profile: Mapped[str | None] = mapped_column(default=None)
+    created_at: Mapped[datetime | None] = mapped_column(default=None)
+    # New column, this task (sustained-behind pacing-extension mechanism,
+    # see Architecture §5's "Resolved" block): the accumulated number of
+    # extra days added to this user's effective pacing baseline by
+    # sustained-behind drift. 0 for a user who has never drifted behind.
+    pace_extension_days: Mapped[int] = mapped_column(default=0)
 
 
 class RolesCache(Base):

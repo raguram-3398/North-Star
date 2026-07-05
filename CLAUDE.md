@@ -61,14 +61,14 @@ north-star/
 │   ├── main.py
 │   ├── agents/
 │   │   ├── research_outline_agent.py   # reasoning/generation only
-│   │   └── coaching_pace_agent.py      # reasoning/generation only
+│   │   └── coaching_pace_agent.py      # reasoning/generation only — complete_topic_verification wires detect_sustained_drift (maybe_trigger_enrichment on "ahead", extend_pacing on "behind")
 │   ├── security/
 │   │   ├── input_gate.py               # clarify-gate bound/loop state, reject detection
 │   │   └── output_guard.py             # confidence-ladder enforcement — the structural gate before any DB write
 │   ├── pace/
 │   │   └── calculator.py               # topic_score, timing_ratio, 80/20 blend, sustained-drift check
 │   ├── outline/
-│   │   ├── hierarchy.py                # insertion into existing hierarchy
+│   │   ├── hierarchy.py                # insertion into existing hierarchy — insert_new_topic's first real caller is data/outline_topics.py's insert_new_outline_topic
 │   │   └── significant_event.py        # bucket/confidence-crossing diff
 │   ├── patches/
 │   │   └── patch_manager.py            # confidence branching, delivery ordering (decide_patch_delivery), low-confidence learn-now-or-defer state machine (PatchDecisionState/resolve_patch_decision)
@@ -77,7 +77,9 @@ north-star/
 │   ├── data/
 │   │   ├── roles_cache.py              # roles_cache I/O
 │   │   ├── progress_log.py             # progress_log I/O
-│   │   ├── outline_topics.py           # outline_topics I/O, including get_completed_topics_matching_skill
+│   │   ├── pace_snapshots.py           # write_pace_snapshot + get_pace_snapshot_history
+│   │   ├── users.py                    # get_user + extend_pacing (pacing-extension mechanism)
+│   │   ├── outline_topics.py           # outline_topics I/O: get_completed_topics_matching_skill, get_all_topics_for_user/has_pending_enrichment_topic/insert_new_outline_topic (enrichment insertion)
 │   │   └── patch_notes.py              # patch_notes I/O
 │   ├── models/
 │   │   └── schemas.py

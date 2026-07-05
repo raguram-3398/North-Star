@@ -35,6 +35,7 @@ from unittest.mock import MagicMock
 import pytest
 
 import agents.coaching_pace_agent as cpa
+from security.output_guard import ConfidenceTier
 from tests.test_research_outline_agent import (
     _FakeTavilyClient,
     _patch_gemini,
@@ -543,16 +544,21 @@ def test_complete_topic_verification_requires_slots_resolved_not_just_attempted(
         )
 
 
-def test_complete_topic_verification_calls_pace_calculator_and_persists(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    attempts = [
-        {"question_number": 1, "attempt_number": 1, "passed": True, "credit": 1.0},
-        {"question_number": 2, "attempt_number": 1, "passed": True, "credit": 1.0},
-        {"question_number": 3, "attempt_number": 3, "passed": False, "credit": 0.5},
-        {"question_number": 4, "attempt_number": 1, "passed": True, "credit": 1.0},
-        {"question_number": 5, "attempt_number": 2, "passed": True, "credit": 1.0},
+def _all_full_credit_attempts() -> list[dict]:
+    return [
+        {"question_number": q, "attempt_number": 1, "passed": True, "credit": 1.0}
+        for q in range(1, 6)
     ]
+
+
+def _patch_completion_writes(
+    monkeypatch: pytest.MonkeyPatch, attempts: list[dict]
+) -> tuple[list[tuple], list[tuple]]:
+    """Shared setup for complete_topic_verification tests: fake
+    get_attempts_for_topic/write_pace_snapshot/mark_topic_completed,
+    returning the snapshot_calls/completed_calls lists so callers can
+    assert on them.
+    """
     monkeypatch.setattr(
         cpa, "get_attempts_for_topic", lambda session, topic_id: attempts
     )
@@ -568,6 +574,24 @@ def test_complete_topic_verification_calls_pace_calculator_and_persists(
         "mark_topic_completed",
         lambda *args, **kwargs: completed_calls.append((args, kwargs)),
     )
+    return snapshot_calls, completed_calls
+
+
+def test_complete_topic_verification_calls_pace_calculator_and_persists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = [
+        {"question_number": 1, "attempt_number": 1, "passed": True, "credit": 1.0},
+        {"question_number": 2, "attempt_number": 1, "passed": True, "credit": 1.0},
+        {"question_number": 3, "attempt_number": 3, "passed": False, "credit": 0.5},
+        {"question_number": 4, "attempt_number": 1, "passed": True, "credit": 1.0},
+        {"question_number": 5, "attempt_number": 2, "passed": True, "credit": 1.0},
+    ]
+    snapshot_calls, completed_calls = _patch_completion_writes(monkeypatch, attempts)
+    # Cold start (no prior history) — this test is about the pace-calc/
+    # persistence wiring, not drift detection (see the dedicated drift
+    # tests below).
+    monkeypatch.setattr(cpa, "get_pace_snapshot_history", lambda session, uid: [])
     session = MagicMock()
 
     result = cpa.complete_topic_verification(
@@ -577,6 +601,7 @@ def test_complete_topic_verification_calls_pace_calculator_and_persists(
     expected_topic_score = (1.0 + 1.0 + 0.5 + 1.0 + 1.0) / 5
     assert result.topic_score == pytest.approx(expected_topic_score)
     assert result.timing_ratio == pytest.approx(4 / 5)
+    assert result.drift == "on_track"
     assert len(snapshot_calls) == 1
     snapshot_args = snapshot_calls[0][0]
     assert snapshot_args[0] is session
@@ -590,35 +615,479 @@ def test_complete_topic_verification_calls_pace_calculator_and_persists(
     assert completed_calls[0][0] == (session, "t1")
 
 
-def test_complete_topic_verification_does_not_call_detect_sustained_drift(
+# --- Sustained-drift wiring (Part 1) ---------------------------------------
+
+
+def test_complete_topic_verification_cold_start_triggers_neither_branch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Explicit scope-boundary test: acting on the pace signal (sustained
-    drift) is the next task's job — this task only computes/persists it."""
-    attempts = [
-        {"question_number": q, "attempt_number": 1, "passed": True, "credit": 1.0}
-        for q in range(1, 6)
-    ]
+    """Fewer than DRIFT_WINDOW_SIZE (3) total snapshots — detect_sustained_drift's
+    own cold-start gating, not a second check duplicated in this module.
+    """
+    attempts = _all_full_credit_attempts()
+    _patch_completion_writes(monkeypatch, attempts)
+    # Only 2 total snapshots (including the one this call is about to add
+    # would make 3, but get_pace_snapshot_history is faked to represent
+    # "before this call's own write took effect on a mocked session" —
+    # i.e. genuinely below the window).
     monkeypatch.setattr(
-        cpa, "get_attempts_for_topic", lambda session, topic_id: attempts
+        cpa,
+        "get_pace_snapshot_history",
+        lambda session, uid: [
+            {"topic_score": 1.0, "timing_ratio": 1.0},
+            {"topic_score": 1.0, "timing_ratio": 1.0},
+        ],
     )
-    monkeypatch.setattr(cpa, "write_pace_snapshot", lambda *a, **k: None)
-    monkeypatch.setattr(cpa, "mark_topic_completed", lambda *a, **k: None)
-
-    called = []
-    import pace.calculator as calculator_module
-
+    maybe_trigger_calls: list[tuple] = []
     monkeypatch.setattr(
-        calculator_module,
-        "detect_sustained_drift",
-        lambda *a, **k: called.append((a, k)),
+        cpa,
+        "maybe_trigger_enrichment",
+        lambda *a, **k: maybe_trigger_calls.append((a, k)),
+    )
+    extend_pacing_calls: list[tuple] = []
+    monkeypatch.setattr(
+        cpa, "extend_pacing", lambda *a, **k: extend_pacing_calls.append((a, k))
+    )
+
+    result = cpa.complete_topic_verification(
+        MagicMock(), "u1", "t1", days_taken=5, days_expected=5
+    )
+
+    assert result.drift == "on_track"
+    assert maybe_trigger_calls == []
+    assert extend_pacing_calls == []
+    assert result.enrichment_topic is None
+    assert result.pace_extension_applied is None
+
+
+def test_complete_topic_verification_ordinary_variation_triggers_neither_branch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A full window of signals that land strictly between the behind/
+    ahead thresholds must trigger neither branch."""
+    attempts = _all_full_credit_attempts()
+    _patch_completion_writes(monkeypatch, attempts)
+    monkeypatch.setattr(
+        cpa,
+        "get_pace_snapshot_history",
+        lambda session, uid: [
+            {"topic_score": 0.8, "timing_ratio": 1.0},
+            {"topic_score": 0.85, "timing_ratio": 1.0},
+            {"topic_score": 0.8, "timing_ratio": 1.0},
+        ],
+    )
+    maybe_trigger_calls: list[tuple] = []
+    monkeypatch.setattr(
+        cpa,
+        "maybe_trigger_enrichment",
+        lambda *a, **k: maybe_trigger_calls.append((a, k)),
+    )
+    extend_pacing_calls: list[tuple] = []
+    monkeypatch.setattr(
+        cpa, "extend_pacing", lambda *a, **k: extend_pacing_calls.append((a, k))
+    )
+
+    result = cpa.complete_topic_verification(
+        MagicMock(), "u1", "t1", days_taken=5, days_expected=5
+    )
+
+    assert result.drift == "on_track"
+    assert maybe_trigger_calls == []
+    assert extend_pacing_calls == []
+
+
+def test_complete_topic_verification_sustained_ahead_triggers_enrichment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = _all_full_credit_attempts()
+    _patch_completion_writes(monkeypatch, attempts)
+    monkeypatch.setattr(
+        cpa,
+        "get_pace_snapshot_history",
+        lambda session, uid: [
+            {"topic_score": 1.0, "timing_ratio": 1.0},
+            {"topic_score": 1.0, "timing_ratio": 1.0},
+            {"topic_score": 1.0, "timing_ratio": 1.0},
+        ],
+    )
+    monkeypatch.setattr(
+        cpa, "get_user", lambda session, uid: {"resolved_role": "Backend Engineer"}
+    )
+    trigger_calls: list[tuple] = []
+
+    def _fake_trigger(session, user_id, resolved_role, origin_topic_id):
+        trigger_calls.append((user_id, resolved_role, origin_topic_id))
+        return {"id": "enrichment-topic-1", "topic_name": "GraphQL"}
+
+    monkeypatch.setattr(cpa, "maybe_trigger_enrichment", _fake_trigger)
+    extend_pacing_calls: list[tuple] = []
+    monkeypatch.setattr(
+        cpa, "extend_pacing", lambda *a, **k: extend_pacing_calls.append((a, k))
+    )
+
+    result = cpa.complete_topic_verification(
+        MagicMock(), "u1", "t1", days_taken=5, days_expected=5
+    )
+
+    assert result.drift == "ahead"
+    assert trigger_calls == [("u1", "Backend Engineer", "t1")]
+    assert result.enrichment_topic == {
+        "id": "enrichment-topic-1",
+        "topic_name": "GraphQL",
+    }
+    assert extend_pacing_calls == []
+
+
+def test_complete_topic_verification_sustained_behind_triggers_pacing_extension(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = _all_full_credit_attempts()
+    _patch_completion_writes(monkeypatch, attempts)
+    monkeypatch.setattr(
+        cpa,
+        "get_pace_snapshot_history",
+        lambda session, uid: [
+            {"topic_score": 0.5, "timing_ratio": 1.0},
+            {"topic_score": 0.5, "timing_ratio": 1.0},
+            {"topic_score": 0.5, "timing_ratio": 1.0},
+        ],
+    )
+    trigger_calls: list[tuple] = []
+    monkeypatch.setattr(
+        cpa, "maybe_trigger_enrichment", lambda *a, **k: trigger_calls.append((a, k))
+    )
+    extend_calls: list[tuple] = []
+
+    def _fake_extend(session, user_id, extension_days):
+        extend_calls.append((user_id, extension_days))
+        return 2
+
+    monkeypatch.setattr(cpa, "extend_pacing", _fake_extend)
+
+    result = cpa.complete_topic_verification(
+        MagicMock(), "u1", "t1", days_taken=5, days_expected=5
+    )
+
+    assert result.drift == "behind"
+    assert extend_calls == [("u1", cpa.PACE_EXTENSION_DAYS_PER_TRIGGER)]
+    assert result.pace_extension_applied == 2
+    assert trigger_calls == []
+
+
+def test_complete_topic_verification_sustained_behind_never_touches_outline_topics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pacing extension must never touch outline_topics content (no
+    deletion, no is_enrichment tagging, nothing structural) — proven here
+    by asserting the only three functions that could modify
+    outline_topics are never called at all on the behind path.
+    """
+    attempts = _all_full_credit_attempts()
+    _patch_completion_writes(monkeypatch, attempts)
+    monkeypatch.setattr(
+        cpa,
+        "get_pace_snapshot_history",
+        lambda session, uid: [{"topic_score": 0.5, "timing_ratio": 1.0}] * 3,
+    )
+    monkeypatch.setattr(cpa, "extend_pacing", lambda *a, **k: 2)
+    insert_calls: list[tuple] = []
+    monkeypatch.setattr(
+        cpa, "insert_new_outline_topic", lambda *a, **k: insert_calls.append((a, k))
+    )
+    get_all_topics_calls: list[tuple] = []
+    monkeypatch.setattr(
+        cpa,
+        "get_all_topics_for_user",
+        lambda *a, **k: get_all_topics_calls.append((a, k)) or [],
+    )
+    has_pending_calls: list[tuple] = []
+    monkeypatch.setattr(
+        cpa,
+        "has_pending_enrichment_topic",
+        lambda *a, **k: has_pending_calls.append((a, k)) or False,
     )
 
     cpa.complete_topic_verification(
         MagicMock(), "u1", "t1", days_taken=5, days_expected=5
     )
 
-    assert called == []
+    assert insert_calls == []
+    assert get_all_topics_calls == []
+    assert has_pending_calls == []
+
+
+# --- Enrichment selection/insertion (Part 2) -------------------------------
+
+
+def test_maybe_trigger_enrichment_inserts_unused_emerging_skill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cpa, "has_pending_enrichment_topic", lambda session, uid: False)
+    monkeypatch.setattr(
+        cpa,
+        "get_role",
+        lambda session, role: {
+            "role_name": role,
+            "core_skills": [],
+            "emerging_skills": [
+                {
+                    "skill": "GraphQL",
+                    "source_url": "https://example.com/graphql",
+                    "confidence": "medium",
+                },
+                {
+                    "skill": "gRPC",
+                    "source_url": "https://example.com/grpc",
+                    "confidence": "low",
+                },
+            ],
+            "last_updated": None,
+        },
+    )
+    monkeypatch.setattr(
+        cpa,
+        "get_all_topics_for_user",
+        lambda session, uid: [{"topic_name": "SQL"}, {"topic_name": "Docker"}],
+    )
+    insert_calls: list[dict] = []
+
+    def _fake_insert(session, **kwargs):
+        insert_calls.append(kwargs)
+        return {"id": "new-topic-1", **kwargs}
+
+    monkeypatch.setattr(cpa, "insert_new_outline_topic", _fake_insert)
+
+    result = cpa.maybe_trigger_enrichment(
+        MagicMock(), "u1", "Backend Engineer", "origin-topic-1"
+    )
+
+    assert result is not None
+    assert len(insert_calls) == 1
+    call = insert_calls[0]
+    assert call["user_id"] == "u1"
+    assert call["topic_name"] == "GraphQL"
+    assert call["topic_group"] == "GraphQL (Enrichment)"
+    assert call["is_enrichment"] is True
+    assert call["source_url"] == "https://example.com/graphql"
+    assert call["source_type"] == "roles_cache-cached"
+    assert call["confidence"] == ConfidenceTier.MEDIUM
+    assert call["prerequisite_topic_ids"] == frozenset({"origin-topic-1"})
+
+
+def test_maybe_trigger_enrichment_skips_an_already_used_emerging_skill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The first emerging skill (GraphQL) already matches an existing
+    outline topic (case-insensitively) — selection must move on to the
+    next one (gRPC), not stop or error.
+    """
+    monkeypatch.setattr(cpa, "has_pending_enrichment_topic", lambda session, uid: False)
+    monkeypatch.setattr(
+        cpa,
+        "get_role",
+        lambda session, role: {
+            "core_skills": [],
+            "emerging_skills": [
+                {
+                    "skill": "GraphQL",
+                    "source_url": "https://x/graphql",
+                    "confidence": "medium",
+                },
+                {"skill": "gRPC", "source_url": "https://x/grpc", "confidence": "low"},
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        cpa,
+        "get_all_topics_for_user",
+        lambda session, uid: [{"topic_name": "graphql"}],
+    )
+    insert_calls: list[dict] = []
+
+    def _fake_insert(session, **kwargs):
+        insert_calls.append(kwargs)
+        return {"id": "t2", **kwargs}
+
+    monkeypatch.setattr(cpa, "insert_new_outline_topic", _fake_insert)
+
+    result = cpa.maybe_trigger_enrichment(MagicMock(), "u1", "Backend Engineer", "t1")
+
+    assert result is not None
+    assert insert_calls[0]["topic_name"] == "gRPC"
+
+
+def test_maybe_trigger_enrichment_skips_if_pending_enrichment_exists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cpa, "has_pending_enrichment_topic", lambda session, uid: True)
+    get_role_calls: list[str] = []
+    monkeypatch.setattr(
+        cpa, "get_role", lambda session, role: get_role_calls.append(role)
+    )
+    insert_calls: list[dict] = []
+    monkeypatch.setattr(
+        cpa, "insert_new_outline_topic", lambda *a, **k: insert_calls.append(k)
+    )
+
+    result = cpa.maybe_trigger_enrichment(MagicMock(), "u1", "Backend Engineer", "t1")
+
+    assert result is None
+    assert get_role_calls == []
+    assert insert_calls == []
+
+
+def test_maybe_trigger_enrichment_does_nothing_when_role_has_no_emerging_skills(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cpa, "has_pending_enrichment_topic", lambda session, uid: False)
+    monkeypatch.setattr(
+        cpa,
+        "get_role",
+        lambda session, role: {"core_skills": [], "emerging_skills": []},
+    )
+    insert_calls: list[dict] = []
+    monkeypatch.setattr(
+        cpa, "insert_new_outline_topic", lambda *a, **k: insert_calls.append(k)
+    )
+
+    result = cpa.maybe_trigger_enrichment(MagicMock(), "u1", "Backend Engineer", "t1")
+
+    assert result is None
+    assert insert_calls == []
+
+
+def test_maybe_trigger_enrichment_does_nothing_when_role_not_in_roles_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cpa, "has_pending_enrichment_topic", lambda session, uid: False)
+    monkeypatch.setattr(cpa, "get_role", lambda session, role: None)
+
+    result = cpa.maybe_trigger_enrichment(MagicMock(), "u1", "Obscure Role", "t1")
+
+    assert result is None
+
+
+# --- Structural pace isolation for enrichment verification (Part 3) -------
+
+
+def test_complete_topic_verification_enrichment_never_writes_pace_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = _all_full_credit_attempts()  # would be "ahead"-eligible if evaluated
+    monkeypatch.setattr(
+        cpa, "get_attempts_for_topic", lambda session, topic_id: attempts
+    )
+    snapshot_calls: list[tuple] = []
+    monkeypatch.setattr(
+        cpa, "write_pace_snapshot", lambda *a, **k: snapshot_calls.append((a, k))
+    )
+    history_calls: list[str] = []
+    monkeypatch.setattr(
+        cpa,
+        "get_pace_snapshot_history",
+        lambda session, uid: history_calls.append(uid) or [],
+    )
+    completed_calls: list[tuple] = []
+    monkeypatch.setattr(
+        cpa,
+        "mark_topic_completed",
+        lambda *args, **kwargs: completed_calls.append((args, kwargs)),
+    )
+
+    result = cpa.complete_topic_verification(
+        MagicMock(), "u1", "t1", days_taken=1, days_expected=1, is_enrichment=True
+    )
+
+    assert snapshot_calls == []
+    assert history_calls == []  # drift isn't even evaluated for enrichment
+    assert result.drift is None
+    assert result.enrichment_topic is None
+    assert result.pace_extension_applied is None
+    assert len(completed_calls) == 1  # still marks completed, for closing-note credit
+
+
+def test_complete_topic_verification_enrichment_half_credit_still_skips_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Even when full/half credit was earned (a topic can still complete
+    with HALF_CREDIT slots via the retry-cap teach-in) — is_enrichment=True
+    must still skip the pace_snapshots write unconditionally.
+    """
+    attempts = [
+        {
+            "question_number": q,
+            "attempt_number": 1 if q <= 3 else cpa.MAX_VERIFICATION_ATTEMPTS,
+            "passed": q <= 3,
+            "credit": 1.0 if q <= 3 else 0.5,
+        }
+        for q in range(1, 6)
+    ]
+    monkeypatch.setattr(
+        cpa, "get_attempts_for_topic", lambda session, topic_id: attempts
+    )
+    snapshot_calls: list[tuple] = []
+    monkeypatch.setattr(
+        cpa, "write_pace_snapshot", lambda *a, **k: snapshot_calls.append((a, k))
+    )
+    monkeypatch.setattr(cpa, "mark_topic_completed", lambda *a, **k: None)
+
+    cpa.complete_topic_verification(
+        MagicMock(), "u1", "t1", days_taken=1, days_expected=1, is_enrichment=True
+    )
+
+    assert snapshot_calls == []
+
+
+def test_complete_topic_verification_non_enrichment_still_writes_pace_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression guard: adding `is_enrichment` must not change the
+    default (`is_enrichment=False`) behavior — pace_snapshots still gets
+    written exactly as before.
+    """
+    attempts = _all_full_credit_attempts()
+    snapshot_calls, completed_calls = _patch_completion_writes(monkeypatch, attempts)
+    monkeypatch.setattr(cpa, "get_pace_snapshot_history", lambda session, uid: [])
+
+    cpa.complete_topic_verification(
+        MagicMock(), "u1", "t1", days_taken=1, days_expected=1
+    )
+
+    assert len(snapshot_calls) == 1
+    assert len(completed_calls) == 1
+
+
+async def test_complete_topic_test_out_with_is_enrichment_skips_pace_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test-out AND enrichment together: nothing in this codebase's
+    test-out logic restricts it to non-enrichment topics (both regular
+    verification and test-out drive the identical
+    complete_topic_verification completion path), so this combination is
+    treated as genuinely possible and tested here, not assumed impossible.
+    """
+    attempts = [_resolved_attempt(q, cpa.FULL_CREDIT) for q in range(1, 6)]
+    monkeypatch.setattr(
+        cpa, "get_attempts_for_topic", lambda session, topic_id: attempts
+    )
+    snapshot_calls: list[tuple] = []
+    monkeypatch.setattr(
+        cpa, "write_pace_snapshot", lambda *a, **k: snapshot_calls.append((a, k))
+    )
+    completed_calls: list[tuple] = []
+    monkeypatch.setattr(
+        cpa,
+        "mark_topic_completed",
+        lambda *args, **kwargs: completed_calls.append((args, kwargs)),
+    )
+
+    result = await cpa.complete_topic_test_out(
+        MagicMock(), "u1", "t1", days_taken=1, days_expected=1, is_enrichment=True
+    )
+
+    assert snapshot_calls == []
+    assert result.completion.drift is None
+    assert completed_calls[0][1] == {"status": cpa.COMPLETED_TEST_OUT_STATUS}
 
 
 # --- Test-out: verification-first (PRD §7.6's exception) ------------------
@@ -690,6 +1159,7 @@ async def test_test_out_full_pass_writes_completed_test_out_status(
         cpa, "get_attempts_for_topic", lambda session, topic_id: attempts
     )
     monkeypatch.setattr(cpa, "write_pace_snapshot", lambda *a, **k: None)
+    monkeypatch.setattr(cpa, "get_pace_snapshot_history", lambda session, uid: [])
     completed_calls: list[tuple] = []
     monkeypatch.setattr(
         cpa,
@@ -746,6 +1216,7 @@ async def test_test_out_partial_pass_relies_on_the_inline_teach_in_not_a_second_
         cpa, "get_attempts_for_topic", lambda session, topic_id: attempts
     )
     monkeypatch.setattr(cpa, "write_pace_snapshot", lambda *a, **k: None)
+    monkeypatch.setattr(cpa, "get_pace_snapshot_history", lambda session, uid: [])
     completed_calls: list[tuple] = []
     monkeypatch.setattr(
         cpa,

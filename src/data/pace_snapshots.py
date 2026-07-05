@@ -13,6 +13,7 @@ Sessions are passed in by the caller (dependency injection), matching
 """
 
 from datetime import UTC, datetime
+from typing import Any
 
 from sqlalchemy.orm import Session
 
@@ -51,10 +52,36 @@ def write_pace_snapshot(
     session.commit()
 
 
-# Deliberately no read function here yet: reconstructing the rolling
-# window `pace/calculator.py`'s `detect_sustained_drift` needs (the
-# combined pace signal per snapshot, not bare topic_score/timing_ratio)
-# is part of *acting* on drift — explicitly out of scope for this task
-# (see agents/coaching_pace_agent.py's module docstring). Adding a read
-# function now, before its actual consumer is built, risks guessing at a
-# shape the next task hasn't decided yet.
+def get_pace_snapshot_history(session: Session, user_id: str) -> list[dict[str, Any]]:
+    """Read every `pace_snapshots` row for `user_id`, oldest first — the
+    rolling-window input `pace/calculator.py`'s `detect_sustained_drift`
+    needs.
+
+    Returns bare `topic_score`/`timing_ratio` per row (plus
+    `days_taken`/`days_expected`/`computed_at`), not a combined pace
+    signal — computing that from the two raw values is
+    `pace/calculator.py`'s `calculate_combined_pace_signal`'s job, done by
+    the caller (`agents/coaching_pace_agent.py`), never reimplemented or
+    pre-computed here. No row limit is applied: `detect_sustained_drift`
+    already slices its own trailing window
+    (`pace_signals[-DRIFT_WINDOW_SIZE:]`), so this function does not
+    guess at that window size — it returns the full history in
+    chronological order and lets the caller's downstream call handle
+    windowing.
+    """
+    rows = (
+        session.query(PaceSnapshot)
+        .filter(PaceSnapshot.user_id == user_id)
+        .order_by(PaceSnapshot.computed_at)
+        .all()
+    )
+    return [
+        {
+            "topic_score": row.topic_score,
+            "timing_ratio": row.timing_ratio,
+            "days_taken": row.days_taken,
+            "days_expected": row.days_expected,
+            "computed_at": row.computed_at,
+        }
+        for row in rows
+    ]
