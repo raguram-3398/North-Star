@@ -263,6 +263,13 @@ Generated when a significant market event affects an already-completed topic. Ne
 
 **Known limitation (see Architecture §3's Cron job "Known limitation" for the full technical finding):** the patch-note candidates generated when a significant market event is detected (`src/cron/refresh_roles.py`) carry a deterministic, mechanically-assembled `new_content` sentence (role, skill, and new confidence tier only) — not real narrative content. This section's own framing assigns patch-note content to Agent 1's reasoning, but the cron job that detects the event is explicitly not an agent and cannot call an LLM (the significant-event-wiring task's scope fence forbade it). **Not resolved by this task:** a production version routes each detected event through Agent 1 to generate the real explanation before the patch-note is persisted.
 
+**Resolved (`src/agents/coaching_pace_agent.py`'s `maybe_deliver_patch`; the patch-delivery task — judgment calls made and flagged during implementation, not specified above at the time of writing):**
+- **Patch-note delivery is not pace-gated.** `maybe_deliver_patch` is called unconditionally on every non-enrichment topic completion, regardless of that call's own drift result — unlike enrichment (§7.10), which only fires on sustained-ahead drift, a market event has nothing to do with the completing user's own pace.
+- **"insert_now" reuses the identical insertion mechanism §7.10's enrichment already wired (`outline/hierarchy.py`'s `insert_new_topic`, via `data/outline_topics.py`'s `insert_new_outline_topic`) — not a second insertion path**, and positions the same way: the just-completed topic is the sole prerequisite, landing the delivered content immediately after the user's current position, per this section's own "always at/near the user's current position" rule.
+- **Co-occurrence with enrichment, a genuine judgment call:** sustained-ahead drift and a pending high-confidence patch-note are independent conditions and can both fire in the same completion call — neither is suppressed in favor of the other. See Architecture §3's "Resolved" block for the exact resulting ordering (a low-stakes tie-break, not a spec-mandated rule).
+- **"ask_user" is not built or wired further by this task** — no UI exists yet; `maybe_deliver_patch` returns without touching the patch-note's status, and a dedicated test confirms a future caller could construct the right `PatchDecisionState` from `decide_patch_delivery`'s output, without fabricating a resolution.
+- **`new_content` is inserted exactly as-is** — the already-flagged deterministic placeholder (see the "Known limitation" above); this task does not attempt real narrative content generation for it.
+
 ### 7.10 Enrichment
 
 Triggered by sustained-ahead pace. Uses the **same outline-update insertion mechanism** as market-driven updates (additive, hierarchy-positioned), tagged as **extra credit**.
@@ -288,6 +295,14 @@ Triggered by sustained-ahead pace. Uses the **same outline-update insertion mech
 - Slow/core-only learner: enrichment topics suggested as next steps, not framed as a deficiency
 - Any deferred low-confidence patches surface here if never resolved earlier
 - **No seniority, grading, or leveling claims** anywhere in this note
+
+**Resolved (`src/agents/coaching_pace_agent.py`'s `is_goal_complete`/`generate_closing_note`/`ClosingNote`; the patch-delivery task — judgment calls made and flagged during implementation, not specified above at the time of writing):**
+- **`is_goal_complete` and `generate_closing_note` are separate, independently callable functions, not composed internally.** `generate_closing_note` does not itself check goal completion — a future orchestration layer calls `is_goal_complete` first, then `generate_closing_note` if true. Neither is wired into any trigger yet ("detect when a user just finished their last topic" has no live flow to hook into).
+- **`is_goal_complete`: core topics only, enrichment entirely excluded from the check** — not merely allowed to be incomplete. A user with zero core topics returns `False` (not vacuously `True`): "goal reached" means the core plan that existed was completed, not that there was nothing to complete.
+- **Fast/enriched vs. slow/core-only is decided by whether the user has *completed* at least one enrichment topic** (not merely has one in-progress or pending) — completed enrichment topics become `demonstrated_strengths`; their absence is what triggers `suggested_next_steps` (the role's `roles_cache` `emerging_skills`) instead.
+- **LLM-vs-deterministic, decided explicitly as this task required:** unlike the market-event `new_content` placeholder (mechanical, because that caller structurally cannot call an LLM), this note is real, user-facing closing prose — so a genuine Gemini call composes it from deterministically-gathered facts, rather than a mechanical template. See Architecture §3's "Resolved" block for the prompt/model details.
+- **"No seniority, grading, or leveling claims" is a hard content constraint, enforced structurally after generation** (a deterministic banned-term check against Gemini's actual output), not trusted to the prompt instruction alone — `generate_closing_note` raises rather than returning non-compliant text. No retry-with-feedback is attempted on a rejection in this task.
+- **Deferred patch-notes are surfaced as raw structured data (`ClosingNote.deferred_patch_notes`), not folded into the Gemini prompt as content to narrate** — this is their one resurfacing point per this section's own rule, but a future caller/UI renders them directly rather than trusting the LLM to accurately restate patch-note facts it didn't ground itself.
 
 ---
 

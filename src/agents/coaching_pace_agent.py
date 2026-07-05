@@ -60,6 +60,7 @@ structure.
 import asyncio
 import sys
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -83,11 +84,17 @@ from data.outline_topics import (
     COMPLETED_STATUS,
     COMPLETED_TEST_OUT_STATUS,
     get_all_topics_for_user,
+    get_topic,
     has_pending_enrichment_topic,
     insert_new_outline_topic,
     mark_topic_completed,
 )
 from data.pace_snapshots import get_pace_snapshot_history, write_pace_snapshot
+from data.patch_notes import (
+    get_deferred_patch_notes,
+    get_pending_patch_notes,
+    update_patch_note_status,
+)
 from data.progress_log import log_progress_step
 from data.roles_cache import get_role
 from data.users import extend_pacing, get_user
@@ -98,7 +105,8 @@ from pace.calculator import (
     calculate_topic_score,
     detect_sustained_drift,
 )
-from security.output_guard import validate_output_object
+from patches.patch_manager import PatchStatus, decide_patch_delivery
+from security.output_guard import ConfidenceTier, validate_output_object
 from utils.exceptions import GeminiCallError, GroundingSourceCallError
 
 # Reuses agents/research_outline_agent.py's private Gemini-call helper
@@ -147,6 +155,16 @@ NOT_YET_RESOLVED_CREDIT = 0.0
 # precedent that each feature's model choice is its own explicit
 # decision even when the value happens to match.
 DAY_CONTENT_GEMINI_MODEL = "gemini-2.5-flash"
+
+# Judgment call: a separate, independent constant from DAY_CONTENT_GEMINI_MODEL
+# even though the value coincides — the goal-completion closing note is a
+# single, bounded composition task (a handful of already-gathered facts
+# turned into prose), the same shape as day-content generation, not a
+# whole-curriculum reasoning task. Matches this file's own established
+# precedent (VERIFICATION_GEMINI_MODEL, the Skill's own separate constant)
+# of never sharing a model constant across features just because the
+# value happens to match.
+CLOSING_NOTE_GEMINI_MODEL = "gemini-2.5-flash"
 
 # Judgment call, flagged for review — not specified anywhere in PRD/
 # Architecture: converting `users.available_time_per_week` (hours) into
@@ -284,6 +302,30 @@ PROMPT_REGISTRY: dict[str, str] = {
         "Respond with ONLY a JSON object matching this shape: "
         '{{"study_content": "<prose study material covering only these '
         'specific gaps, citing the given source(s)>"}}.'
+    ),
+    "goal_completion_closing_note_v1": (
+        "Compose a warm, encouraging goal-completion closing note for a "
+        "learner who has just finished their core learning plan for the "
+        "{resolved_role!r} role.\n\n"
+        "Demonstrated strengths (extra-credit/enrichment topics they "
+        "completed beyond the core plan — list as genuine accomplishments "
+        "if any are given below; if none are given, do not mention "
+        "strengths at all): {demonstrated_strengths}\n"
+        "Suggested next steps (only relevant when there are no "
+        "demonstrated strengths above — frame positively, as an exciting "
+        "opportunity, never as something missing, lacking, or a "
+        "deficiency): {suggested_next_steps}\n"
+        "Number of still-pending market-update notes to mention exist for "
+        "later review, if greater than zero (do not mention if zero): "
+        "{deferred_patch_count}\n\n"
+        "Hard rule, non-negotiable: never use seniority, grading, or "
+        "leveling language of any kind — no words like 'junior', "
+        "'senior', 'beginner', 'expert', 'novice', 'grade', 'score', or "
+        "similar, and no comparison to any level or standard. Describe "
+        "accomplishments and next steps in plain, encouraging terms "
+        "only.\n\n"
+        "Respond with ONLY a JSON object matching this shape: "
+        '{{"note_text": "<the composed closing note prose>"}}.'
     ),
 }
 
@@ -724,6 +766,12 @@ class TopicCompletionResult:
 
     `pace_extension_applied` is populated only when `drift == "behind"` —
     the new total `users.pace_extension_days` after this trigger.
+
+    `delivered_patch_topic` is populated whenever `maybe_deliver_patch`
+    actually inserted a patch-note's content this call — independent of
+    `drift` (patch delivery is not pace-gated; see `complete_topic_verification`'s
+    docstring for the judgment call on how this and `enrichment_topic` can
+    both be populated in the same call).
     """
 
     topic_score: float
@@ -732,6 +780,7 @@ class TopicCompletionResult:
     drift: Literal["ahead", "behind", "on_track"] | None = None
     enrichment_topic: dict[str, Any] | None = None
     pace_extension_applied: int | None = None
+    delivered_patch_topic: dict[str, Any] | None = None
 
 
 def _select_enrichment_skill(
@@ -823,6 +872,130 @@ def maybe_trigger_enrichment(
         is_enrichment=True,
         prerequisite_topic_ids=frozenset({origin_topic_id}),
     )
+
+
+# Judgment call, flagged: like enrichment, a delivered patch-note's new
+# outline_topics row gets its own singleton topic_group — the origin
+# topic's own name plus this suffix (mirrors
+# ENRICHMENT_TOPIC_GROUP_SUFFIX/ENRICHMENT_POSITION_IN_GROUP's reasoning
+# exactly, applied to a market-driven update instead of an emerging
+# skill), so compute_hands_on_intensity's group_size==1 special case
+# applies (full intensity, one day).
+PATCH_NOTE_TOPIC_SUFFIX = " (Update)"
+PATCH_NOTE_POSITION_IN_GROUP = 1
+
+# Judgment call, flagged: patch_notes rows carry no source_type column
+# (Architecture §5's schema: source_url/confidence only) — the same gap
+# data/grounding_fallback.py's CACHED_SOURCE_TYPE already exists to name
+# honestly for roles_cache. "patch-note" names this specific provenance
+# layer (delivered patch-note content, not a fresh grounding result or a
+# roles_cache re-serve) rather than reusing CACHED_SOURCE_TYPE or
+# guessing at the patch's original source_type, which isn't persisted.
+PATCH_NOTE_SOURCE_TYPE = "patch-note"
+
+
+def maybe_deliver_patch(
+    session: Session,
+    user_id: str,
+    origin_topic_id: str,
+) -> dict[str, Any] | None:
+    """Patch-note delivery (PRD §7.9): fetch `user_id`'s pending patch-
+    notes, join in each one's origin topic's `hierarchy_position`
+    (`patches/patch_manager.py`'s `decide_patch_delivery` does no DB
+    reads/joins of its own — see that function's docstring), and call it
+    with `origin_topic_id`'s own `hierarchy_position` as
+    `current_hierarchy_position` — `origin_topic_id` is the topic whose
+    completion triggered this check, so this is "the user's current
+    position" in the same sense `maybe_trigger_enrichment` already uses
+    it for enrichment placement.
+
+    `"insert_now"`: inserts the chosen patch-note's content into the
+    user's outline via `outline/hierarchy.py`'s existing `insert_new_topic`
+    (`data/outline_topics.py`'s `insert_new_outline_topic` — the identical
+    wrapper `maybe_trigger_enrichment` already calls, not a second
+    insertion path), anchored on `origin_topic_id` as the sole
+    prerequisite so it lands immediately after the user's current
+    position. Source fields are the patch-note's own already-real
+    `source_url`/`confidence` (re-validated via `validate_output_object`,
+    CLAUDE.md guardrail #12, mirroring `maybe_trigger_enrichment`'s
+    pattern) — `new_content` itself is inserted as-is, the already-
+    documented deterministic placeholder from the prior task, not
+    regenerated here. On success, the patch-note's status is updated to
+    `DELIVERED` via the existing `update_patch_note_status`. Returns the
+    inserted topic dict.
+
+    `"ask_user"`: this task does not build or wire any user-facing
+    prompt/response handling — no UI exists yet. Returns `None`; no
+    patch-note status changes, nothing is inserted. A future caller can
+    construct `PatchDecisionState(patch_note_id=decision.patch_note_id)`
+    directly from this same `decide_patch_delivery` call (see
+    `tests/test_coaching_pace_agent.py` for a test confirming this
+    constructs correctly) — this function does not fabricate a
+    resolution.
+
+    `"none"` (including no pending patch-notes at all): returns `None`,
+    no action.
+    """
+    pending = get_pending_patch_notes(session, user_id)
+    if not pending:
+        return None
+
+    current_topic = get_topic(session, origin_topic_id)
+    if current_topic is None:
+        return None
+    current_hierarchy_position = current_topic["hierarchy_position"]
+
+    assembled: list[dict[str, Any]] = []
+    for patch in pending:
+        origin = get_topic(session, patch["origin_topic_id"])
+        if origin is None:
+            continue
+        assembled.append(
+            {
+                "id": patch["id"],
+                "confidence": ConfidenceTier(patch["confidence"]),
+                "hierarchy_position": origin["hierarchy_position"],
+            }
+        )
+    if not assembled:
+        return None
+
+    decision = decide_patch_delivery(assembled, current_hierarchy_position)
+    if decision.action != "insert_now":
+        return None
+
+    chosen = next(patch for patch in pending if patch["id"] == decision.patch_note_id)
+    origin_topic = get_topic(session, chosen["origin_topic_id"])
+    assert origin_topic is not None  # already confirmed present in the loop above
+
+    grounded = validate_output_object(
+        {
+            "source_url": chosen["source_url"],
+            "source_type": PATCH_NOTE_SOURCE_TYPE,
+            "confidence": chosen["confidence"],
+        }
+    )
+    new_topic_name = f"{origin_topic['topic_name']}{PATCH_NOTE_TOPIC_SUFFIX}"
+
+    inserted = insert_new_outline_topic(
+        session,
+        user_id=user_id,
+        topic_name=new_topic_name,
+        topic_group=new_topic_name,
+        position_in_group=PATCH_NOTE_POSITION_IN_GROUP,
+        source_url=grounded.source_url,
+        source_type=grounded.source_type,
+        confidence=grounded.confidence,
+        is_enrichment=False,
+        prerequisite_topic_ids=frozenset({origin_topic_id}),
+    )
+    update_patch_note_status(
+        session,
+        chosen["id"],
+        PatchStatus.DELIVERED,
+        datetime.now(UTC).replace(tzinfo=None, microsecond=0),
+    )
+    return inserted
 
 
 def _get_latest_attempt_per_question(
@@ -928,6 +1101,28 @@ def complete_topic_verification(
     `"on_track"` (including every cold-start call, fewer than
     `DRIFT_WINDOW_SIZE` snapshots) does nothing further.
 
+    `maybe_deliver_patch` (PRD §7.9) is called unconditionally, right
+    after the drift branch, whenever `is_enrichment=False` — patch-note
+    delivery is not pace-gated at all (unlike enrichment, which only
+    fires on sustained-ahead drift), so it runs every non-enrichment
+    completion regardless of `drift`'s value.
+
+    **Co-occurrence judgment call, flagged:** `maybe_trigger_enrichment`
+    and `maybe_deliver_patch` can both fire in the same call (sustained-
+    ahead drift *and* a pending high-confidence patch-note, independent
+    conditions). Both are allowed to insert — there is no priority
+    scheme suppressing one in favor of the other. They run sequentially
+    in the order written above (enrichment first, patch delivery
+    second); `insert_new_outline_topic` always reads a fresh snapshot of
+    the hierarchy immediately before inserting, so this is well-defined,
+    not a race: both anchor on the same `origin_topic_id` as their sole
+    prerequisite, so whichever runs second lands immediately after
+    `origin_topic_id` and pushes the one that ran first (and everything
+    after it) down by one position — net effect, patch content ends up
+    between the just-completed topic and the enrichment topic. This
+    ordering is an arbitrary, low-stakes tie-break (matching existing
+    code order), not a spec-mandated rule.
+
     Raises `ValueError` (via `_get_final_credits_per_question` or
     `pace/calculator.py`) if the topic's 5 question slots aren't all
     genuinely resolved yet, or if `days_expected` isn't positive. Marking
@@ -943,6 +1138,7 @@ def complete_topic_verification(
     drift: Literal["ahead", "behind", "on_track"] | None = None
     enrichment_topic: dict[str, Any] | None = None
     pace_extension_applied: int | None = None
+    delivered_patch_topic: dict[str, Any] | None = None
 
     if not is_enrichment:
         write_pace_snapshot(
@@ -972,6 +1168,8 @@ def complete_topic_verification(
                 session, user_id, PACE_EXTENSION_DAYS_PER_TRIGGER
             )
 
+        delivered_patch_topic = maybe_deliver_patch(session, user_id, topic_id)
+
     mark_topic_completed(
         session,
         topic_id,
@@ -985,6 +1183,7 @@ def complete_topic_verification(
         drift=drift,
         enrichment_topic=enrichment_topic,
         pace_extension_applied=pace_extension_applied,
+        delivered_patch_topic=delivered_patch_topic,
     )
 
 
@@ -1158,13 +1357,195 @@ async def complete_topic_test_out(
     return TestOutResult(completion=completion, full_pass=full_pass)
 
 
-def generate_closing_note(user_id: str) -> str:
-    """Compose the goal-completion closing note, reusing roles_cache
-    infrastructure for current hiring signal and in-demand skills, per PRD
-    §7.11. Never makes a seniority, grading, or leveling claim.
+# --- Goal-completion closing note (PRD §7.11) --------------------------
 
-    Not yet implemented — scaffolding only. Explicitly out of scope for
-    this task; deliberately left untouched, not stubbed with a guessed
-    shape.
+
+def is_goal_complete(session: Session, user_id: str) -> bool:
+    """PRD §7.11: "goal reached = original core scope complete, full
+    stop." True when every *core* (`is_enrichment=False`) outline_topics
+    row for `user_id` has `status` in `{completed, completed_test_out}`.
+
+    Enrichment topics are never a completion requirement — they are
+    excluded from this check entirely, not merely allowed to be
+    incomplete alongside a passing check.
+
+    Judgment call, flagged: a user with zero core topics at all (no
+    outline yet, or every topic happens to be enrichment-tagged — the
+    latter shouldn't occur in practice, since enrichment topics are only
+    ever inserted alongside an existing core outline) returns `False`,
+    not vacuously `True` — "goal reached" reads as "the core plan that
+    existed was completed," not "there was nothing to complete."
     """
-    raise NotImplementedError
+    topics = get_all_topics_for_user(session, user_id)
+    core_topics = [topic for topic in topics if not topic["is_enrichment"]]
+    if not core_topics:
+        return False
+    return all(
+        topic["status"] in {COMPLETED_STATUS, COMPLETED_TEST_OUT_STATUS}
+        for topic in core_topics
+    )
+
+
+# Judgment call, flagged: a deterministic, non-exhaustive banned-term list
+# enforcing PRD §7.11's hard "no seniority, grading, or leveling claims"
+# constraint structurally, as a post-generation check — not trusted to
+# the prompt instruction alone (CLAUDE.md: gates are structural, not
+# advisory). Case-insensitive substring match: simple and auditable, not
+# a full NLP classifier. Deliberately errs toward over-inclusive (e.g.
+# "expert"/"novice" alone, not just compound forms) since this is a hard
+# content constraint, not a style preference — recall matters more than
+# precision here. Revisable if real Gemini output surfaces a banned
+# concept phrased in a way this list misses, or a legitimate phrase this
+# list wrongly flags.
+_BANNED_LEVELING_TERMS = frozenset(
+    {
+        "junior",
+        "senior",
+        "beginner",
+        "entry-level",
+        "entry level",
+        "mid-level",
+        "novice",
+        "expert",
+        "grade",
+        "graded",
+        "grading",
+        "score of",
+        "level up",
+        "leveled up",
+    }
+)
+
+
+def _contains_banned_leveling_language(text: str) -> bool:
+    """True if `text` contains any PRD §7.11-banned seniority/grading/
+    leveling term (case-insensitive substring match) — see
+    `_BANNED_LEVELING_TERMS`'s module-level judgment-call note.
+    """
+    lowered = text.casefold()
+    return any(term in lowered for term in _BANNED_LEVELING_TERMS)
+
+
+@dataclass(frozen=True)
+class ClosingNote:
+    """The goal-completion closing note (PRD §7.11), returned by
+    `generate_closing_note`.
+
+    `note_text` is Gemini-composed prose (see this module's judgment call
+    on why an LLM call — not a deterministic template like
+    `src/cron/refresh_roles.py`'s `new_content` placeholder — is used
+    here: this is real user-facing closing content, not an internal
+    placeholder). `demonstrated_strengths`/`suggested_next_steps`/
+    `deferred_patch_notes` are the same already-deterministic facts the
+    prompt was built from, exposed directly so a future caller/UI can
+    render them without re-deriving or re-parsing `note_text`.
+    """
+
+    resolved_role: str
+    note_text: str
+    demonstrated_strengths: list[str]
+    suggested_next_steps: list[str]
+    deferred_patch_notes: list[dict[str, Any]]
+
+
+async def generate_closing_note(session: Session, user_id: str) -> ClosingNote:
+    """Compose the goal-completion closing note (PRD §7.11): reuses
+    `roles_cache` infrastructure (current hiring signal, in-demand
+    skills) for the user's resolved role, read-only — never writes to
+    `roles_cache`.
+
+    Does **not** itself check whether the goal is actually complete —
+    call `is_goal_complete` first; this function composes a note from
+    whatever state exists regardless, per this task's explicit framing of
+    the two as separate, independently callable functions (no internal
+    orchestration between them yet — that's a future caller's job).
+
+    Facts are gathered deterministically first, never trusted to Gemini:
+    completed enrichment topics (`data/outline_topics.py`'s
+    `get_all_topics_for_user`, filtered here) and still-`DEFERRED`
+    patch-notes (`data/patch_notes.py`'s `get_deferred_patch_notes` — PRD
+    §7.9's "resurface at the goal-completion closing note" is this
+    function). Fast/enriched learner (>=1 completed enrichment topic):
+    those topics become `demonstrated_strengths`. Slow/core-only learner
+    (0 completed enrichment topics): the role's `roles_cache`
+    `emerging_skills` become `suggested_next_steps` instead — the prompt
+    is instructed to frame these positively, never as a deficiency, but
+    that instruction alone is not trusted as the enforcement mechanism
+    (see below).
+
+    **LLM-vs-deterministic judgment call, flagged as explicitly requested:**
+    unlike `src/cron/refresh_roles.py`'s `new_content` placeholder (an
+    internal, mechanically-assembled sentence a non-agent cron job
+    produces because it structurally cannot call an LLM), this note is
+    real, user-facing closing prose composed by an agent — so a genuine
+    Gemini call (`goal_completion_closing_note_v1`, `CLOSING_NOTE_GEMINI_MODEL`)
+    is used to produce natural, personalized language from the
+    deterministically-gathered facts above, rather than a mechanical
+    template.
+
+    PRD §7.11's "no seniority, grading, or leveling claims" is a hard
+    content constraint, not a style preference — so it is enforced
+    **structurally**, after generation: `_contains_banned_leveling_language`
+    checks Gemini's actual output, and this function raises
+    `GeminiCallError` if it matches, rather than trusting the prompt's
+    own instruction alone to have been followed (CLAUDE.md: gates are
+    structural, not advisory). No retry-with-error-feedback is attempted
+    on that rejection in this task — flagged as a reasonable minimal
+    implementation, not a permanent limitation.
+
+    Raises `ValueError` if the user has no `resolved_role` set (a
+    data-integrity gap upstream — this function cannot compose a note
+    without knowing which role's `roles_cache` entry to reuse). Raises
+    `GeminiCallError` if Gemini's response is malformed, empty, or
+    contains banned language.
+    """
+    user = get_user(session, user_id)
+    resolved_role = user["resolved_role"] if user is not None else None
+    if not resolved_role:
+        raise ValueError(
+            f"user {user_id!r} has no resolved_role set — cannot compose a "
+            "closing note without knowing which role's roles_cache entry to reuse"
+        )
+
+    role = get_role(session, resolved_role)
+    topics = get_all_topics_for_user(session, user_id)
+    completed_enrichment_topics = [
+        topic["topic_name"]
+        for topic in topics
+        if topic["is_enrichment"]
+        and topic["status"] in {COMPLETED_STATUS, COMPLETED_TEST_OUT_STATUS}
+    ]
+    deferred_patches = get_deferred_patch_notes(session, user_id)
+
+    demonstrated_strengths: list[str] = []
+    suggested_next_steps: list[str] = []
+    if completed_enrichment_topics:
+        demonstrated_strengths = completed_enrichment_topics
+    elif role is not None:
+        suggested_next_steps = [entry["skill"] for entry in role["emerging_skills"]]
+
+    prompt = PROMPT_REGISTRY["goal_completion_closing_note_v1"].format(
+        resolved_role=resolved_role,
+        demonstrated_strengths=", ".join(demonstrated_strengths) or "none",
+        suggested_next_steps=", ".join(suggested_next_steps) or "none",
+        deferred_patch_count=len(deferred_patches),
+    )
+    parsed = await _call_gemini_json(
+        prompt, required_keys={"note_text"}, model=CLOSING_NOTE_GEMINI_MODEL
+    )
+    note_text = parsed["note_text"]
+    if not isinstance(note_text, str) or not note_text.strip():
+        raise GeminiCallError(f"Gemini returned no usable 'note_text': {parsed!r}")
+    if _contains_banned_leveling_language(note_text):
+        raise GeminiCallError(
+            "closing note text contains banned seniority/grading/leveling "
+            f"language (PRD §7.11 hard constraint): {note_text!r}"
+        )
+
+    return ClosingNote(
+        resolved_role=resolved_role,
+        note_text=note_text,
+        demonstrated_strengths=demonstrated_strengths,
+        suggested_next_steps=suggested_next_steps,
+        deferred_patch_notes=deferred_patches,
+    )

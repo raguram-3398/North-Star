@@ -61,7 +61,7 @@ north-star/
 │   ├── main.py
 │   ├── agents/
 │   │   ├── research_outline_agent.py   # reasoning/generation only
-│   │   └── coaching_pace_agent.py      # reasoning/generation only — complete_topic_verification wires detect_sustained_drift (maybe_trigger_enrichment on "ahead", extend_pacing on "behind")
+│   │   └── coaching_pace_agent.py      # reasoning/generation only — complete_topic_verification wires detect_sustained_drift (maybe_trigger_enrichment on "ahead", extend_pacing on "behind", maybe_deliver_patch unconditionally); is_goal_complete/generate_closing_note
 │   ├── security/
 │   │   ├── input_gate.py               # clarify-gate bound/loop state, reject detection
 │   │   └── output_guard.py             # confidence-ladder enforcement — the structural gate before any DB write

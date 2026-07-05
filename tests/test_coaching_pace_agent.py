@@ -42,7 +42,7 @@ from tests.test_research_outline_agent import (
     _tavily_response,
     _tavily_result_dict,
 )
-from utils.exceptions import GroundingSourceCallError
+from utils.exceptions import GeminiCallError, GroundingSourceCallError
 
 TOPIC_SOURCE_MATERIAL = (
     "Git branching lets you create, merge, and delete lightweight "
@@ -557,7 +557,11 @@ def _patch_completion_writes(
     """Shared setup for complete_topic_verification tests: fake
     get_attempts_for_topic/write_pace_snapshot/mark_topic_completed,
     returning the snapshot_calls/completed_calls lists so callers can
-    assert on them.
+    assert on them. Also fakes get_pending_patch_notes to return an empty
+    list — these tests aren't about patch delivery (see the dedicated
+    maybe_deliver_patch tests below), so this keeps that call a
+    deliberate, explicit no-op rather than relying on an unmocked
+    MagicMock session's query chain happening to iterate empty.
     """
     monkeypatch.setattr(
         cpa, "get_attempts_for_topic", lambda session, topic_id: attempts
@@ -574,6 +578,7 @@ def _patch_completion_writes(
         "mark_topic_completed",
         lambda *args, **kwargs: completed_calls.append((args, kwargs)),
     )
+    monkeypatch.setattr(cpa, "get_pending_patch_notes", lambda session, uid: [])
     return snapshot_calls, completed_calls
 
 
@@ -1090,6 +1095,224 @@ async def test_complete_topic_test_out_with_is_enrichment_skips_pace_snapshot(
     assert completed_calls[0][1] == {"status": cpa.COMPLETED_TEST_OUT_STATUS}
 
 
+# --- Patch-note delivery wiring (patch-delivery task, Part 1) -------------
+
+
+def test_maybe_deliver_patch_inserts_high_confidence_patch_and_marks_delivered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pending_patch = {
+        "id": "patch-1",
+        "user_id": "u1",
+        "origin_topic_id": "topic-sql",
+        "new_content": "SQL is now more in-demand.",
+        "source_url": "https://example.com/sql-update",
+        "confidence": "high",
+        "status": "pending",
+        "created_at": None,
+        "resolved_at": None,
+    }
+    monkeypatch.setattr(
+        cpa, "get_pending_patch_notes", lambda session, uid: [pending_patch]
+    )
+
+    def _fake_get_topic(session: object, topic_id: str) -> dict | None:
+        if topic_id == "t1":
+            return {"id": "t1", "topic_name": "Docker", "hierarchy_position": 5}
+        if topic_id == "topic-sql":
+            return {"id": "topic-sql", "topic_name": "SQL", "hierarchy_position": 2}
+        return None
+
+    monkeypatch.setattr(cpa, "get_topic", _fake_get_topic)
+    insert_calls: list[dict] = []
+
+    def _fake_insert(session: object, **kwargs: object) -> dict:
+        insert_calls.append(kwargs)
+        return {"id": "new-patch-topic-1", **kwargs}
+
+    monkeypatch.setattr(cpa, "insert_new_outline_topic", _fake_insert)
+    update_calls: list[tuple] = []
+    monkeypatch.setattr(
+        cpa,
+        "update_patch_note_status",
+        lambda session, patch_id, status, resolved_at: update_calls.append(
+            (patch_id, status, resolved_at)
+        ),
+    )
+
+    result = cpa.maybe_deliver_patch(MagicMock(), "u1", "t1")
+
+    assert result is not None
+    assert len(insert_calls) == 1
+    call = insert_calls[0]
+    assert call["user_id"] == "u1"
+    assert call["topic_name"] == "SQL (Update)"
+    assert call["topic_group"] == "SQL (Update)"
+    assert call["is_enrichment"] is False
+    assert call["source_url"] == "https://example.com/sql-update"
+    assert call["source_type"] == "patch-note"
+    assert call["confidence"] == ConfidenceTier.HIGH
+    assert call["prerequisite_topic_ids"] == frozenset({"t1"})
+    assert len(update_calls) == 1
+    assert update_calls[0][0] == "patch-1"
+    assert update_calls[0][1] == cpa.PatchStatus.DELIVERED
+
+
+def test_maybe_deliver_patch_does_not_insert_low_confidence_patch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A low/uncertain-confidence patch routes to "ask_user", not
+    "insert_now" — nothing gets inserted, and the patch-note stays
+    pending (no status update at all).
+    """
+    pending_patch = {
+        "id": "patch-2",
+        "user_id": "u1",
+        "origin_topic_id": "topic-sql",
+        "new_content": "content",
+        "source_url": "https://example.com/x",
+        "confidence": "low",
+        "status": "pending",
+        "created_at": None,
+        "resolved_at": None,
+    }
+    monkeypatch.setattr(
+        cpa, "get_pending_patch_notes", lambda session, uid: [pending_patch]
+    )
+    monkeypatch.setattr(
+        cpa,
+        "get_topic",
+        lambda session, topic_id: {
+            "id": topic_id,
+            "topic_name": "X",
+            "hierarchy_position": 1,
+        },
+    )
+    insert_calls: list[dict] = []
+    monkeypatch.setattr(
+        cpa, "insert_new_outline_topic", lambda *a, **k: insert_calls.append(k)
+    )
+    update_calls: list[tuple] = []
+    monkeypatch.setattr(
+        cpa, "update_patch_note_status", lambda *a, **k: update_calls.append((a, k))
+    )
+
+    result = cpa.maybe_deliver_patch(MagicMock(), "u1", "t1")
+
+    assert result is None
+    assert insert_calls == []
+    assert update_calls == []
+
+
+def test_maybe_deliver_patch_no_pending_patches_does_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cpa, "get_pending_patch_notes", lambda session, uid: [])
+    insert_calls: list[dict] = []
+    monkeypatch.setattr(
+        cpa, "insert_new_outline_topic", lambda *a, **k: insert_calls.append(k)
+    )
+
+    result = cpa.maybe_deliver_patch(MagicMock(), "u1", "t1")
+
+    assert result is None
+    assert insert_calls == []
+
+
+def test_decide_patch_delivery_ask_user_can_construct_patch_decision_state() -> None:
+    """Confirms the interface a future caller would use for the
+    "needs_user_decision" outcome — this task does not build or wire the
+    actual resolution (no UI exists yet), only confirms a
+    `PatchDecisionState` constructs correctly from the decision; no
+    resolution is fabricated.
+    """
+    from patches.patch_manager import PatchDecisionState, decide_patch_delivery
+
+    pending = [
+        {"id": "patch-low", "confidence": ConfidenceTier.LOW, "hierarchy_position": 1}
+    ]
+
+    decision = decide_patch_delivery(pending, current_hierarchy_position=5)
+
+    assert decision.action == "ask_user"
+    assert decision.patch_note_id is not None
+    state = PatchDecisionState(patch_note_id=decision.patch_note_id)
+    assert state.patch_note_id == "patch-low"
+    assert state.resolved is False
+
+
+def test_complete_topic_verification_calls_maybe_deliver_patch_regardless_of_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Patch-note delivery is not pace-gated — unlike enrichment, it must
+    run on every non-enrichment completion regardless of drift's value
+    (here: cold-start "on_track").
+    """
+    attempts = _all_full_credit_attempts()
+    monkeypatch.setattr(
+        cpa, "get_attempts_for_topic", lambda session, topic_id: attempts
+    )
+    monkeypatch.setattr(cpa, "write_pace_snapshot", lambda *a, **k: None)
+    monkeypatch.setattr(cpa, "mark_topic_completed", lambda *a, **k: None)
+    monkeypatch.setattr(cpa, "get_pace_snapshot_history", lambda session, uid: [])
+    deliver_calls: list[tuple] = []
+    monkeypatch.setattr(
+        cpa,
+        "maybe_deliver_patch",
+        lambda *a, **k: deliver_calls.append(a) or None,
+    )
+
+    result = cpa.complete_topic_verification(
+        MagicMock(), "u1", "t1", days_taken=5, days_expected=5
+    )
+
+    assert result.drift == "on_track"
+    assert len(deliver_calls) == 1
+    assert deliver_calls[0][1] == "u1"
+    assert deliver_calls[0][2] == "t1"
+
+
+def test_complete_topic_verification_ahead_and_pending_patch_both_fire(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Co-occurrence judgment call: sustained-ahead drift and a pending
+    high-confidence patch-note are independent conditions and can both
+    fire in the same call — neither suppresses the other.
+    """
+    attempts = _all_full_credit_attempts()
+    _patch_completion_writes(monkeypatch, attempts)
+    monkeypatch.setattr(
+        cpa,
+        "get_pace_snapshot_history",
+        lambda session, uid: [{"topic_score": 1.0, "timing_ratio": 1.0}] * 3,
+    )
+    monkeypatch.setattr(
+        cpa, "get_user", lambda session, uid: {"resolved_role": "Backend Engineer"}
+    )
+    enrichment_calls: list[tuple] = []
+    monkeypatch.setattr(
+        cpa,
+        "maybe_trigger_enrichment",
+        lambda *a, **k: enrichment_calls.append(a) or {"id": "enrichment-1"},
+    )
+    patch_deliver_calls: list[tuple] = []
+    monkeypatch.setattr(
+        cpa,
+        "maybe_deliver_patch",
+        lambda *a, **k: patch_deliver_calls.append(a) or {"id": "patch-topic-1"},
+    )
+
+    result = cpa.complete_topic_verification(
+        MagicMock(), "u1", "t1", days_taken=5, days_expected=5
+    )
+
+    assert result.drift == "ahead"
+    assert result.enrichment_topic == {"id": "enrichment-1"}
+    assert result.delivered_patch_topic == {"id": "patch-topic-1"}
+    assert len(enrichment_calls) == 1
+    assert len(patch_deliver_calls) == 1
+
+
 # --- Test-out: verification-first (PRD §7.6's exception) ------------------
 
 
@@ -1160,6 +1383,7 @@ async def test_test_out_full_pass_writes_completed_test_out_status(
     )
     monkeypatch.setattr(cpa, "write_pace_snapshot", lambda *a, **k: None)
     monkeypatch.setattr(cpa, "get_pace_snapshot_history", lambda session, uid: [])
+    monkeypatch.setattr(cpa, "get_pending_patch_notes", lambda session, uid: [])
     completed_calls: list[tuple] = []
     monkeypatch.setattr(
         cpa,
@@ -1217,6 +1441,7 @@ async def test_test_out_partial_pass_relies_on_the_inline_teach_in_not_a_second_
     )
     monkeypatch.setattr(cpa, "write_pace_snapshot", lambda *a, **k: None)
     monkeypatch.setattr(cpa, "get_pace_snapshot_history", lambda session, uid: [])
+    monkeypatch.setattr(cpa, "get_pending_patch_notes", lambda session, uid: [])
     completed_calls: list[tuple] = []
     monkeypatch.setattr(
         cpa,
@@ -1304,3 +1529,227 @@ async def test_test_out_reuses_the_identical_retry_cap_machinery_not_a_second_on
     assert fake_grade.call_count == 3
     assert len(written) == 3
     assert all(kwargs["is_test_out"] is True for _, kwargs in written)
+
+
+# --- Goal completion / closing note (patch-delivery task, Part 2) ---------
+
+
+def test_is_goal_complete_true_when_all_core_topics_completed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    topics = [
+        {"topic_name": "SQL", "is_enrichment": False, "status": cpa.COMPLETED_STATUS},
+        {
+            "topic_name": "Python",
+            "is_enrichment": False,
+            "status": cpa.COMPLETED_TEST_OUT_STATUS,
+        },
+        {"topic_name": "GraphQL", "is_enrichment": True, "status": "not_started"},
+    ]
+    monkeypatch.setattr(cpa, "get_all_topics_for_user", lambda session, uid: topics)
+
+    assert cpa.is_goal_complete(MagicMock(), "u1") is True
+
+
+def test_is_goal_complete_false_when_a_core_topic_is_incomplete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    topics = [
+        {"topic_name": "SQL", "is_enrichment": False, "status": cpa.COMPLETED_STATUS},
+        {"topic_name": "Python", "is_enrichment": False, "status": "in_progress"},
+    ]
+    monkeypatch.setattr(cpa, "get_all_topics_for_user", lambda session, uid: topics)
+
+    assert cpa.is_goal_complete(MagicMock(), "u1") is False
+
+
+def test_is_goal_complete_ignores_incomplete_enrichment_topics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    topics = [
+        {"topic_name": "SQL", "is_enrichment": False, "status": cpa.COMPLETED_STATUS},
+        {"topic_name": "GraphQL", "is_enrichment": True, "status": "not_started"},
+    ]
+    monkeypatch.setattr(cpa, "get_all_topics_for_user", lambda session, uid: topics)
+
+    assert cpa.is_goal_complete(MagicMock(), "u1") is True
+
+
+def test_is_goal_complete_false_when_no_core_topics_at_all(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cpa, "get_all_topics_for_user", lambda session, uid: [])
+
+    assert cpa.is_goal_complete(MagicMock(), "u1") is False
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "You've grown from a junior developer into a senior one!",
+        "This puts you at an expert level in the field.",
+        "You started as a total beginner.",
+        "Your score of 95% shows real mastery.",
+    ],
+)
+def test_contains_banned_leveling_language_detects_banned_terms(text: str) -> None:
+    assert cpa._contains_banned_leveling_language(text) is True
+
+
+def test_contains_banned_leveling_language_allows_clean_text() -> None:
+    text = (
+        "Congratulations on completing your learning plan! You built real, "
+        "demonstrable skills employers are looking for right now."
+    )
+    assert cpa._contains_banned_leveling_language(text) is False
+
+
+async def test_generate_closing_note_fast_learner_lists_enrichment_strengths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cpa, "get_user", lambda session, uid: {"resolved_role": "Backend Engineer"}
+    )
+    monkeypatch.setattr(
+        cpa,
+        "get_role",
+        lambda session, role: {
+            "core_skills": [],
+            "emerging_skills": [
+                {"skill": "gRPC", "source_url": "https://x", "confidence": "medium"}
+            ],
+        },
+    )
+    topics = [
+        {"topic_name": "SQL", "is_enrichment": False, "status": cpa.COMPLETED_STATUS},
+        {
+            "topic_name": "GraphQL",
+            "is_enrichment": True,
+            "status": cpa.COMPLETED_STATUS,
+        },
+    ]
+    monkeypatch.setattr(cpa, "get_all_topics_for_user", lambda session, uid: topics)
+    monkeypatch.setattr(cpa, "get_deferred_patch_notes", lambda session, uid: [])
+    _patch_gemini(
+        monkeypatch,
+        responses=[
+            json.dumps({"note_text": "Congratulations! You built strong skills."})
+        ],
+    )
+
+    result = await cpa.generate_closing_note(MagicMock(), "u1")
+
+    assert result.resolved_role == "Backend Engineer"
+    assert result.demonstrated_strengths == ["GraphQL"]
+    assert result.suggested_next_steps == []
+    assert result.note_text == "Congratulations! You built strong skills."
+    assert result.deferred_patch_notes == []
+
+
+async def test_generate_closing_note_core_only_learner_suggests_emerging_skills(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cpa, "get_user", lambda session, uid: {"resolved_role": "Backend Engineer"}
+    )
+    monkeypatch.setattr(
+        cpa,
+        "get_role",
+        lambda session, role: {
+            "core_skills": [],
+            "emerging_skills": [
+                {"skill": "gRPC", "source_url": "https://x", "confidence": "medium"},
+                {"skill": "GraphQL", "source_url": "https://y", "confidence": "low"},
+            ],
+        },
+    )
+    topics = [
+        {"topic_name": "SQL", "is_enrichment": False, "status": cpa.COMPLETED_STATUS}
+    ]
+    monkeypatch.setattr(cpa, "get_all_topics_for_user", lambda session, uid: topics)
+    monkeypatch.setattr(cpa, "get_deferred_patch_notes", lambda session, uid: [])
+    _patch_gemini(
+        monkeypatch,
+        responses=[json.dumps({"note_text": "Great work finishing the plan!"})],
+    )
+
+    result = await cpa.generate_closing_note(MagicMock(), "u1")
+
+    assert result.demonstrated_strengths == []
+    assert result.suggested_next_steps == ["gRPC", "GraphQL"]
+
+
+async def test_generate_closing_note_surfaces_deferred_patch_notes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cpa, "get_user", lambda session, uid: {"resolved_role": "Backend Engineer"}
+    )
+    monkeypatch.setattr(
+        cpa,
+        "get_role",
+        lambda session, role: {"core_skills": [], "emerging_skills": []},
+    )
+    monkeypatch.setattr(cpa, "get_all_topics_for_user", lambda session, uid: [])
+    deferred = [{"id": "patch-1", "new_content": "x", "status": "deferred"}]
+    monkeypatch.setattr(cpa, "get_deferred_patch_notes", lambda session, uid: deferred)
+    _patch_gemini(monkeypatch, responses=[json.dumps({"note_text": "text"})])
+
+    result = await cpa.generate_closing_note(MagicMock(), "u1")
+
+    assert result.deferred_patch_notes == deferred
+
+
+async def test_generate_closing_note_unaffected_when_no_deferred_patches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cpa, "get_user", lambda session, uid: {"resolved_role": "Backend Engineer"}
+    )
+    monkeypatch.setattr(
+        cpa,
+        "get_role",
+        lambda session, role: {"core_skills": [], "emerging_skills": []},
+    )
+    monkeypatch.setattr(cpa, "get_all_topics_for_user", lambda session, uid: [])
+    monkeypatch.setattr(cpa, "get_deferred_patch_notes", lambda session, uid: [])
+    _patch_gemini(monkeypatch, responses=[json.dumps({"note_text": "text"})])
+
+    result = await cpa.generate_closing_note(MagicMock(), "u1")
+
+    assert result.deferred_patch_notes == []
+
+
+async def test_generate_closing_note_raises_on_banned_leveling_language(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cpa, "get_user", lambda session, uid: {"resolved_role": "Backend Engineer"}
+    )
+    monkeypatch.setattr(
+        cpa,
+        "get_role",
+        lambda session, role: {"core_skills": [], "emerging_skills": []},
+    )
+    monkeypatch.setattr(cpa, "get_all_topics_for_user", lambda session, uid: [])
+    monkeypatch.setattr(cpa, "get_deferred_patch_notes", lambda session, uid: [])
+    _patch_gemini(
+        monkeypatch,
+        responses=[
+            json.dumps(
+                {"note_text": "You've grown from a junior to a senior developer!"}
+            )
+        ],
+    )
+
+    with pytest.raises(GeminiCallError):
+        await cpa.generate_closing_note(MagicMock(), "u1")
+
+
+async def test_generate_closing_note_raises_if_no_resolved_role(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cpa, "get_user", lambda session, uid: {"resolved_role": None})
+
+    with pytest.raises(ValueError):
+        await cpa.generate_closing_note(MagicMock(), "u1")
