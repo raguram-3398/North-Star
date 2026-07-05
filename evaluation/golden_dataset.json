@@ -1,1 +1,74 @@
-[]
+[
+  {
+    "id": "git_branching",
+    "topic_source_material": "Git is a distributed version control system that tracks changes in source code during software development. Unlike centralized version control systems, every developer's working copy of the code is also a repository that contains the full history of all changes. Branching in Git is lightweight — creating, merging, and deleting branches takes seconds because a branch is simply a movable pointer to a commit, not a full copy of the codebase.",
+    "source_url": "https://git-scm.com/book/en/v2/Getting-Started-About-Version-Control",
+    "num_questions": 5,
+    "expected_question_shape": {
+      "count": 5,
+      "fields_per_question": ["question_text", "grading_criteria", "source_url"],
+      "source_url_equals_input": true,
+      "grading_criteria_is_specific_rubric_not_restated_answer": true
+    }
+  },
+  {
+    "id": "python_functions",
+    "topic_source_material": "A function in Python is defined using the 'def' keyword, followed by the function name and parentheses containing any parameters. Functions can return a value using the 'return' statement; if no return statement is present, the function returns None. Default parameter values are specified in the function signature (e.g. def greet(name='world')), letting a caller omit that argument.",
+    "source_url": "https://docs.python.org/3/tutorial/controlflow.html#defining-functions",
+    "num_questions": 5,
+    "expected_question_shape": {
+      "count": 5,
+      "fields_per_question": ["question_text", "grading_criteria", "source_url"],
+      "source_url_equals_input": true,
+      "grading_criteria_is_specific_rubric_not_restated_answer": true
+    }
+  },
+  {
+    "id": "sql_joins",
+    "topic_source_material": "An INNER JOIN returns rows that have matching values in both tables being joined. A LEFT JOIN returns all rows from the left table, and the matched rows from the right table — if there is no match, the result contains NULL for right-table columns. A self join is a regular join where a table is joined with itself, typically using table aliases to distinguish the two references.",
+    "source_url": "https://www.postgresql.org/docs/current/queries-table-expressions.html#QUERIES-JOIN",
+    "num_questions": 1,
+    "expected_question_shape": {
+      "count": 1,
+      "fields_per_question": ["question_text", "grading_criteria", "source_url"],
+      "source_url_equals_input": true,
+      "grading_criteria_is_specific_rubric_not_restated_answer": true
+    }
+  },
+  {
+    "id": "docker_containers",
+    "topic_source_material": "A Docker image is a read-only template used to create containers. A container is a runnable instance of an image — you can create, start, stop, move, or delete a container using the Docker API or CLI. Containers share the host machine's OS kernel, unlike virtual machines, which each run a full guest operating system, making containers much lighter-weight and faster to start.",
+    "source_url": "https://docs.docker.com/get-started/overview/",
+    "num_questions": 5,
+    "expected_question_shape": {
+      "count": 5,
+      "fields_per_question": ["question_text", "grading_criteria", "source_url"],
+      "source_url_equals_input": true,
+      "grading_criteria_is_specific_rubric_not_restated_answer": true
+    }
+  },
+  {
+    "id": "rest_api_status_codes",
+    "topic_source_material": "HTTP status codes in the 2xx range indicate success (200 OK, 201 Created). The 4xx range indicates a client error — 400 Bad Request means the server could not understand the request due to malformed syntax, while 404 Not Found means the requested resource doesn't exist. The 5xx range indicates a server error, such as 500 Internal Server Error, meaning the server encountered an unexpected condition.",
+    "source_url": "https://developer.mozilla.org/en-US/docs/Web/HTTP/Status",
+    "num_questions": 5,
+    "expected_question_shape": {
+      "count": 5,
+      "fields_per_question": ["question_text", "grading_criteria", "source_url"],
+      "source_url_equals_input": true,
+      "grading_criteria_is_specific_rubric_not_restated_answer": true
+    }
+  },
+  {
+    "id": "css_box_model",
+    "topic_source_material": "The CSS box model describes how every element is represented as a rectangular box, consisting of content, padding, border, and margin. The 'box-sizing' property changes how the total width and height of an element are calculated: 'content-box' (the default) means width/height apply only to the content, while 'border-box' means width/height include padding and border.",
+    "source_url": "https://developer.mozilla.org/en-US/docs/Web/CSS/CSS_box_model/Introduction_to_the_CSS_box_model",
+    "num_questions": 1,
+    "expected_question_shape": {
+      "count": 1,
+      "fields_per_question": ["question_text", "grading_criteria", "source_url"],
+      "source_url_equals_input": true,
+      "grading_criteria_is_specific_rubric_not_restated_answer": true
+    }
+  }
+]

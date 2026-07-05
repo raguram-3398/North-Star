@@ -1,1 +1,53 @@
-[]
+[
+  {
+    "case_id": "positive_initial_five_question_set",
+    "type": "positive",
+    "description": "A topic is about to be studied for the first time and needs its initial 5-question verification set — the Skill must fire and produce exactly 5 source-anchored questions.",
+    "input": {
+      "topic_source_material": "Git is a distributed version control system that tracks changes in source code during software development. Unlike centralized version control systems, every developer's working copy of the code is also a repository that contains the full history of all changes. Git uses a staging area (the 'index') where commits can be formatted and reviewed before completing the commit. Branching in Git is lightweight — creating, merging, and deleting branches takes seconds because a branch is simply a movable pointer to a commit, not a full copy of the codebase.",
+      "source_url": "https://git-scm.com/book/en/v2/Getting-Started-About-Version-Control",
+      "num_questions": 5,
+      "previous_question_texts": []
+    },
+    "expected": {
+      "should_fire": true,
+      "question_count": 5,
+      "every_question_has_non_empty_source_url": true,
+      "every_question_source_url_equals_input_source_url": true
+    }
+  },
+  {
+    "case_id": "positive_targeted_retry_single_fresh_question",
+    "type": "positive",
+    "description": "A user failed a specific question and needs a fresh question covering the same underlying concept — the Skill must fire, produce exactly 1 question, and that question must not repeat any previously-asked question for this slot.",
+    "input": {
+      "topic_source_material": "Git is a distributed version control system that tracks changes in source code during software development. Unlike centralized version control systems, every developer's working copy of the code is also a repository that contains the full history of all changes.",
+      "source_url": "https://git-scm.com/book/en/v2/Getting-Started-About-Version-Control",
+      "num_questions": 1,
+      "previous_question_texts": [
+        "What makes Git a 'distributed' version control system, as opposed to a centralized one?"
+      ]
+    },
+    "expected": {
+      "should_fire": true,
+      "question_count": 1,
+      "question_text_differs_from_all_previous": true,
+      "every_question_has_non_empty_source_url": true
+    }
+  },
+  {
+    "case_id": "negative_empty_source_material",
+    "type": "negative",
+    "description": "Empty/invalid source material must NOT produce questions — the Skill must refuse to fire (raise) rather than silently generating ungrounded content from nothing.",
+    "input": {
+      "topic_source_material": "",
+      "source_url": "https://example.com/whatever",
+      "num_questions": 5,
+      "previous_question_texts": []
+    },
+    "expected": {
+      "should_fire": false,
+      "raises": "ValueError"
+    }
+  }
+]
