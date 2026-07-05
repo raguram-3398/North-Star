@@ -43,7 +43,7 @@ import agents.research_outline_agent as roa
 from data.grounding_fallback import CachedFallbackResult, GeneralKnowledgeFloorResult
 from security.input_gate import ClarifyGateStage, ClarifyGateState
 from security.output_guard import ConfidenceTier, ValidatedGroundedContent
-from utils.exceptions import ClarifyGateLLMError
+from utils.exceptions import GeminiCallError
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
@@ -870,25 +870,25 @@ async def test_last_agent_message_raises_without_a_prior_agent_turn() -> None:
         roa._last_agent_message([_user_turn("hello")])
 
 
-async def test_gemini_json_helper_raises_clarify_gate_llm_error_on_malformed_json(
+async def test_gemini_json_helper_raises_gemini_call_error_on_malformed_json(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_gemini(monkeypatch, responses=["not valid json at all"])
 
-    with pytest.raises(ClarifyGateLLMError):
+    with pytest.raises(GeminiCallError):
         await roa._evaluate_acceptance("some proposal", "yes")
 
 
-async def test_gemini_json_helper_raises_clarify_gate_llm_error_on_missing_key(
+async def test_gemini_json_helper_raises_gemini_call_error_on_missing_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_gemini(monkeypatch, responses=[json.dumps({"unexpected": "shape"})])
 
-    with pytest.raises(ClarifyGateLLMError):
+    with pytest.raises(GeminiCallError):
         await roa._evaluate_acceptance("some proposal", "yes")
 
 
-async def test_gemini_timeout_raises_clarify_gate_llm_error(
+async def test_gemini_timeout_raises_gemini_call_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Explicit timeout-path test (CLAUDE.md testing expectations), mirroring
@@ -897,5 +897,245 @@ async def test_gemini_timeout_raises_clarify_gate_llm_error(
     monkeypatch.setattr(roa, "EXTERNAL_CALL_TIMEOUT_SECONDS", 0.01)
     _patch_gemini(monkeypatch, responses=["irrelevant"], sleep_seconds=0.2)
 
-    with pytest.raises(ClarifyGateLLMError):
+    with pytest.raises(GeminiCallError):
         await roa._generate_narrowing_question("Data stuff", [])
+
+
+# --- Initial Outline Creation: create_initial_outline ---------------------
+
+
+def _grounded(
+    skill: str,
+    source_url: str,
+    source_type: str = "job_listing",
+    confidence: ConfidenceTier = ConfidenceTier.HIGH,
+) -> ValidatedGroundedContent:
+    return ValidatedGroundedContent(
+        source_url=source_url,
+        source_type=source_type,
+        confidence=confidence,
+        extra={"skill": skill},
+    )
+
+
+GIT_SKILL = _grounded("Git", "https://git.example/1")
+PYTHON_SKILL = _grounded("Python", "https://python.example/1")
+DJANGO_SKILL = _grounded(
+    "Django",
+    "https://django.example/1",
+    source_type="web_search",
+    confidence=ConfidenceTier.MEDIUM,
+)
+
+# One group per skill except Python, which fans out into 3 topics —
+# exercises both cross-group ordering (Git, then Python*, then Django)
+# and within-group ordering (Python syntax -> functions -> OOP).
+_WELL_FORMED_HIERARCHY_RESPONSE = json.dumps(
+    {
+        "groups": [
+            {
+                "topic_group": "Git",
+                "topics": [{"topic_name": "Git basics", "source_skill": "Git"}],
+            },
+            {
+                "topic_group": "Python",
+                "topics": [
+                    {
+                        "topic_name": "Python syntax and variables",
+                        "source_skill": "Python",
+                    },
+                    {"topic_name": "Python functions", "source_skill": "Python"},
+                    {
+                        "topic_name": "Python object-oriented programming",
+                        "source_skill": "Python",
+                    },
+                ],
+            },
+            {
+                "topic_group": "Django",
+                "topics": [
+                    {
+                        "topic_name": "Django framework basics",
+                        "source_skill": "Django",
+                    }
+                ],
+            },
+        ]
+    }
+)
+
+
+async def test_create_initial_outline_orders_groups_in_prerequisite_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Global cross-group ordering: Git and all of Python's topics must
+    precede Django (task's explicit example)."""
+    _patch_gemini(monkeypatch, responses=[_WELL_FORMED_HIERARCHY_RESPONSE])
+
+    topics = await roa.create_initial_outline(
+        "Backend Engineer", [GIT_SKILL, PYTHON_SKILL], [DJANGO_SKILL]
+    )
+
+    by_name = {t.topic_name: t for t in topics}
+    django_position = by_name["Django framework basics"].hierarchy_position
+    assert by_name["Git basics"].hierarchy_position < django_position
+    assert by_name["Python syntax and variables"].hierarchy_position < django_position
+    assert by_name["Python functions"].hierarchy_position < django_position
+    assert (
+        by_name["Python object-oriented programming"].hierarchy_position
+        < django_position
+    )
+
+
+async def test_create_initial_outline_orders_within_group_in_prerequisite_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Within-group ordering: inside the 'Python' group, syntax must
+    precede functions must precede OOP — both by position_in_group and by
+    the global hierarchy_position."""
+    _patch_gemini(monkeypatch, responses=[_WELL_FORMED_HIERARCHY_RESPONSE])
+
+    topics = await roa.create_initial_outline(
+        "Backend Engineer", [GIT_SKILL, PYTHON_SKILL], [DJANGO_SKILL]
+    )
+
+    python_topics = [t for t in topics if t.topic_group == "Python"]
+    assert [t.topic_name for t in python_topics] == [
+        "Python syntax and variables",
+        "Python functions",
+        "Python object-oriented programming",
+    ]
+    assert [t.position_in_group for t in python_topics] == [1, 2, 3]
+    assert [t.hierarchy_position for t in python_topics] == sorted(
+        t.hierarchy_position for t in python_topics
+    )
+
+
+async def test_create_initial_outline_carries_source_fields_through_unaltered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every output topic's source_url/source_type/confidence must equal
+    its input skill's exactly — Gemini's JSON never even contains these
+    fields, so this also proves they can't be silently altered."""
+    _patch_gemini(monkeypatch, responses=[_WELL_FORMED_HIERARCHY_RESPONSE])
+
+    topics = await roa.create_initial_outline(
+        "Backend Engineer", [GIT_SKILL, PYTHON_SKILL], [DJANGO_SKILL]
+    )
+    by_name = {t.topic_name: t for t in topics}
+
+    git_topic = by_name["Git basics"]
+    assert git_topic.source_url == GIT_SKILL.source_url
+    assert git_topic.source_type == GIT_SKILL.source_type
+    assert git_topic.confidence == GIT_SKILL.confidence
+
+    for name in (
+        "Python syntax and variables",
+        "Python functions",
+        "Python object-oriented programming",
+    ):
+        assert by_name[name].source_url == PYTHON_SKILL.source_url
+        assert by_name[name].source_type == PYTHON_SKILL.source_type
+        assert by_name[name].confidence == PYTHON_SKILL.confidence
+
+    django_topic = by_name["Django framework basics"]
+    assert django_topic.source_url == DJANGO_SKILL.source_url
+    assert django_topic.source_type == DJANGO_SKILL.source_type
+    assert django_topic.confidence == DJANGO_SKILL.confidence
+
+
+async def test_create_initial_outline_sets_is_enrichment_false_and_not_started(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_gemini(monkeypatch, responses=[_WELL_FORMED_HIERARCHY_RESPONSE])
+
+    topics = await roa.create_initial_outline(
+        "Backend Engineer", [GIT_SKILL, PYTHON_SKILL], [DJANGO_SKILL]
+    )
+
+    assert topics
+    for topic in topics:
+        assert topic.is_enrichment is False
+        assert topic.status == "not_started"
+
+
+async def test_create_initial_outline_raises_on_missing_groups_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_gemini(monkeypatch, responses=[json.dumps({"unexpected": "shape"})])
+
+    with pytest.raises(GeminiCallError):
+        await roa.create_initial_outline("Backend Engineer", [GIT_SKILL], [])
+
+
+async def test_create_initial_outline_raises_on_fabricated_source_skill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The LLM referencing a skill that isn't in the grounded input at all
+    must raise, not silently pass through an unattributable topic."""
+    response = json.dumps(
+        {
+            "groups": [
+                {
+                    "topic_group": "Git",
+                    "topics": [
+                        {
+                            "topic_name": "Git basics",
+                            "source_skill": "Some Made Up Skill",
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+    _patch_gemini(monkeypatch, responses=[response])
+
+    with pytest.raises(GeminiCallError):
+        await roa.create_initial_outline("Backend Engineer", [GIT_SKILL], [])
+
+
+async def test_create_initial_outline_raises_when_a_skill_is_never_covered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dropping a grounded skill entirely (never referenced by any topic)
+    must raise — CLAUDE.md guardrail #1's 'never drop' extended to mean
+    every grounded skill must end up somewhere in the outline."""
+    response = json.dumps(
+        {
+            "groups": [
+                {
+                    "topic_group": "Git",
+                    "topics": [{"topic_name": "Git basics", "source_skill": "Git"}],
+                }
+            ]
+        }
+    )
+    _patch_gemini(monkeypatch, responses=[response])
+
+    with pytest.raises(GeminiCallError):
+        await roa.create_initial_outline(
+            "Backend Engineer", [GIT_SKILL, PYTHON_SKILL], []
+        )
+
+
+async def test_create_initial_outline_raises_on_malformed_topic_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = json.dumps(
+        {"groups": [{"topic_group": "Git", "topics": [{"topic_name": "Git basics"}]}]}
+    )
+    _patch_gemini(monkeypatch, responses=[response])
+
+    with pytest.raises(GeminiCallError):
+        await roa.create_initial_outline("Backend Engineer", [GIT_SKILL], [])
+
+
+async def test_create_initial_outline_raises_on_empty_group_list() -> None:
+    with pytest.raises(ValueError):
+        await roa.create_initial_outline("Backend Engineer", [], [])
+
+
+def test_build_grounded_skill_map_raises_on_duplicate_skill_name() -> None:
+    duplicate = _grounded("Git", "https://git.example/2")
+    with pytest.raises(ValueError):
+        roa._build_grounded_skill_map([GIT_SKILL], [duplicate])

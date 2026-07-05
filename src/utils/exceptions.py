@@ -59,14 +59,18 @@ class GroundingSourceCallError(Exception):
     """
 
 
-class ClarifyGateLLMError(Exception):
-    """Raised by agents/research_outline_agent.py's clarify-gate turn
-    functions when a Gemini call itself fails (connection error,
-    non-success response, or exceeding its explicit timeout) or when the
-    response cannot be parsed into the structured shape the caller
-    requires (e.g. malformed JSON, or a required field missing from an
-    otherwise-parsed object). Distinct from a genuinely ambiguous or
-    negative *interpretation* of the model's output (e.g. the model
-    honestly reports it could not resolve a role) — that is expected,
-    handled conversational content, not an error.
+class GeminiCallError(Exception):
+    """Raised by any Gemini-backed reasoning step in
+    agents/research_outline_agent.py (the clarify gate's turn functions
+    and initial outline-hierarchy sequencing) when a Gemini call itself
+    fails (connection error, non-success response, or exceeding its
+    explicit timeout) or when the response cannot be parsed into the
+    structured shape the caller requires — malformed JSON, a required
+    field missing from an otherwise-parsed object, or (for outline
+    sequencing specifically) a topic referencing a skill that was never
+    in the grounded input, or a grounded skill never covered by any
+    topic. Distinct from a genuinely ambiguous or negative
+    *interpretation* of the model's output (e.g. the model honestly
+    reports it could not resolve a role) — that is expected, handled
+    conversational content, not an error.
     """

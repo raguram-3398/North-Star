@@ -89,7 +89,7 @@ from security.output_guard import (
     validate_output_object,
 )
 from utils.exceptions import (
-    ClarifyGateLLMError,
+    GeminiCallError,
     GroundingSourceCallError,
     HimalayasParseError,
     TavilyParseError,
@@ -157,13 +157,21 @@ def _get_tavily_client() -> TavilyClient:
     return _tavily_client
 
 
-# --- Clarify Gate (PRD §7.2) conversational content --------------------
+# --- Shared Gemini call infrastructure (used by both the Clarify Gate ---
+# --- and initial outline creation below) --------------------------------
 
 # Judgment call: "flash" tier chosen for short, low-latency conversational
 # turns (a handful of sentences at most) rather than long grounded
 # generation — distinct from any future model choice for outline/
 # hierarchy sequencing, which may warrant a stronger tier.
 CLARIFY_GATE_GEMINI_MODEL = "gemini-2.5-flash"
+
+# Judgment call: a stronger tier than the clarify gate's, deliberately.
+# Initial outline creation is a one-time call per user (not a per-turn
+# conversational cost), and correctness of prerequisite ordering across
+# potentially dozens of skills matters more here than low latency —
+# "pro" is justified where "flash" is not.
+OUTLINE_HIERARCHY_GEMINI_MODEL = "gemini-2.5-pro"
 
 _gemini_client: genai.Client | None = None
 
@@ -248,6 +256,40 @@ PROMPT_REGISTRY: dict[str, str] = {
         "User's reply: {user_reply!r}\n\n"
         "Respond with ONLY a JSON object matching this shape: "
         '{{"accepted": true or false}}.'
+    ),
+    "outline_hierarchy_sequencing_v1": (
+        "You are designing the initial learning curriculum for someone "
+        "pursuing the role of {role!r}. Below is a grounded list of "
+        "skills this role actually requires (each labeled 'core' — "
+        "consistently required — or 'emerging' — a real but newer/growing "
+        "requirement). Sequence them into a dependency-ordered curriculum "
+        "using real-world domain knowledge of how these subjects build on "
+        "each other.\n\n"
+        "Skills:\n{skill_list}\n\n"
+        "Requirements:\n"
+        "1. Organize the skills into named topic groups (e.g. 'Python', "
+        "'SQL', 'Git') and order the GROUPS themselves in prerequisite "
+        "order — foundational/basics groups before groups that build on "
+        "them or are more advanced/role-specific.\n"
+        "2. Within EACH group, order its topics in prerequisite order too "
+        "(e.g. within a 'Python' group: syntax and variables, then "
+        "functions, then object-oriented programming, before a framework "
+        "built on Python appears as its own later group).\n"
+        "3. Break a broad skill into multiple smaller topics where that "
+        "reflects how it's actually learned (e.g. a broad skill like "
+        "'Python' should become several topics, not one) — do not "
+        "collapse a whole skill into a single topic just because it was "
+        "one line in the list above.\n"
+        "4. Every topic must set 'source_skill' to the EXACT text of "
+        "exactly one skill from the list above. Every skill in the list "
+        "above must be covered by at least one topic. Never invent a "
+        "skill that isn't in the list above, and never omit one.\n\n"
+        "Respond with ONLY a JSON object matching this shape:\n"
+        '{{"groups": [{{"topic_group": "<group name>", "topics": '
+        '[{{"topic_name": "<specific topic name>", "source_skill": '
+        '"<exact skill text from the list above>"}}, ...]}}, ...]}}\n'
+        "Groups must appear in prerequisite order; topics within each "
+        "group must appear in prerequisite order."
     ),
 }
 
@@ -347,45 +389,59 @@ def _last_agent_message(conversation: ConversationHistory) -> str:
     )
 
 
-async def _call_gemini_text(prompt: str) -> str:
+async def _call_gemini_text(prompt: str, model: str = CLARIFY_GATE_GEMINI_MODEL) -> str:
     """Call Gemini with a plain-text prompt and return the response text,
-    stripped. Raises `ClarifyGateLLMError` if the call fails, times out, or
+    stripped. Raises `GeminiCallError` if the call fails, times out, or
     returns no text at all.
+
+    Shared across every Gemini-backed reasoning step in this module (not
+    clarify-gate-specific despite the default `model`) — callers pass an
+    explicit `model` when they need a different tier (e.g.
+    `OUTLINE_HIERARCHY_GEMINI_MODEL`).
     """
     client = _get_gemini_client()
     try:
         response = await asyncio.wait_for(
             client.aio.models.generate_content(
-                model=CLARIFY_GATE_GEMINI_MODEL,
+                model=model,
                 contents=prompt,
             ),
             timeout=EXTERNAL_CALL_TIMEOUT_SECONDS,
         )
     except Exception as exc:  # noqa: BLE001 — see module docstring: any
         # Gemini-side failure (connection, API error, or timeout) is a
-        # ClarifyGateLLMError, never left as a bare SDK/asyncio exception
+        # GeminiCallError, never left as a bare SDK/asyncio exception
         # for the caller to guess at.
-        raise ClarifyGateLLMError(f"Gemini call failed: {exc}") from exc
+        raise GeminiCallError(f"Gemini call failed: {exc}") from exc
 
     text = response.text
     if not text or not text.strip():
-        raise ClarifyGateLLMError("Gemini returned an empty response")
+        raise GeminiCallError("Gemini returned an empty response")
     return text.strip()
 
 
-async def _call_gemini_json(prompt: str, required_keys: set[str]) -> dict[str, Any]:
+async def _call_gemini_json(
+    prompt: str,
+    required_keys: set[str],
+    model: str = CLARIFY_GATE_GEMINI_MODEL,
+) -> dict[str, Any]:
     """Call Gemini requesting a JSON object response and return it parsed.
 
-    Raises `ClarifyGateLLMError` if the call fails/times out, the response
+    Raises `GeminiCallError` if the call fails/times out, the response
     is not valid JSON, the parsed value is not a JSON object, or any of
     `required_keys` is missing — never returns a partially-valid dict for
     the caller to guess at.
+
+    Shared across every Gemini-backed reasoning step in this module (not
+    clarify-gate-specific despite the default `model`) — callers pass an
+    explicit `model` when they need a different tier (e.g.
+    `OUTLINE_HIERARCHY_GEMINI_MODEL`).
     """
     client = _get_gemini_client()
     try:
         response = await asyncio.wait_for(
             client.aio.models.generate_content(
-                model=CLARIFY_GATE_GEMINI_MODEL,
+                model=model,
                 contents=prompt,
                 config=genai_types.GenerateContentConfig(
                     response_mime_type="application/json",
@@ -394,27 +450,28 @@ async def _call_gemini_json(prompt: str, required_keys: set[str]) -> dict[str, A
             timeout=EXTERNAL_CALL_TIMEOUT_SECONDS,
         )
     except Exception as exc:  # noqa: BLE001 — see _call_gemini_text
-        raise ClarifyGateLLMError(f"Gemini call failed: {exc}") from exc
+        raise GeminiCallError(f"Gemini call failed: {exc}") from exc
 
     raw_text = response.text
     if not raw_text or not raw_text.strip():
-        raise ClarifyGateLLMError("Gemini returned an empty response")
+        raise GeminiCallError("Gemini returned an empty response")
     try:
         parsed = json.loads(raw_text)
     except json.JSONDecodeError as exc:
-        raise ClarifyGateLLMError(
+        raise GeminiCallError(
             f"Gemini response was not valid JSON: {raw_text!r}"
         ) from exc
     if not isinstance(parsed, dict):
-        raise ClarifyGateLLMError(
-            f"Gemini JSON response was not an object: {raw_text!r}"
-        )
+        raise GeminiCallError(f"Gemini JSON response was not an object: {raw_text!r}")
     missing = required_keys - parsed.keys()
     if missing:
-        raise ClarifyGateLLMError(
+        raise GeminiCallError(
             f"Gemini JSON response is missing required keys {missing}: {raw_text!r}"
         )
     return parsed
+
+
+# --- Clarify Gate (PRD §7.2) conversational content ---------------------
 
 
 async def _generate_narrowing_question(
@@ -444,7 +501,7 @@ async def _evaluate_narrowing_answer(
     resolved = bool(parsed["resolved"])
     role = parsed["role"] if resolved else None
     if resolved and not isinstance(role, str):
-        raise ClarifyGateLLMError(
+        raise GeminiCallError(
             f"Gemini reported resolved=True but 'role' was not a string: {parsed!r}"
         )
     return resolved, role
@@ -463,11 +520,9 @@ async def _propose_best_guess_role(
     parsed = await _call_gemini_json(prompt, required_keys={"role", "message"})
     role, message = parsed["role"], parsed["message"]
     if not isinstance(role, str) or not role.strip():
-        raise ClarifyGateLLMError(f"Gemini proposal had no usable 'role': {parsed!r}")
+        raise GeminiCallError(f"Gemini proposal had no usable 'role': {parsed!r}")
     if not isinstance(message, str) or not message.strip():
-        raise ClarifyGateLLMError(
-            f"Gemini proposal had no usable 'message': {parsed!r}"
-        )
+        raise GeminiCallError(f"Gemini proposal had no usable 'message': {parsed!r}")
     return role, message
 
 
@@ -913,12 +968,196 @@ async def ground_role(
     )
 
 
-def create_initial_outline(
-    resolved_role: str, grounded_skills: list[dict[str, Any]]
-) -> list[dict[str, Any]]:
-    """Sequence grounded skill data into a dependency hierarchy (basics ->
-    full role requirements), per PRD §7.4.
+# --- Initial Outline Creation (PRD §7.4) ---------------------------------
 
-    Not yet implemented — scaffolding only.
+NOT_STARTED_STATUS = "not_started"
+
+
+@dataclass(frozen=True)
+class InitialOutlineTopic:
+    """One `outline_topics` row produced by initial hierarchy creation
+    (Architecture §5's schema, PRD §7.4) — not yet persisted; the actual
+    DB write path (not built as part of this task) is responsible for
+    assigning `id`/`user_id` and performing the insert.
+
+    `hierarchy_position` is the single global ordering across the entire
+    outline (1-indexed); `position_in_group` is this topic's order within
+    its own `topic_group` (also 1-indexed) — Architecture §5's two
+    separate ordering columns.
     """
-    raise NotImplementedError
+
+    topic_name: str
+    hierarchy_position: int
+    topic_group: str
+    position_in_group: int
+    source_url: str
+    source_type: str
+    confidence: ConfidenceTier
+    is_enrichment: bool
+    status: str
+
+
+def _build_grounded_skill_map(
+    core_skills: list[ValidatedGroundedContent],
+    emerging_skills: list[ValidatedGroundedContent],
+) -> dict[str, ValidatedGroundedContent]:
+    """Build a skill-name -> already-validated-grounding lookup from
+    `ground_role`'s (or `data/grounding_fallback.py`'s) output, used to
+    re-attach each output topic's source_url/source_type/confidence by
+    exact name match — never by trusting anything Gemini says about
+    sourcing (see `create_initial_outline`'s docstring).
+
+    Raises `ValueError` if a skill entry has no usable name, or if the
+    same skill name appears in both `core_skills` and `emerging_skills` —
+    both indicate a caller/data-integrity bug upstream, not something
+    this function should silently resolve one way or another.
+    """
+    skill_map: dict[str, ValidatedGroundedContent] = {}
+    for grounded in (*core_skills, *emerging_skills):
+        name = grounded.extra.get("skill")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(
+                f"grounded skill entry has no usable 'skill' name: {grounded!r}"
+            )
+        if name in skill_map:
+            raise ValueError(
+                f"skill {name!r} appears more than once across core_skills/"
+                "emerging_skills — each grounded skill must be listed exactly once"
+            )
+        skill_map[name] = grounded
+    return skill_map
+
+
+def _format_skill_list_for_prompt(
+    core_skills: list[ValidatedGroundedContent],
+    emerging_skills: list[ValidatedGroundedContent],
+) -> str:
+    lines = [f"- {skill.extra['skill']} (core)" for skill in core_skills]
+    lines += [f"- {skill.extra['skill']} (emerging)" for skill in emerging_skills]
+    return "\n".join(lines)
+
+
+async def create_initial_outline(
+    resolved_role: str,
+    core_skills: list[ValidatedGroundedContent],
+    emerging_skills: list[ValidatedGroundedContent],
+) -> list[InitialOutlineTopic]:
+    """Sequence already-grounded skill data (from `ground_role`'s
+    `LiveGroundingResult.skills` split by caller into core/emerging, or
+    directly from `data/grounding_fallback.py`'s `CachedFallbackResult`)
+    into a dependency-ordered outline hierarchy (PRD §7.4) — genuinely
+    requires LLM domain-knowledge judgment (Architecture §2/§3): correct
+    prerequisite order (HTML before CSS before JavaScript; Python
+    fundamentals before Django) isn't derivable from the grounded skill
+    list alone.
+
+    This function only *sequences and groups* already-grounded data; it
+    never re-grounds, re-fetches, or re-attributes sourcing. Every output
+    topic's `source_url`/`source_type`/`confidence` is copied unchanged
+    from the input skill it was derived from (matched by exact skill
+    name via `source_skill` in Gemini's response) — Gemini's JSON output
+    never carries sourcing fields at all, so it structurally cannot
+    invent, drop, or alter one (CLAUDE.md guardrail #1), rather than this
+    merely being a prompt instruction Gemini could get wrong.
+
+    Raises `GeminiCallError` if Gemini's response is malformed, omits any
+    input skill, or references a skill not in the input (a fabricated
+    `source_skill`). Raises `security.output_guard.ConfidenceValidationError`
+    if a constructed candidate somehow fails the structural gate (should
+    never happen given already-validated input, per CLAUDE.md guardrail
+    #12 — every topic still passes through `validate_output_object`
+    rather than being trusted by construction).
+
+    Does not build outline confirmation, day-by-day content, or
+    insertion/update logic for an existing outline (`outline/hierarchy.py`)
+    — this is one-time initial creation only.
+    """
+    skill_map = _build_grounded_skill_map(core_skills, emerging_skills)
+    if not skill_map:
+        raise ValueError("create_initial_outline requires at least one grounded skill")
+
+    prompt = PROMPT_REGISTRY["outline_hierarchy_sequencing_v1"].format(
+        role=resolved_role,
+        skill_list=_format_skill_list_for_prompt(core_skills, emerging_skills),
+    )
+    parsed = await _call_gemini_json(
+        prompt, required_keys={"groups"}, model=OUTLINE_HIERARCHY_GEMINI_MODEL
+    )
+
+    groups = parsed["groups"]
+    if not isinstance(groups, list) or not groups:
+        raise GeminiCallError(f"'groups' must be a non-empty list: {parsed!r}")
+
+    topics: list[InitialOutlineTopic] = []
+    referenced_skills: set[str] = set()
+    hierarchy_position = 0
+
+    for group in groups:
+        if (
+            not isinstance(group, dict)
+            or "topic_group" not in group
+            or "topics" not in group
+        ):
+            raise GeminiCallError(f"malformed group entry: {group!r}")
+        topic_group = group["topic_group"]
+        group_topics = group["topics"]
+        if not isinstance(topic_group, str) or not topic_group.strip():
+            raise GeminiCallError(f"group has no usable 'topic_group': {group!r}")
+        if not isinstance(group_topics, list) or not group_topics:
+            raise GeminiCallError(f"group {topic_group!r} has no topics: {group!r}")
+
+        for position_in_group, topic in enumerate(group_topics, start=1):
+            if (
+                not isinstance(topic, dict)
+                or "topic_name" not in topic
+                or "source_skill" not in topic
+            ):
+                raise GeminiCallError(f"malformed topic entry: {topic!r}")
+            topic_name = topic["topic_name"]
+            source_skill = topic["source_skill"]
+            if not isinstance(topic_name, str) or not topic_name.strip():
+                raise GeminiCallError(f"topic has no usable 'topic_name': {topic!r}")
+            if not isinstance(source_skill, str) or source_skill not in skill_map:
+                raise GeminiCallError(
+                    f"topic {topic_name!r} references 'source_skill' "
+                    f"{source_skill!r}, which is not in the grounded skill list"
+                )
+
+            grounded = skill_map[source_skill]
+            referenced_skills.add(source_skill)
+            hierarchy_position += 1
+
+            candidate = {
+                "source_url": grounded.source_url,
+                "source_type": grounded.source_type,
+                "confidence": grounded.confidence.value,
+                "topic_name": topic_name,
+                "hierarchy_position": hierarchy_position,
+                "topic_group": topic_group,
+                "position_in_group": position_in_group,
+                "is_enrichment": False,
+                "status": NOT_STARTED_STATUS,
+            }
+            validated = validate_output_object(candidate)
+            topics.append(
+                InitialOutlineTopic(
+                    topic_name=validated.extra["topic_name"],
+                    hierarchy_position=validated.extra["hierarchy_position"],
+                    topic_group=validated.extra["topic_group"],
+                    position_in_group=validated.extra["position_in_group"],
+                    source_url=validated.source_url,
+                    source_type=validated.source_type,
+                    confidence=validated.confidence,
+                    is_enrichment=validated.extra["is_enrichment"],
+                    status=validated.extra["status"],
+                )
+            )
+
+    missing_skills = skill_map.keys() - referenced_skills
+    if missing_skills:
+        raise GeminiCallError(
+            "the following grounded skills were never covered by any "
+            f"topic: {sorted(missing_skills)}"
+        )
+
+    return topics
