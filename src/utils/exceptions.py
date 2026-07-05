@@ -42,3 +42,15 @@ class TavilyParseError(Exception):
     response, not merely a result with no extractable skills (which is
     not an error — see data/tavily_parser.py's module docstring).
     """
+
+
+class GroundingSourceCallError(Exception):
+    """Raised by agents/research_outline_agent.py when a live grounding
+    source call itself (Himalayas MCP or Tavily) fails — connection
+    error, non-success API response, or the call exceeding its explicit
+    timeout (CLAUDE.md guardrail #14). Distinct, intentionally, from that
+    source legitimately returning zero relevant results (not an error —
+    see data/himalayas_relevance.py): a call failure and an empty/
+    irrelevant result both end up treated as "no live signal from this
+    source" for confidence-ladder purposes, but only a call failure
+    raises this exception internally before being caught and downgraded,
