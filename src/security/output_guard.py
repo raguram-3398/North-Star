@@ -45,15 +45,6 @@ class ValidatedGroundedContent:
     extra: dict[str, Any] = field(default_factory=dict)
 
 
-def assign_confidence_tier(sources_agree: bool, source_count: int) -> ConfidenceTier:
-    """Deterministically map a cross-validation outcome to a confidence
-    tier on the canonical ladder (PRD §7.3).
-
-    Not yet implemented — scaffolding only.
-    """
-    raise NotImplementedError
-
-
 def validate_output_object(candidate: dict[str, Any]) -> ValidatedGroundedContent:
     """Validate that a candidate outline item, patch-note, or grounding
     result carries a populated, well-formed source_url, source_type, and

@@ -43,18 +43,18 @@ addition was needed). `"on_track"` -> no action. See the dedicated
 "Resolved" block near `complete_topic_verification` below for the full
 set of judgment calls.
 
-**Test-out** (`complete_topic_test_out`, `generate_gap_study_content`)
-reuses the identical `begin_verification_question`/
-`submit_verification_answer` retry-cap machinery regular verification
-uses — no separate retry cap or attempt-counting shape — and
-`complete_topic_verification`'s existing pace-signal/completion path,
-extended with an `is_test_out` flag so a full pass writes the schema's
-distinct `completed_test_out` status rather than `completed`. Only a
-partial pass (>=1 question resolved via the retry-cap teach-and-
-de-escalate path) generates any content at all, and only
-`generate_gap_study_content` — a new, purpose-built path scoped strictly
-to the failed question(s), never `generate_day_content`'s 7-step
-structure.
+**Test-out** (`complete_topic_test_out`) reuses the identical
+`begin_verification_question`/`submit_verification_answer` retry-cap
+machinery regular verification uses — no separate retry cap or
+attempt-counting shape — and `complete_topic_verification`'s existing
+pace-signal/completion path, extended with an `is_test_out` flag so a
+full pass writes the schema's distinct `completed_test_out` status
+rather than `completed`. A partial pass (>=1 question resolved via the
+retry-cap teach-and-de-escalate path) generates no further content: each
+`HALF_CREDIT` slot already received `submit_verification_answer`'s inline
+teach-in during the retry-cap attempt itself, so `complete_topic_test_out`
+only marks completion — a second remediation-content generation step
+here would re-teach the identical rubric a second time.
 """
 
 import asyncio
@@ -76,6 +76,7 @@ from tavily.errors import TimeoutError as TavilyTimeoutError
 
 from agents.research_outline_agent import (
     EXTERNAL_CALL_TIMEOUT_SECONDS,
+    HEAVY_GENERATION_TIMEOUT_SECONDS,
     _call_gemini_json,
     _get_tavily_client,
 )
@@ -290,19 +291,6 @@ PROMPT_REGISTRY: dict[str, str] = {
         "Size the depth/length of every field to genuinely fit within "
         "{minutes_available} minutes total for the whole lesson."
     ),
-    "gap_study_content_v1": (
-        "A learner tried to test out of a topic by answering verification "
-        "questions before any study material was shown. They did not pass "
-        "the question(s) below outright — they only passed after being "
-        "taught the answer at the retry cap. Generate focused study "
-        "material that teaches ONLY the specific gap(s) below — do not "
-        "cover the whole topic, only what these question(s) actually "
-        "test.\n\n"
-        "{gaps}\n\n"
-        "Respond with ONLY a JSON object matching this shape: "
-        '{{"study_content": "<prose study material covering only these '
-        'specific gaps, citing the given source(s)>"}}.'
-    ),
     "goal_completion_closing_note_v1": (
         "Compose a warm, encouraging goal-completion closing note for a "
         "learner who has just finished their core learning plan for the "
@@ -510,7 +498,10 @@ async def generate_day_content(
         }
 
     parsed = await _call_gemini_json(
-        prompt, required_keys=required_keys, model=DAY_CONTENT_GEMINI_MODEL
+        prompt,
+        required_keys=required_keys,
+        model=DAY_CONTENT_GEMINI_MODEL,
+        timeout=HEAVY_GENERATION_TIMEOUT_SECONDS,
     )
 
     return DayContent(
@@ -745,6 +736,21 @@ ENRICHMENT_POSITION_IN_GROUP = 1
 # few topics) rather than a large jump; unvalidated against real usage,
 # same status as pace/calculator.py's own threshold constants.
 PACE_EXTENSION_DAYS_PER_TRIGGER = 2
+
+# PRD §7.8's explicit "cold start: weeks 1-2 are calibration only" —
+# real, previously-unimplemented gap: `pace/calculator.py`'s own docstring
+# states plainly that calendar-time cold-start gating is "the caller's
+# responsibility (Agent 2)", but no caller ever did it — this module's
+# only prior gating was `detect_sustained_drift`'s own `DRIFT_WINDOW_SIZE`
+# (a *count* of snapshots), which is a different concept from "weeks 1-2"
+# (*calendar* time) and does not stand in for it: a user completing 3
+# topics in their first 2 days would already trigger real drift/
+# enrichment/pacing-extension actions well inside week 1. 14 (2 weeks,
+# calendar days since `users.created_at`) is the literal reading of the
+# PRD's own "weeks 1-2" wording — a judgment call on the exact boundary,
+# flagged for tuning like every other constant in this module, not a
+# silently-invented threshold.
+COLD_START_CALIBRATION_DAYS = 14
 
 
 @dataclass(frozen=True)
@@ -1059,6 +1065,7 @@ def complete_topic_verification(
     days_expected: int,
     is_test_out: bool = False,
     is_enrichment: bool = False,
+    reference_time: datetime | None = None,
 ) -> TopicCompletionResult:
     """Called once all 5 verification question slots for `topic_id` have
     resolved: computes `topic_score` from their final credits
@@ -1089,17 +1096,30 @@ def complete_topic_verification(
     When a `pace_snapshots` row *is* written (i.e. `is_enrichment=False`),
     this function also reads the user's full pace-snapshot history
     (`data/pace_snapshots.py`'s `get_pace_snapshot_history` — which now
-    includes the row just written), recomputes each entry's combined pace
-    signal (`calculate_combined_pace_signal`, not reimplemented), and
-    calls `pace/calculator.py`'s `detect_sustained_drift` unmodified
-    (cold-start/window-size gating is entirely that function's own
-    responsibility — not duplicated here). `"ahead"` calls
+    includes the row just written) and recomputes each entry's combined
+    pace signal (`calculate_combined_pace_signal`, not reimplemented).
+
+    **Cold-start gate (PRD §7.8's "weeks 1-2 are calibration only"):**
+    `pace/calculator.py`'s `DRIFT_WINDOW_SIZE` gating is a *count* of
+    snapshots, not calendar time — a user who completes 3 topics in their
+    first 2 days would already trigger real drift/enrichment/pacing-
+    extension actions well inside week 1, which is not what "weeks 1-2
+    are calibration only" means. This function additionally checks
+    `users.created_at` against `COLD_START_CALIBRATION_DAYS`
+    (`reference_time`, defaulting to now, minus `created_at`): still
+    inside the calibration window -> `detect_sustained_drift` is never
+    even called, `drift` stays `"on_track"`, nothing further fires. Data
+    collection (the `pace_snapshots` write above) is never suppressed —
+    only judgment/action on it is.
+
+    Past the calibration window, calls `pace/calculator.py`'s
+    `detect_sustained_drift` unmodified. `"ahead"` calls
     `maybe_trigger_enrichment` (skipped, logged as `enrichment_topic=None`,
     if the user's `users.resolved_role` is missing — a data-integrity gap
     upstream, not something this function raises over). `"behind"` calls
     `data/users.py`'s `extend_pacing` by `PACE_EXTENSION_DAYS_PER_TRIGGER`.
-    `"on_track"` (including every cold-start call, fewer than
-    `DRIFT_WINDOW_SIZE` snapshots) does nothing further.
+    `"on_track"` (including every cold-start call, and every call with
+    fewer than `DRIFT_WINDOW_SIZE` snapshots) does nothing further.
 
     `maybe_deliver_patch` (PRD §7.9) is called unconditionally, right
     after the drift branch, whenever `is_enrichment=False` — patch-note
@@ -1150,15 +1170,28 @@ def complete_topic_verification(
             days_taken,
             days_expected,
         )
-        history = get_pace_snapshot_history(session, user_id)
-        pace_signals = [
-            calculate_combined_pace_signal(row["topic_score"], row["timing_ratio"])
-            for row in history
-        ]
-        drift = detect_sustained_drift(pace_signals)
+        user = get_user(session, user_id)
+        resolved_reference_time = reference_time or datetime.now(UTC).replace(
+            tzinfo=None, microsecond=0
+        )
+        in_cold_start = (
+            user is not None
+            and user["created_at"] is not None
+            and (resolved_reference_time - user["created_at"]).days
+            < COLD_START_CALIBRATION_DAYS
+        )
+
+        if not in_cold_start:
+            history = get_pace_snapshot_history(session, user_id)
+            pace_signals = [
+                calculate_combined_pace_signal(row["topic_score"], row["timing_ratio"])
+                for row in history
+            ]
+            drift = detect_sustained_drift(pace_signals)
+        else:
+            drift = "on_track"
 
         if drift == "ahead":
-            user = get_user(session, user_id)
             if user is not None and user["resolved_role"]:
                 enrichment_topic = maybe_trigger_enrichment(
                     session, user_id, user["resolved_role"], topic_id
@@ -1201,76 +1234,14 @@ def complete_topic_verification(
 # rule ("all 5 questions passed, full or half credit, to complete") —
 # test-out does not introduce a second, competing definition of "passed."
 #
-# Reconsidered and corrected: a partial pass's `HALF_CREDIT` slot(s) are,
-# by construction, exactly the slot(s) that already fired
-# `_build_taught_answer_message` during `submit_verification_answer`'s own
-# 3rd-attempt de-escalation — there is no other way to reach `HALF_CREDIT`.
-# `generate_gap_study_content` was built, then deliberately NOT wired into
-# `complete_topic_test_out` below, because doing so would re-teach the
-# identical rubric (`grading_criteria`) a second time, worded differently,
-# in the same session, moments after the user already saw it — a genuine
-# double-remediation bug, not a richer second pass. `complete_topic_test_out`
-# relies entirely on that already-delivered teach-in; it generates nothing
-# further. `generate_gap_study_content` is kept, unwired, as a possible
-# building block for a future, non-test-out remediation flow (e.g. a
-# dedicated "review what you missed" feature outside the test-out path)
-# — not deleted, since it is not itself wrong, only wrong to call here.
-
-
-def _format_failed_questions_for_prompt(
-    failed_questions: list[VerificationQuestion],
-) -> str:
-    return "\n\n".join(
-        f"Gap {i}:\nQuestion: {q.question_text}\n"
-        f"What a correct answer needed: {q.grading_criteria}\n"
-        f"Source: {q.source_url}"
-        for i, q in enumerate(failed_questions, start=1)
-    )
-
-
-async def generate_gap_study_content(
-    failed_questions: list[VerificationQuestion],
-) -> str:
-    """Generate remedial study material scoped ONLY to specific
-    verification question(s) a user did not pass outright.
-
-    A new, purpose-built content path — distinct from
-    `generate_day_content`'s 7-step structure, which this function does
-    not call into or reuse in any way.
-
-    **Not currently called anywhere in this module.** It was built for
-    test-out's partial-pass path (PRD §7.6), then deliberately *not*
-    wired into `complete_topic_test_out` — see the module-level note
-    above this section for why: every question this function could be
-    given during test-out already received
-    `submit_verification_answer`'s inline teach-in
-    (`_build_taught_answer_message`) built from the exact same
-    `grading_criteria`, in the same session, moments earlier; calling
-    this function too would re-teach the identical rubric a second time
-    in different words, not add anything. Retained, unwired, as a
-    possible building block for a future *non*-test-out remediation flow
-    (e.g. a dedicated "review what you missed" feature) — not deleted,
-    since the function itself is sound, only wrong to call from
-    test-out.
-
-    Raises `ValueError` if `failed_questions` is empty. Raises
-    `GeminiCallError` if Gemini's response is malformed or has no usable
-    `study_content`.
-    """
-    if not failed_questions:
-        raise ValueError(
-            "generate_gap_study_content requires at least one failed question"
-        )
-    prompt = PROMPT_REGISTRY["gap_study_content_v1"].format(
-        gaps=_format_failed_questions_for_prompt(failed_questions)
-    )
-    parsed = await _call_gemini_json(
-        prompt, required_keys={"study_content"}, model=DAY_CONTENT_GEMINI_MODEL
-    )
-    content = parsed["study_content"]
-    if not isinstance(content, str) or not content.strip():
-        raise GeminiCallError(f"Gemini returned no usable 'study_content': {parsed!r}")
-    return content
+# A partial pass's `HALF_CREDIT` slot(s) are, by construction, exactly the
+# slot(s) that already fired `_build_taught_answer_message` during
+# `submit_verification_answer`'s own 3rd-attempt de-escalation — there is
+# no other way to reach `HALF_CREDIT`. `complete_topic_test_out` therefore
+# relies entirely on that already-delivered teach-in and generates nothing
+# further; a second remediation-content generation step here would re-teach
+# the identical rubric (`grading_criteria`) a second time, worded
+# differently, moments after the user already saw it.
 
 
 @dataclass(frozen=True)
@@ -1331,11 +1302,10 @@ async def complete_topic_test_out(
     `submit_verification_answer`'s inline teach-in
     (`_build_taught_answer_message`) during the retry-cap attempt itself,
     moments before this function is ever called. A separate gap-study
-    generation step (`generate_gap_study_content`, built but deliberately
-    left unwired here) was considered and rejected: it would have
-    re-derived prose from the identical `grading_criteria` the teach-in
-    already used, in the same session, teaching the same fact twice in
-    different words. See the module-level note above this section.
+    generation step was considered and rejected: it would have re-derived
+    prose from the identical `grading_criteria` the teach-in already used,
+    in the same session, teaching the same fact twice in different words.
+    See the module-level note above this section.
 
     Raises `ValueError` (via `_get_final_credits_per_question`) if the
     topic's 5 question slots aren't all genuinely resolved yet, or if
@@ -1531,7 +1501,10 @@ async def generate_closing_note(session: Session, user_id: str) -> ClosingNote:
         deferred_patch_count=len(deferred_patches),
     )
     parsed = await _call_gemini_json(
-        prompt, required_keys={"note_text"}, model=CLOSING_NOTE_GEMINI_MODEL
+        prompt,
+        required_keys={"note_text"},
+        model=CLOSING_NOTE_GEMINI_MODEL,
+        timeout=HEAVY_GENERATION_TIMEOUT_SECONDS,
     )
     note_text = parsed["note_text"]
     if not isinstance(note_text, str) or not note_text.strip():

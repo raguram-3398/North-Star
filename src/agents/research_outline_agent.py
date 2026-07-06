@@ -104,8 +104,26 @@ from utils.exceptions import (
 
 # CLAUDE.md guardrail #14: explicit timeout on every external call.
 # Reuses the 10s convention already established in db/connection.py and
-# tests/spike_grounding_connectivity.py.
+# tests/spike_grounding_connectivity.py. Sized for short conversational
+# turns (a handful of sentences) — never used for a one-shot call that
+# generates a full multi-field/multi-item structured payload; see
+# HEAVY_GENERATION_TIMEOUT_SECONDS for those.
 EXTERNAL_CALL_TIMEOUT_SECONDS = 10
+
+# Real, measured root cause of a live "Outline Creation failed: Gemini
+# call failed: TimeoutError()" bug: a live probe of create_initial_outline
+# (10 grounded skills -> 21 sequenced topics, gemini-2.5-flash) took 13.5s
+# end to end — already past EXTERNAL_CALL_TIMEOUT_SECONDS, and a bare
+# asyncio.TimeoutError has no `.code` attribute so `_is_retryable_gemini_
+# error` never retries it — meaning every real Outline Creation call was
+# guaranteed to fail on the very first attempt, not just an occasional
+# slow one. Used for every one-shot call whose output is a full
+# multi-field or multi-item structured generation (outline hierarchy
+# sequencing, per-topic explanations, day-content generation, gap-study
+# content, the closing note, verification-question batches) rather than a
+# short conversational turn. 45s gives ~3x headroom above the measured
+# 13.5s for a larger real skill/topic list.
+HEAVY_GENERATION_TIMEOUT_SECONDS = 45
 
 # Retry/backoff for transient Gemini errors only — 429 (RESOURCE_EXHAUSTED,
 # rate limit) and 503 (UNAVAILABLE, transient overload), Google's own
@@ -123,18 +141,46 @@ GEMINI_RETRY_BASE_DELAY_SECONDS = 1.0
 # ~30-60s ceiling this was scoped against.
 GEMINI_RETRY_MAX_DELAY_SECONDS = 30.0
 
-# Outer ceiling on the ENTIRE retry sequence inside
-# `_generate_content_with_retry` (every attempt's own
-# EXTERNAL_CALL_TIMEOUT_SECONDS wait *plus* every backoff sleep between
-# them) — distinct from that per-attempt timeout. Worst case: 5 attempts
-# (1 + GEMINI_RETRY_MAX_ATTEMPTS) x EXTERNAL_CALL_TIMEOUT_SECONDS (50s)
-# + the 4 nominal backoff waits (1+2+4+8=15s) = ~65s. Set with generous
-# margin above that so the retry loop always gets to run its own full
-# course rather than being cut off by an outer deadline shorter than its
-# own worst case (the real incident this fixes: a live Outline Creation
-# call raised a bare TimeoutError during a burst of transient 503s,
-# before the retry loop had a chance to finish).
-GEMINI_RETRY_LOOP_TIMEOUT_SECONDS = 120.0
+# Buffer added on top of the exact worst-case retry-sequence duration
+# (see _compute_gemini_retry_loop_timeout) to get the outer ceiling on the
+# ENTIRE retry sequence inside `_generate_content_with_retry` (every
+# attempt's own per-attempt timeout wait *plus* every backoff sleep
+# between them) — distinct from, and always larger than, that per-attempt
+# timeout. Original incident this fixes: a live Outline Creation call
+# raised a bare TimeoutError during a burst of transient 503s, before the
+# retry loop had a chance to finish, because nothing bounded the whole
+# sequence. A fixed buffer (rather than a proportional multiplier) is used
+# so the ceiling doesn't scale unboundedly once a much larger per-attempt
+# timeout (HEAVY_GENERATION_TIMEOUT_SECONDS) is passed in — 55s matches
+# this margin's original sizing (a 65s worst case at the 10s short-turn
+# timeout was rounded up to a 120s ceiling).
+GEMINI_RETRY_LOOP_TIMEOUT_MARGIN_SECONDS = 55.0
+
+
+def _compute_gemini_retry_loop_timeout(per_attempt_timeout: float) -> float:
+    """Worst-case duration of `_run_attempts`' whole retry sequence at a
+    given per-attempt timeout, plus `GEMINI_RETRY_LOOP_TIMEOUT_MARGIN_SECONDS`
+    headroom: every attempt (1 + `GEMINI_RETRY_MAX_ATTEMPTS`) using its
+    full per-attempt timeout, plus every nominal (jitter-free) backoff
+    wait between them. Computed per call rather than a single fixed
+    constant because different callers pass different per-attempt
+    timeouts (`EXTERNAL_CALL_TIMEOUT_SECONDS` for a short conversational
+    turn, `HEAVY_GENERATION_TIMEOUT_SECONDS` for a one-shot structured
+    generation) — a ceiling sized only for the short-turn case would cut
+    off a still-healthy heavy-generation retry sequence under a 429/503
+    burst, recreating the exact bug this mechanism exists to prevent.
+    """
+    total_attempts = GEMINI_RETRY_MAX_ATTEMPTS + 1
+    nominal_backoff_total: float = sum(
+        min(GEMINI_RETRY_MAX_DELAY_SECONDS, GEMINI_RETRY_BASE_DELAY_SECONDS * (2**a))
+        for a in range(GEMINI_RETRY_MAX_ATTEMPTS)
+    )
+    return (
+        total_attempts * per_attempt_timeout
+        + nominal_backoff_total
+        + GEMINI_RETRY_LOOP_TIMEOUT_MARGIN_SECONDS
+    )
+
 
 # Simple pacing guard between Gemini calls (not a queue): a pipeline run
 # routinely fires several Gemini-backed steps back to back (Clarify Gate
@@ -566,6 +612,7 @@ async def _generate_content_with_retry(
     model: str,
     contents: str,
     config: genai_types.GenerateContentConfig | None = None,
+    timeout: float | None = None,
 ) -> Any:
     """The one shared low-level Gemini call every reasoning step in this
     codebase eventually routes through — directly here, or via
@@ -576,6 +623,12 @@ async def _generate_content_with_retry(
     `_call_gemini_json` (each called `client.aio.models.generate_content`
     directly); now there is genuinely one place, not two, that owns
     pacing, the explicit timeout (CLAUDE.md guardrail #14), and retry.
+
+    `timeout` is the per-attempt budget — defaults to
+    `EXTERNAL_CALL_TIMEOUT_SECONDS` for a short conversational turn;
+    callers doing a one-shot structured generation pass
+    `HEAVY_GENERATION_TIMEOUT_SECONDS` explicitly (see that constant's own
+    comment for the real incident this parameter fixes).
 
     Retries only a transient 429/503 (`_is_retryable_gemini_error`), up to
     `GEMINI_RETRY_MAX_ATTEMPTS` additional attempts, with exponential
@@ -588,12 +641,21 @@ async def _generate_content_with_retry(
     "Gemini call failed:" with nothing after the colon.
 
     The whole retry sequence (every attempt plus every backoff wait) is
-    itself wrapped in `GEMINI_RETRY_LOOP_TIMEOUT_SECONDS` — see that
-    constant's own comment for why: without an outer ceiling here, only
-    each *individual* attempt was ever bounded, so nothing prevented some
+    itself wrapped in a ceiling computed by
+    `_compute_gemini_retry_loop_timeout(timeout)` — see that function's
+    own comment for why: without an outer ceiling here, only each
+    *individual* attempt was ever bounded, so nothing prevented some
     other, tighter external deadline from cutting the whole sequence off
     with a bare, unhelpful `TimeoutError` before it could finish.
     """
+    # `timeout` defaults to `None`, resolved here rather than in the
+    # signature (`timeout: float = EXTERNAL_CALL_TIMEOUT_SECONDS`) —
+    # a default bound in the signature is evaluated once at function-
+    # definition time, so a test's `monkeypatch.setattr(roa,
+    # "EXTERNAL_CALL_TIMEOUT_SECONDS", ...)` would silently have no effect
+    # on every caller that relies on the default. Resolving the module
+    # global here, at call time, is what makes that monkeypatch work.
+    resolved_timeout = EXTERNAL_CALL_TIMEOUT_SECONDS if timeout is None else timeout
 
     async def _run_attempts() -> Any:
         client = _get_gemini_client()
@@ -607,7 +669,7 @@ async def _generate_content_with_retry(
                     client.aio.models.generate_content(
                         model=model, contents=contents, config=config
                     ),
-                    timeout=EXTERNAL_CALL_TIMEOUT_SECONDS,
+                    timeout=resolved_timeout,
                 )
             except Exception as exc:  # noqa: BLE001 — see this function's
                 # own docstring: every Gemini-side failure becomes a
@@ -635,19 +697,23 @@ async def _generate_content_with_retry(
             f"Gemini call failed: {_format_gemini_error(last_error)}"
         ) from last_error
 
+    retry_loop_timeout = _compute_gemini_retry_loop_timeout(resolved_timeout)
     try:
-        return await asyncio.wait_for(
-            _run_attempts(), timeout=GEMINI_RETRY_LOOP_TIMEOUT_SECONDS
-        )
+        return await asyncio.wait_for(_run_attempts(), timeout=retry_loop_timeout)
     except TimeoutError as exc:  # asyncio.TimeoutError is this since 3.11
         raise GeminiCallError(
-            "Gemini call failed: the full retry sequence exceeded "
-            f"GEMINI_RETRY_LOOP_TIMEOUT_SECONDS ({GEMINI_RETRY_LOOP_TIMEOUT_SECONDS}s) "
-            "across all attempts and backoff waits"
+            "Gemini call failed: the full retry sequence exceeded its "
+            f"computed outer ceiling ({retry_loop_timeout:.0f}s, based on a "
+            f"{resolved_timeout}s per-attempt timeout) across all attempts "
+            "and backoff waits"
         ) from exc
 
 
-async def _call_gemini_text(prompt: str, model: str = SHORT_TURN_GEMINI_MODEL) -> str:
+async def _call_gemini_text(
+    prompt: str,
+    model: str = SHORT_TURN_GEMINI_MODEL,
+    timeout: float | None = None,
+) -> str:
     """Call Gemini with a plain-text prompt and return the response text,
     stripped. Raises `GeminiCallError` if the call fails, times out, or
     returns no text at all — see `_generate_content_with_retry` for the
@@ -655,10 +721,16 @@ async def _call_gemini_text(prompt: str, model: str = SHORT_TURN_GEMINI_MODEL) -
 
     Shared across every Gemini-backed reasoning step in this module (not
     clarify-gate-specific despite the default `model`) — callers pass an
-    explicit `model` when they need a different tier (e.g.
-    `OUTLINE_HIERARCHY_GEMINI_MODEL`).
+    explicit `model` (e.g. `OUTLINE_HIERARCHY_GEMINI_MODEL`) and, for a
+    one-shot structured generation rather than a short conversational
+    turn, an explicit `timeout=HEAVY_GENERATION_TIMEOUT_SECONDS`. Defaults
+    to `None` (resolved to `EXTERNAL_CALL_TIMEOUT_SECONDS` inside
+    `_generate_content_with_retry`), not the constant itself, for the same
+    monkeypatch-at-call-time reason documented there.
     """
-    response = await _generate_content_with_retry(model=model, contents=prompt)
+    response = await _generate_content_with_retry(
+        model=model, contents=prompt, timeout=timeout
+    )
 
     text = response.text
     if not text or not text.strip():
@@ -670,6 +742,7 @@ async def _call_gemini_json(
     prompt: str,
     required_keys: set[str],
     model: str = SHORT_TURN_GEMINI_MODEL,
+    timeout: float | None = None,
 ) -> dict[str, Any]:
     """Call Gemini requesting a JSON object response and return it parsed.
 
@@ -681,13 +754,18 @@ async def _call_gemini_json(
 
     Shared across every Gemini-backed reasoning step in this module (not
     clarify-gate-specific despite the default `model`) — callers pass an
-    explicit `model` when they need a different tier (e.g.
-    `OUTLINE_HIERARCHY_GEMINI_MODEL`).
+    explicit `model` (e.g. `OUTLINE_HIERARCHY_GEMINI_MODEL`) and, for a
+    one-shot structured generation rather than a short conversational
+    turn, an explicit `timeout=HEAVY_GENERATION_TIMEOUT_SECONDS`. Defaults
+    to `None` (resolved to `EXTERNAL_CALL_TIMEOUT_SECONDS` inside
+    `_generate_content_with_retry`), not the constant itself, for the same
+    monkeypatch-at-call-time reason documented there.
     """
     response = await _generate_content_with_retry(
         model=model,
         contents=prompt,
         config=genai_types.GenerateContentConfig(response_mime_type="application/json"),
+        timeout=timeout,
     )
 
     raw_text = response.text
@@ -1319,7 +1397,10 @@ async def create_initial_outline(
         skill_list=_format_skill_list_for_prompt(core_skills, emerging_skills),
     )
     parsed = await _call_gemini_json(
-        prompt, required_keys={"groups"}, model=OUTLINE_HIERARCHY_GEMINI_MODEL
+        prompt,
+        required_keys={"groups"},
+        model=OUTLINE_HIERARCHY_GEMINI_MODEL,
+        timeout=HEAVY_GENERATION_TIMEOUT_SECONDS,
     )
 
     groups = parsed["groups"]
@@ -1469,6 +1550,7 @@ async def _generate_topic_explanations(
         prompt,
         required_keys={"topic_explanations"},
         model=OUTLINE_HIERARCHY_GEMINI_MODEL,
+        timeout=HEAVY_GENERATION_TIMEOUT_SECONDS,
     )
     entries = parsed["topic_explanations"]
     if not isinstance(entries, list) or not entries:

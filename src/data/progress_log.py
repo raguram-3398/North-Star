@@ -5,15 +5,14 @@ results, hands-on/review outcomes, reflection entries, and timing — feeds
 pace calculation. This module only reads and writes rows; deciding what
 content each step contains is `agents/coaching_pace_agent.py`'s job.
 
-Sessions are passed in by the caller (dependency injection), matching
-`data/roles_cache.py`'s established pattern — the original stub's
-`get_progress_for_topic(topic_id)` had no `session` parameter at all,
-which couldn't have done real I/O; corrected here to match every other
-I/O module's convention.
+Write-only: no code path anywhere reads this log back (pace calculation
+is fed by `data/pace_snapshots.py`, not by re-querying these rows), so
+this module exposes only `log_progress_step`. Sessions are passed in by
+the caller (dependency injection), matching `data/roles_cache.py`'s
+established pattern.
 """
 
 from datetime import UTC, datetime
-from typing import Any
 
 from sqlalchemy.orm import Session
 
@@ -64,26 +63,3 @@ def log_progress_step(
         )
     )
     session.commit()
-
-
-def get_progress_for_topic(session: Session, topic_id: str) -> list[dict[str, Any]]:
-    """Read all recorded progress-log entries for a given topic, ordered
-    by day_number then created_at.
-    """
-    rows = (
-        session.query(ProgressLog)
-        .filter(ProgressLog.topic_id == topic_id)
-        .order_by(ProgressLog.day_number, ProgressLog.created_at)
-        .all()
-    )
-    return [
-        {
-            "user_id": row.user_id,
-            "topic_id": row.topic_id,
-            "day_number": row.day_number,
-            "step": row.step,
-            "reflection_text": row.reflection_text,
-            "created_at": row.created_at,
-        }
-        for row in rows
-    ]

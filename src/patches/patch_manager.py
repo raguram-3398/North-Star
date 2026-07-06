@@ -71,28 +71,6 @@ def branch_by_confidence(
     return "needs_user_decision"
 
 
-def mark_patch_delivered(patch: dict[str, Any]) -> dict[str, Any]:
-    """Mark a patch-note as delivered.
-
-    Only this patch's own `status` field changes — every other field
-    (including anything related to its origin topic) passes through
-    untouched.
-    """
-    return {**patch, "status": PatchStatus.DELIVERED}
-
-
-def mark_patch_deferred(patch: dict[str, Any]) -> dict[str, Any]:
-    """Mark a patch-note as deferred: parked permanently, no expiry, per
-    PRD §7.9. Deferred patches resurface at the goal-completion closing
-    note, or on-demand if the user explicitly asks — this function only
-    sets the status; resurfacing itself is the caller's job.
-
-    Only this patch's own `status` field changes — every other field
-    passes through untouched.
-    """
-    return {**patch, "status": PatchStatus.DEFERRED}
-
-
 def order_pending_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Order multiple pending items — patch-notes and/or regular topics —
     competing for the same day's delivery by `hierarchy_position`, never

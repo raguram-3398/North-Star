@@ -30,15 +30,15 @@ This file is the standing constitution for all work in this repo. Read `specs/PR
 ```
 north-star/
 ├── pyproject.toml
-├── README.md
+├── README.md            # NOT YET WRITTEN — see "What Goes in the README on Ship Day"
 ├── CLAUDE.md
 ├── .gitignore
 ├── .claudeignore
 ├── .env / .env.example
 ├── .dockerignore
-├── Dockerfile
-├── requirements.txt
-├── streamlit_app.py
+├── Dockerfile            # NOT YET BUILT
+├── requirements.txt      # NOT YET BUILT — pyproject.toml is the real dependency source today
+├── streamlit_app.py      # NOT YET BUILT — src/main.py is the current streamlit run target; see Architecture §3's "Known limitation" (Enum/session_state) for why this thin wrapper would close a real bug class
 │
 ├── .agent/
 │   └── skills/
@@ -47,7 +47,7 @@ north-star/
 │           └── generator.py
 │
 ├── .github/workflows/
-│   ├── ci.yml
+│   ├── ci.yml            # NOT YET BUILT
 │   └── refresh_roles.yml
 │
 ├── specs/
@@ -87,8 +87,7 @@ north-star/
 │   │   ├── connection.py
 │   │   └── create_schema.py            # one-time Base.metadata.create_all() script — `python -m src.db.create_schema`, no Alembic
 │   └── utils/
-│       ├── logger.py                   # NOT BUILT — explicitly descoped for this submission, see Cost & Usage Tracking below
-│       └── exceptions.py
+│       └── exceptions.py               # logger.py was built, then deleted outright as a real scope cut — never re-add it for this submission, see Cost & Usage Tracking below
 │
 ├── evaluation/
 │   ├── golden_dataset.json
@@ -130,7 +129,7 @@ Never do these, even if a task seems to call for it — ask first:
 - Docstrings on every public function/class stating what it does and why (not just what)
 - SQLAlchemy models mirror `Architecture_North_Star.md`'s schema exactly — if a field needs to change, update the architecture doc in the same commit
 - **Timeout on every external call, no exceptions** — Himalayas, Tavily, Gemini, and Neon all get explicit timeouts (`asyncio.wait_for` for coroutines, `asyncio.timeout()` as a context manager for streaming). Every timeout is tested, not assumed.
-- **Raise exceptions, never return error strings or `None`-as-error.** Mixed return types destroy the caller's ability to reason about what it received. Use specific, typed exceptions (see `utils/exceptions.py`) — e.g. `GroundingError`, `VerificationTimeoutError`, `ConfidenceValidationError` — never a bare `Exception` and never a string that looks like data.
+- **Raise exceptions, never return error strings or `None`-as-error.** Mixed return types destroy the caller's ability to reason about what it received. Use specific, typed exceptions (see `utils/exceptions.py`) — e.g. `GeminiCallError`, `GroundingSourceCallError`, `ConfidenceValidationError` — never a bare `Exception` and never a string that looks like data.
 - **Pure functions stay pure.** `pace/calculator.py`, `outline/significant_event.py`, `security/output_guard.py`, `security/input_gate.py`'s bound-check logic — all side-effect-free, independently testable, no `print()`, no DB calls, no external API calls inside them. If a function needs to do I/O, it is not one of these modules.
 - No bare `except:` — catch specific exceptions, especially around external calls (Himalayas, Tavily, Gemini) where failure is expected and must degrade gracefully per the confidence ladder, not crash
 - **One client per module, instantiated at module level — never inside a function or per-request.** Applies to the Gemini client, Tavily client, and any Himalayas MCP client. Re-instantiating a client per call is an anti-pattern to avoid from the start, not fix later.

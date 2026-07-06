@@ -30,6 +30,7 @@ own retry-cap orchestration logic.
 """
 
 import json
+from datetime import datetime
 from unittest.mock import MagicMock
 
 import pytest
@@ -49,6 +50,12 @@ TOPIC_SOURCE_MATERIAL = (
     "pointers to commits."
 )
 SOURCE_URL = "https://git-scm.com/book/en/v2/Git-Branching-Branches-in-a-Nutshell"
+
+# Well past COLD_START_CALIBRATION_DAYS — the default `created_at` for
+# every `complete_topic_verification` test's `get_user` fake, so tests
+# about drift/enrichment/pacing-extension behavior (not about the
+# cold-start gate itself) aren't accidentally suppressed by it.
+LONG_PAST_USER_CREATED_AT = datetime(2020, 1, 1)
 
 
 def _patch_tavily_theory(
@@ -562,6 +569,15 @@ def _patch_completion_writes(
     maybe_deliver_patch tests below), so this keeps that call a
     deliberate, explicit no-op rather than relying on an unmocked
     MagicMock session's query chain happening to iterate empty.
+
+    `get_user` defaults to a user created long ago (past
+    `COLD_START_CALIBRATION_DAYS`) with no `resolved_role` — the
+    cold-start gate now reads `created_at` unconditionally on every
+    non-enrichment completion, so every test through this shared helper
+    needs a real, well-formed `get_user` fake, not an unmocked `MagicMock`
+    session's auto-generated (and non-datetime) `.created_at`. Tests that
+    need a specific `resolved_role` override this again afterward and
+    must carry `created_at` forward too.
     """
     monkeypatch.setattr(
         cpa, "get_attempts_for_topic", lambda session, topic_id: attempts
@@ -579,6 +595,14 @@ def _patch_completion_writes(
         lambda *args, **kwargs: completed_calls.append((args, kwargs)),
     )
     monkeypatch.setattr(cpa, "get_pending_patch_notes", lambda session, uid: [])
+    monkeypatch.setattr(
+        cpa,
+        "get_user",
+        lambda session, uid: {
+            "resolved_role": None,
+            "created_at": LONG_PAST_USER_CREATED_AT,
+        },
+    )
     return snapshot_calls, completed_calls
 
 
@@ -623,11 +647,12 @@ def test_complete_topic_verification_calls_pace_calculator_and_persists(
 # --- Sustained-drift wiring (Part 1) ---------------------------------------
 
 
-def test_complete_topic_verification_cold_start_triggers_neither_branch(
+def test_complete_topic_verification_below_drift_window_size_triggers_neither_branch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Fewer than DRIFT_WINDOW_SIZE (3) total snapshots — detect_sustained_drift's
-    own cold-start gating, not a second check duplicated in this module.
+    own window-size gating (a *count*, distinct from the calendar-based
+    `COLD_START_CALIBRATION_DAYS` gate tested separately below).
     """
     attempts = _all_full_credit_attempts()
     _patch_completion_writes(monkeypatch, attempts)
@@ -663,6 +688,104 @@ def test_complete_topic_verification_cold_start_triggers_neither_branch(
     assert extend_pacing_calls == []
     assert result.enrichment_topic is None
     assert result.pace_extension_applied is None
+
+
+def test_complete_topic_verification_within_calibration_window_suppresses_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PRD §7.8's "weeks 1-2 are calibration only": a user still inside
+    `COLD_START_CALIBRATION_DAYS` of their own `users.created_at` gets
+    `drift` forced to "on_track" and `detect_sustained_drift` is never
+    even called — even though the snapshot history below would otherwise
+    read as sustained-ahead (3 perfect scores, well past
+    DRIFT_WINDOW_SIZE).
+    """
+    attempts = _all_full_credit_attempts()
+    _patch_completion_writes(monkeypatch, attempts)
+    monkeypatch.setattr(
+        cpa,
+        "get_pace_snapshot_history",
+        lambda session, uid: [{"topic_score": 1.0, "timing_ratio": 1.0}] * 3,
+    )
+    reference_time = datetime(2026, 1, 10)
+    monkeypatch.setattr(
+        cpa,
+        "get_user",
+        lambda session, uid: {
+            "resolved_role": "Backend Engineer",
+            # 5 days before reference_time — well inside the 14-day window.
+            "created_at": datetime(2026, 1, 5),
+        },
+    )
+    drift_calls: list[list[float]] = []
+    monkeypatch.setattr(
+        cpa,
+        "detect_sustained_drift",
+        lambda signals: drift_calls.append(signals) or "ahead",
+    )
+    trigger_calls: list[tuple] = []
+    monkeypatch.setattr(
+        cpa, "maybe_trigger_enrichment", lambda *a, **k: trigger_calls.append(a)
+    )
+
+    result = cpa.complete_topic_verification(
+        MagicMock(),
+        "u1",
+        "t1",
+        days_taken=5,
+        days_expected=5,
+        reference_time=reference_time,
+    )
+
+    assert result.drift == "on_track"
+    assert drift_calls == []
+    assert trigger_calls == []
+    assert result.enrichment_topic is None
+
+
+def test_complete_topic_verification_past_calibration_window_allows_drift_detection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The mirror image of the calibration-window test above: once
+    `COLD_START_CALIBRATION_DAYS` has elapsed since `users.created_at`,
+    `detect_sustained_drift` runs normally against the real snapshot
+    history.
+    """
+    attempts = _all_full_credit_attempts()
+    _patch_completion_writes(monkeypatch, attempts)
+    monkeypatch.setattr(
+        cpa,
+        "get_pace_snapshot_history",
+        lambda session, uid: [{"topic_score": 1.0, "timing_ratio": 1.0}] * 3,
+    )
+    reference_time = datetime(2026, 1, 20)
+    monkeypatch.setattr(
+        cpa,
+        "get_user",
+        lambda session, uid: {
+            "resolved_role": "Backend Engineer",
+            # 15 days before reference_time — just past the 14-day window.
+            "created_at": datetime(2026, 1, 5),
+        },
+    )
+    trigger_calls: list[tuple] = []
+    monkeypatch.setattr(
+        cpa,
+        "maybe_trigger_enrichment",
+        lambda *a, **k: trigger_calls.append(a) or {"id": "enrichment-1"},
+    )
+
+    result = cpa.complete_topic_verification(
+        MagicMock(),
+        "u1",
+        "t1",
+        days_taken=5,
+        days_expected=5,
+        reference_time=reference_time,
+    )
+
+    assert result.drift == "ahead"
+    assert len(trigger_calls) == 1
 
 
 def test_complete_topic_verification_ordinary_variation_triggers_neither_branch(
@@ -716,7 +839,12 @@ def test_complete_topic_verification_sustained_ahead_triggers_enrichment(
         ],
     )
     monkeypatch.setattr(
-        cpa, "get_user", lambda session, uid: {"resolved_role": "Backend Engineer"}
+        cpa,
+        "get_user",
+        lambda session, uid: {
+            "resolved_role": "Backend Engineer",
+            "created_at": LONG_PAST_USER_CREATED_AT,
+        },
     )
     trigger_calls: list[tuple] = []
 
@@ -1255,6 +1383,14 @@ def test_complete_topic_verification_calls_maybe_deliver_patch_regardless_of_dri
     monkeypatch.setattr(cpa, "write_pace_snapshot", lambda *a, **k: None)
     monkeypatch.setattr(cpa, "mark_topic_completed", lambda *a, **k: None)
     monkeypatch.setattr(cpa, "get_pace_snapshot_history", lambda session, uid: [])
+    monkeypatch.setattr(
+        cpa,
+        "get_user",
+        lambda session, uid: {
+            "resolved_role": None,
+            "created_at": LONG_PAST_USER_CREATED_AT,
+        },
+    )
     deliver_calls: list[tuple] = []
     monkeypatch.setattr(
         cpa,
@@ -1287,7 +1423,12 @@ def test_complete_topic_verification_ahead_and_pending_patch_both_fire(
         lambda session, uid: [{"topic_score": 1.0, "timing_ratio": 1.0}] * 3,
     )
     monkeypatch.setattr(
-        cpa, "get_user", lambda session, uid: {"resolved_role": "Backend Engineer"}
+        cpa,
+        "get_user",
+        lambda session, uid: {
+            "resolved_role": "Backend Engineer",
+            "created_at": LONG_PAST_USER_CREATED_AT,
+        },
     )
     enrichment_calls: list[tuple] = []
     monkeypatch.setattr(
@@ -1343,33 +1484,6 @@ def _resolved_attempt(
     }
 
 
-async def test_generate_gap_study_content_calls_gemini_and_returns_study_content(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _patch_gemini(
-        monkeypatch,
-        responses=[
-            json.dumps({"study_content": "Rebase moves commits onto a new base."})
-        ],
-    )
-    failed_questions = [
-        cpa.VerificationQuestion(
-            question_text="What is a rebase?",
-            grading_criteria="Must define a rebase.",
-            source_url=SOURCE_URL,
-        )
-    ]
-
-    content = await cpa.generate_gap_study_content(failed_questions)
-
-    assert content == "Rebase moves commits onto a new base."
-
-
-async def test_generate_gap_study_content_rejects_empty_list() -> None:
-    with pytest.raises(ValueError):
-        await cpa.generate_gap_study_content([])
-
-
 async def test_test_out_full_pass_writes_completed_test_out_status(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1384,20 +1498,19 @@ async def test_test_out_full_pass_writes_completed_test_out_status(
     monkeypatch.setattr(cpa, "write_pace_snapshot", lambda *a, **k: None)
     monkeypatch.setattr(cpa, "get_pace_snapshot_history", lambda session, uid: [])
     monkeypatch.setattr(cpa, "get_pending_patch_notes", lambda session, uid: [])
+    monkeypatch.setattr(
+        cpa,
+        "get_user",
+        lambda session, uid: {
+            "resolved_role": None,
+            "created_at": LONG_PAST_USER_CREATED_AT,
+        },
+    )
     completed_calls: list[tuple] = []
     monkeypatch.setattr(
         cpa,
         "mark_topic_completed",
         lambda *args, **kwargs: completed_calls.append((args, kwargs)),
-    )
-    gap_content_calls: list[list] = []
-
-    async def fake_generate_gap_study_content(failed_questions):
-        gap_content_calls.append(failed_questions)
-        return "should never be reached"
-
-    monkeypatch.setattr(
-        cpa, "generate_gap_study_content", fake_generate_gap_study_content
     )
     session = MagicMock()
 
@@ -1406,7 +1519,6 @@ async def test_test_out_full_pass_writes_completed_test_out_status(
     )
 
     assert result.full_pass is True
-    assert gap_content_calls == []
     assert len(completed_calls) == 1
     assert completed_calls[0][0] == (session, "t1")
     assert completed_calls[0][1] == {"status": cpa.COMPLETED_TEST_OUT_STATUS}
@@ -1415,19 +1527,17 @@ async def test_test_out_full_pass_writes_completed_test_out_status(
 async def test_test_out_partial_pass_relies_on_the_inline_teach_in_not_a_second_step(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """This is the key regression guard for a real interaction this task
-    got wrong on the first pass and corrected after review: a partial
-    pass's HALF_CREDIT slot(s) already received
-    `submit_verification_answer`'s inline teach-in
-    (`_build_taught_answer_message`), built from the identical
+    """Regression guard for a real interaction this task got wrong on the
+    first pass and corrected after review: a partial pass's HALF_CREDIT
+    slot(s) already received `submit_verification_answer`'s inline
+    teach-in (`_build_taught_answer_message`), built from the identical
     `grading_criteria`, during the retry-cap attempt itself — moments
-    before `complete_topic_test_out` is ever called. Calling
-    `generate_gap_study_content` here too would re-teach the same rubric
-    a second time in different words. `complete_topic_test_out` must
-    still mark the topic complete (`completed_test_out`, PRD §7.7's
-    completion rule doesn't distinguish full/half credit), but it must
-    call `generate_gap_study_content` exactly zero times, regardless of
-    how many slots are half-credit.
+    before `complete_topic_test_out` is ever called. `complete_topic_
+    test_out` must still mark the topic complete (`completed_test_out`,
+    PRD §7.7's completion rule doesn't distinguish full/half credit), and
+    must generate no further remediation content — `TestOutResult` itself
+    carries no content field, so there is structurally nothing else for a
+    partial pass to produce here.
     """
     attempts = [
         _resolved_attempt(1, cpa.FULL_CREDIT, "What is a commit?"),
@@ -1442,20 +1552,19 @@ async def test_test_out_partial_pass_relies_on_the_inline_teach_in_not_a_second_
     monkeypatch.setattr(cpa, "write_pace_snapshot", lambda *a, **k: None)
     monkeypatch.setattr(cpa, "get_pace_snapshot_history", lambda session, uid: [])
     monkeypatch.setattr(cpa, "get_pending_patch_notes", lambda session, uid: [])
+    monkeypatch.setattr(
+        cpa,
+        "get_user",
+        lambda session, uid: {
+            "resolved_role": None,
+            "created_at": LONG_PAST_USER_CREATED_AT,
+        },
+    )
     completed_calls: list[tuple] = []
     monkeypatch.setattr(
         cpa,
         "mark_topic_completed",
         lambda *args, **kwargs: completed_calls.append((args, kwargs)),
-    )
-    gap_content_calls: list[list] = []
-
-    async def fake_generate_gap_study_content(failed_questions):
-        gap_content_calls.append(failed_questions)
-        return "should never be called from complete_topic_test_out"
-
-    monkeypatch.setattr(
-        cpa, "generate_gap_study_content", fake_generate_gap_study_content
     )
     session = MagicMock()
 
@@ -1464,7 +1573,6 @@ async def test_test_out_partial_pass_relies_on_the_inline_teach_in_not_a_second_
     )
 
     assert result.full_pass is False
-    assert gap_content_calls == []  # the inline teach-in already covered this
     assert len(completed_calls) == 1
     assert completed_calls[0][1] == {"status": cpa.COMPLETED_TEST_OUT_STATUS}
 

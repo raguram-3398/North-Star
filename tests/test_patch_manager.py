@@ -11,8 +11,6 @@ from patches.patch_manager import (
     PatchStatus,
     branch_by_confidence,
     decide_patch_delivery,
-    mark_patch_deferred,
-    mark_patch_delivered,
     order_pending_items,
     resolve_patch_decision,
 )
@@ -41,61 +39,6 @@ def test_non_high_confidence_branches_to_needs_user_decision(
 def test_reject_confidence_is_rejected_outright() -> None:
     with pytest.raises(ValueError):
         branch_by_confidence(ConfidenceTier.REJECT)
-
-
-def test_mark_patch_delivered_sets_status_and_preserves_other_fields() -> None:
-    patch = {
-        "id": "patch-1",
-        "origin_topic_id": "topic-1",
-        "confidence": ConfidenceTier.HIGH,
-        "status": PatchStatus.PENDING,
-        "hierarchy_position": 3,
-    }
-
-    result = mark_patch_delivered(patch)
-
-    assert result["status"] == PatchStatus.DELIVERED
-    assert result["id"] == "patch-1"
-    assert result["origin_topic_id"] == "topic-1"
-    assert result["confidence"] == ConfidenceTier.HIGH
-    assert result["hierarchy_position"] == 3
-
-
-def test_mark_patch_deferred_sets_status_and_preserves_other_fields() -> None:
-    patch = {
-        "id": "patch-2",
-        "origin_topic_id": "topic-2",
-        "confidence": ConfidenceTier.LOW,
-        "status": PatchStatus.PENDING,
-        "hierarchy_position": 5,
-    }
-
-    result = mark_patch_deferred(patch)
-
-    assert result["status"] == PatchStatus.DEFERRED
-    assert result["id"] == "patch-2"
-    assert result["origin_topic_id"] == "topic-2"
-
-
-def test_mark_patch_never_touches_origin_topic_status_field() -> None:
-    """Even if a patch dict happens to carry a field describing its
-    origin topic's status, marking the patch delivered/deferred must
-    never alter it — a patch-note is always independently tracked
-    (PRD §7.9, CLAUDE.md guardrail #5).
-    """
-    patch = {
-        "id": "patch-3",
-        "origin_topic_id": "topic-3",
-        "origin_topic_status": "completed",
-        "status": PatchStatus.PENDING,
-        "hierarchy_position": 1,
-    }
-
-    delivered = mark_patch_delivered(patch)
-    deferred = mark_patch_deferred(patch)
-
-    assert delivered["origin_topic_status"] == "completed"
-    assert deferred["origin_topic_status"] == "completed"
 
 
 def test_order_pending_items_orders_multiple_patches_by_hierarchy_position() -> None:

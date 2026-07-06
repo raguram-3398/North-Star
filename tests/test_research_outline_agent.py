@@ -931,6 +931,79 @@ async def test_gemini_timeout_raises_gemini_call_error(
         await roa._generate_narrowing_question("Data stuff", [])
 
 
+async def test_explicit_timeout_overrides_the_short_turn_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for the real 'Outline Creation failed: Gemini call
+    failed: TimeoutError()' incident: `EXTERNAL_CALL_TIMEOUT_SECONDS` (10s)
+    is too short for a one-shot structured-generation call's real latency
+    (a live probe of `create_initial_outline` measured 13.5s — see
+    HEAVY_GENERATION_TIMEOUT_SECONDS's own comment), and a bare
+    `asyncio.TimeoutError` is never retried. This shrinks the short-turn
+    default to below the fake call's sleep time, then proves an explicit
+    `timeout=` argument — not the default — is what determines whether
+    the call survives.
+    """
+    monkeypatch.setattr(roa, "EXTERNAL_CALL_TIMEOUT_SECONDS", 0.01)
+    _patch_gemini(monkeypatch, responses=["ok"], sleep_seconds=0.05)
+
+    with pytest.raises(GeminiCallError):
+        await roa._call_gemini_text("some prompt")
+
+    result = await roa._call_gemini_text("some prompt", timeout=0.5)
+    assert result == "ok"
+
+
+async def test_create_initial_outline_uses_heavy_generation_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Wiring regression test: `create_initial_outline`'s Gemini call must
+    always pass `timeout=HEAVY_GENERATION_TIMEOUT_SECONDS` explicitly,
+    never fall back to the short-turn default — that fallback is exactly
+    what caused the real production incident this test guards against.
+    """
+    captured_kwargs: dict[str, object] = {}
+
+    async def _fake_call_gemini_json(
+        prompt: str, required_keys: set[str], **kwargs: object
+    ) -> dict:
+        captured_kwargs.update(kwargs)
+        return json.loads(_WELL_FORMED_HIERARCHY_RESPONSE)
+
+    monkeypatch.setattr(roa, "_call_gemini_json", _fake_call_gemini_json)
+
+    await roa.create_initial_outline(
+        "Backend Engineer", [GIT_SKILL, PYTHON_SKILL], [DJANGO_SKILL]
+    )
+
+    assert captured_kwargs["timeout"] == roa.HEAVY_GENERATION_TIMEOUT_SECONDS
+
+
+def test_compute_gemini_retry_loop_timeout_matches_original_short_turn_ceiling() -> (
+    None
+):
+    """`_compute_gemini_retry_loop_timeout(EXTERNAL_CALL_TIMEOUT_SECONDS)`
+    must reproduce this codebase's original fixed 120s ceiling exactly —
+    a formula regression here would silently change short-turn behavior
+    that was already working."""
+    assert roa._compute_gemini_retry_loop_timeout(10) == 120.0
+
+
+def test_compute_gemini_retry_loop_timeout_scales_for_heavier_calls() -> None:
+    """A larger per-attempt timeout (HEAVY_GENERATION_TIMEOUT_SECONDS) must
+    produce a proportionally larger outer ceiling — a fixed 120s ceiling
+    sized only for the 10s short-turn case would cut off a still-healthy
+    heavy-generation retry sequence under a 429/503 burst, recreating the
+    exact incident this mechanism exists to prevent."""
+    heavy_ceiling = roa._compute_gemini_retry_loop_timeout(
+        roa.HEAVY_GENERATION_TIMEOUT_SECONDS
+    )
+    assert heavy_ceiling > (roa.GEMINI_RETRY_MAX_ATTEMPTS + 1) * (
+        roa.HEAVY_GENERATION_TIMEOUT_SECONDS
+    )
+    assert heavy_ceiling > roa._compute_gemini_retry_loop_timeout(10)
+
+
 class _FakeGeminiAPIError(Exception):
     """A minimal stand-in for `google.genai.errors.APIError`'s shape
     (`.code`/`.status`/`.message`, the real attributes `_is_retryable_
