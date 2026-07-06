@@ -172,17 +172,25 @@ def _get_tavily_client() -> TavilyClient:
 # confirmation turn classification/question/concern responses) — renamed
 # from `CLARIFY_GATE_GEMINI_MODEL` once outline confirmation became a
 # second consumer, since it was never actually clarify-gate-specific,
-# only clarify-gate-first. Distinct from `OUTLINE_HIERARCHY_GEMINI_MODEL`
-# below, which is deliberately a stronger tier for less frequent, more
-# substantive one-time generation.
+# only clarify-gate-first. Kept as a separate constant from
+# `OUTLINE_HIERARCHY_GEMINI_MODEL` below even though both now hold the
+# same value — outline-hierarchy sequencing was originally a
+# deliberately stronger tier for less frequent, more substantive
+# one-time generation; see that constant's own comment for why they
+# coincide today rather than by original design.
 SHORT_TURN_GEMINI_MODEL = "gemini-2.5-flash"
 
-# Judgment call: a stronger tier than the clarify gate's, deliberately.
-# Initial outline creation is a one-time call per user (not a per-turn
-# conversational cost), and correctness of prerequisite ordering across
-# potentially dozens of skills matters more here than low latency —
-# "pro" is justified where "flash" is not.
-OUTLINE_HIERARCHY_GEMINI_MODEL = "gemini-2.5-pro"
+# Originally "gemini-2.5-pro" (a stronger tier than the clarify gate's,
+# deliberately: initial outline creation is a one-time call per user, and
+# correctness of prerequisite ordering across potentially dozens of
+# skills mattered more here than low latency). Superseded: this
+# project's Gemini API key has zero free-tier quota for gemini-2.5-pro
+# (confirmed via a live 429 with limit: 0, reproduced on a second,
+# freshly-issued key — a project/tier-wide constraint, not a per-call-site
+# quality tradeoff anymore). Every Gemini call in this codebase now uses
+# "gemini-2.5-flash" for that external reason, not because flash was
+# judged sufficient on the merits here.
+OUTLINE_HIERARCHY_GEMINI_MODEL = "gemini-2.5-flash"
 
 _gemini_client: genai.Client | None = None
 
