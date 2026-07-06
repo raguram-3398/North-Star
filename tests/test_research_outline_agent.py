@@ -46,6 +46,7 @@ from security.input_gate import (
     ClarifyGateState,
     OutlineConfirmationStage,
     OutlineConfirmationState,
+    OutlineReviewAction,
 )
 from security.output_guard import ConfidenceTier, ValidatedGroundedContent
 from utils.exceptions import GeminiCallError
@@ -903,7 +904,14 @@ async def test_last_agent_message_raises_without_a_prior_agent_turn() -> None:
 async def test_gemini_json_helper_raises_gemini_call_error_on_malformed_json(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _patch_gemini(monkeypatch, responses=["not valid json at all"])
+    """Every attempt (1 + GEMINI_JSON_RETRY_MAX_ATTEMPTS) comes back
+    malformed here, so the retry loop must still exhaust and raise —
+    queues one bad response per attempt the retry loop will actually
+    make."""
+    _patch_gemini(
+        monkeypatch,
+        responses=["not valid json at all"] * (roa.GEMINI_JSON_RETRY_MAX_ATTEMPTS + 1),
+    )
 
     with pytest.raises(GeminiCallError):
         await roa._evaluate_acceptance("some proposal", "yes")
@@ -912,10 +920,47 @@ async def test_gemini_json_helper_raises_gemini_call_error_on_malformed_json(
 async def test_gemini_json_helper_raises_gemini_call_error_on_missing_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _patch_gemini(monkeypatch, responses=[json.dumps({"unexpected": "shape"})])
+    _patch_gemini(
+        monkeypatch,
+        responses=[json.dumps({"unexpected": "shape"})]
+        * (roa.GEMINI_JSON_RETRY_MAX_ATTEMPTS + 1),
+    )
 
     with pytest.raises(GeminiCallError):
         await roa._evaluate_acceptance("some proposal", "yes")
+
+
+async def test_gemini_json_helper_retries_on_malformed_json_and_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for the real, live 'Outline Confirmation failed:
+    Gemini response was not valid JSON: ...' incident (and the same class
+    of failure reported earlier on Outline Creation): a large one-shot
+    structured-generation call occasionally comes back as a genuine 200 OK
+    response with syntactically broken JSON (observed live: a single
+    missing '}' after the first entry in a ~70-item list) — not a 429/503,
+    so `_generate_content_with_retry`'s transport-level retry never
+    engages. `_call_gemini_json` must retry this itself and recover,
+    feeding the concrete parse error back into the next attempt's prompt
+    (CLAUDE.md's error-fed retry discipline) rather than a generic
+    "try again".
+    """
+    good_response = json.dumps({"accepted": True})
+    client = _patch_gemini(
+        monkeypatch,
+        responses=[
+            '{"accepted": true',  # malformed: missing closing brace
+            good_response,
+        ],
+    )
+
+    result = await roa._evaluate_acceptance("some proposal", "yes")
+
+    assert result is True
+    assert len(client.aio.models.calls) == 2
+    retry_prompt = client.aio.models.calls[1]["contents"]
+    assert "not valid JSON" in retry_prompt
+    assert "some proposal" in retry_prompt
 
 
 async def test_gemini_timeout_raises_gemini_call_error(
@@ -952,6 +997,32 @@ async def test_explicit_timeout_overrides_the_short_turn_default(
 
     result = await roa._call_gemini_text("some prompt", timeout=0.5)
     assert result == "ok"
+
+
+def test_reset_gemini_client_for_new_event_loop_forces_fresh_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for the real, live-reproduced 'Outline Confirmation
+    failed: Gemini call failed: Event loop is closed' incident: the
+    memoized Gemini client caches an async transport bound to whichever
+    event loop first used it, but `main.py._run_async` runs every
+    Gemini-backed call on its own fresh `asyncio.run(...)` loop, so a
+    reused client's transport is bound to an already-closed loop by the
+    second call. Proves `reset_gemini_client_for_new_event_loop` discards
+    the memoized client so the next `_get_gemini_client()` call constructs
+    a genuinely new instance, rather than returning the same one across
+    loops.
+    """
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-key")
+    monkeypatch.setattr(roa, "_gemini_client", None)
+
+    first = roa._get_gemini_client()
+    assert roa._get_gemini_client() is first  # memoized within one loop
+
+    roa.reset_gemini_client_for_new_event_loop()
+
+    second = roa._get_gemini_client()
+    assert second is not first
 
 
 async def test_create_initial_outline_uses_heavy_generation_timeout(
@@ -1327,7 +1398,11 @@ async def test_create_initial_outline_sets_is_enrichment_false_and_not_started(
 async def test_create_initial_outline_raises_on_missing_groups_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _patch_gemini(monkeypatch, responses=[json.dumps({"unexpected": "shape"})])
+    _patch_gemini(
+        monkeypatch,
+        responses=[json.dumps({"unexpected": "shape"})]
+        * (roa.GEMINI_JSON_RETRY_MAX_ATTEMPTS + 1),
+    )
 
     with pytest.raises(GeminiCallError):
         await roa.create_initial_outline("Backend Engineer", [GIT_SKILL], [])
@@ -1585,6 +1660,7 @@ async def test_handle_review_turn_addition_request_consumes_round_without_regene
     assert turn.state.rounds_used == 1
     assert turn.topics == topics
     assert not turn.concluded
+    assert turn.action is OutlineReviewAction.ADDITION_REQUEST
 
 
 async def test_handle_review_turn_confirm_ends_review_immediately(
@@ -1664,6 +1740,71 @@ async def test_classify_review_turn_raises_on_unrecognized_action(
 
     with pytest.raises(GeminiCallError):
         await roa._classify_review_turn("Backend Engineer", topics, "hello")
+
+
+async def test_extract_addition_skill_name_returns_clean_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_gemini(monkeypatch, responses=[json.dumps({"skill_name": "Kubernetes"})])
+
+    result = await roa._extract_addition_skill_name("can we add some kubernetes stuff")
+
+    assert result == "Kubernetes"
+
+
+async def test_extract_addition_skill_name_raises_on_missing_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_gemini(
+        monkeypatch,
+        responses=[json.dumps({"unexpected": "shape"})]
+        * (roa.GEMINI_JSON_RETRY_MAX_ATTEMPTS + 1),
+    )
+
+    with pytest.raises(GeminiCallError):
+        await roa._extract_addition_skill_name("add kubernetes")
+
+
+async def test_ground_addition_request_closes_the_previously_flagged_gap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for the real, user-reported gap: Outline
+    Confirmation's addition-request path previously always said grounding
+    a raw addition wasn't wired up (Architecture §10/PRD §11 item 6).
+    `ground_addition_request` closes it: extract a clean skill name, then
+    confirm it via a live Tavily search, never a fabricated source_url
+    (CLAUDE.md guardrail #1).
+    """
+    _patch_gemini(monkeypatch, responses=[json.dumps({"skill_name": "Kubernetes"})])
+    _patch_tavily(
+        monkeypatch,
+        _FakeTavilyClient(
+            _tavily_response(
+                [_tavily_result_dict(0.9, "", url="https://kubernetes.io/docs/")]
+            )
+        ),
+    )
+
+    result = await roa.ground_addition_request("can we add some kubernetes please")
+
+    assert result is not None
+    assert result.source_url == "https://kubernetes.io/docs/"
+    assert result.source_type == roa.TAVILY_SOURCE_TYPE
+    assert result.confidence == ConfidenceTier.MEDIUM
+    assert result.extra["skill"] == "Kubernetes"
+
+
+async def test_ground_addition_request_returns_none_when_tavily_has_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Never a fabricated source_url — a Tavily batch with no usable
+    result must return `None`, not invent a citation."""
+    _patch_gemini(monkeypatch, responses=[json.dumps({"skill_name": "Kubernetes"})])
+    _patch_tavily(monkeypatch, _FakeTavilyClient(_tavily_response([])))
+
+    result = await roa.ground_addition_request("add kubernetes")
+
+    assert result is None
 
 
 async def test_regenerate_outline_with_addition_produces_valid_sourced_outline(

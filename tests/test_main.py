@@ -46,9 +46,14 @@ from agents.research_outline_agent import (
     OutlineConfirmationTurn,
 )
 from data.grounding_fallback import GeneralKnowledgeFloorResult
-from main import _build_verification_source
-from security.input_gate import OutlineConfirmationStage, OutlineConfirmationState
+from main import _build_verification_source, _run_async
+from security.input_gate import (
+    OutlineConfirmationStage,
+    OutlineConfirmationState,
+    OutlineReviewAction,
+)
 from security.output_guard import ConfidenceTier, ValidatedGroundedContent
+from utils.exceptions import GeminiCallError
 
 MAIN_PATH = "src/main.py"
 
@@ -62,6 +67,51 @@ def _mock_db_session(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
 
 def _make_at() -> AppTest:
     return AppTest.from_file(MAIN_PATH, default_timeout=20)
+
+
+def test_run_async_resets_gemini_client_after_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Wiring regression test for the real, live-reproduced 'Outline
+    Confirmation failed: Gemini call failed: Event loop is closed'
+    incident: `_run_async` must reset the memoized Gemini client after
+    every `asyncio.run(...)` completes, since that client's cached async
+    transport is bound to the loop this call just closed — reused as-is
+    by the next call's own fresh loop, it raises exactly that error (see
+    `reset_gemini_client_for_new_event_loop`'s own docstring for the live
+    repro). This test only proves the reset is *called* every time, not
+    the underlying transport/event-loop behavior itself, which isn't
+    reachable through a mock.
+    """
+    calls: list[bool] = []
+    monkeypatch.setattr(
+        "main.reset_gemini_client_for_new_event_loop", lambda: calls.append(True)
+    )
+
+    async def _ok() -> str:
+        return "result"
+
+    assert _run_async(_ok()) == "result"
+    assert calls == [True]
+
+
+def test_run_async_resets_gemini_client_even_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reset must fire in a `finally`, not only on the happy path — a
+    failed Gemini call still closes its loop, so the next call would hit
+    the same stale-transport bug if the reset were skipped on error."""
+    calls: list[bool] = []
+    monkeypatch.setattr(
+        "main.reset_gemini_client_for_new_event_loop", lambda: calls.append(True)
+    )
+
+    async def _boom() -> str:
+        raise GeminiCallError("boom")
+
+    with pytest.raises(GeminiCallError):
+        _run_async(_boom())
+    assert calls == [True]
 
 
 def test_intake_creates_user_and_advances_to_clarify_gate(
@@ -439,6 +489,186 @@ def test_outline_confirmation_review_turn_calls_handle_review_turn(
     assert len(at.button) == 0
 
 
+def test_outline_confirmation_addition_request_grounds_and_regenerates_outline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for the real, user-reported gap: an addition
+    request on Outline Confirmation previously always said grounding a
+    raw addition wasn't wired up (Architecture §10/PRD §11 item 6). Now
+    it grounds the request and regenerates the outline for real.
+    """
+    fake_topics = _fake_outline_topics()
+    first_turn = OutlineConfirmationTurn(
+        state=OutlineConfirmationState(stage=OutlineConfirmationStage.REVIEWING),
+        message="Here's your learning plan.",
+        topics=fake_topics,
+    )
+    monkeypatch.setattr(
+        roa, "begin_outline_confirmation", AsyncMock(return_value=first_turn)
+    )
+
+    addition_ack_turn = OutlineConfirmationTurn(
+        state=OutlineConfirmationState(
+            stage=OutlineConfirmationStage.REVIEWING, rounds_used=1
+        ),
+        message="Got it — I'll add 'can we add kubernetes?' and update your outline.",
+        topics=fake_topics,
+        concluded=False,
+        action=OutlineReviewAction.ADDITION_REQUEST,
+    )
+    monkeypatch.setattr(
+        roa, "handle_review_turn", AsyncMock(return_value=addition_ack_turn)
+    )
+
+    grounded_addition = ValidatedGroundedContent(
+        source_url="https://kubernetes.io/docs/",
+        source_type="web_search",
+        confidence=ConfidenceTier.MEDIUM,
+        extra={"skill": "Kubernetes"},
+    )
+    monkeypatch.setattr(
+        roa, "ground_addition_request", AsyncMock(return_value=grounded_addition)
+    )
+
+    new_topics = [
+        *fake_topics,
+        InitialOutlineTopic(
+            topic_name="Kubernetes basics",
+            hierarchy_position=2,
+            topic_group="Kubernetes",
+            position_in_group=1,
+            source_url="https://kubernetes.io/docs/",
+            source_type="web_search",
+            confidence=ConfidenceTier.MEDIUM,
+            is_enrichment=False,
+            status="not_started",
+        ),
+    ]
+    regenerated_turn = OutlineConfirmationTurn(
+        state=addition_ack_turn.state,
+        message="Updated your outline to include Kubernetes.",
+        topics=new_topics,
+        concluded=False,
+    )
+    monkeypatch.setattr(
+        roa,
+        "regenerate_outline_with_addition",
+        AsyncMock(return_value=regenerated_turn),
+    )
+
+    fake_insert_outline_topics = MagicMock(
+        return_value=[
+            {
+                "id": "topic-2",
+                "hierarchy_position": 2,
+                "topic_name": "Kubernetes basics",
+                "topic_group": "Kubernetes",
+            }
+        ]
+    )
+    monkeypatch.setattr(
+        outline_topics_module, "insert_outline_topics", fake_insert_outline_topics
+    )
+
+    grounded_skill = ValidatedGroundedContent(
+        source_url="https://example.com/a",
+        source_type="job_listing",
+        confidence=ConfidenceTier.HIGH,
+        extra={"skill": "Docker"},
+    )
+    fake_grounding_result = LiveGroundingResult(
+        role_name="Backend Engineer",
+        skills=[grounded_skill],
+        confidence=ConfidenceTier.HIGH,
+        has_conflict=False,
+        himalayas_status="signal",
+        tavily_status="signal",
+    )
+
+    at = _make_at()
+    at.session_state["current_stage"] = "outline_confirmation"
+    at.session_state["resolved_role"] = "Backend Engineer"
+    at.session_state["outline_topics"] = fake_topics
+    at.session_state["user_id"] = "user-1"
+    at.session_state["grounding_result"] = fake_grounding_result
+    at.run()
+
+    at.chat_input[0].set_value("can we add kubernetes?").run()
+
+    assert not at.exception
+    fake_insert_outline_topics.assert_called_once()
+    assert at.session_state["outline_topics"] is new_topics
+    assert (
+        at.session_state["persisted_topics"] == fake_insert_outline_topics.return_value
+    )
+    assert at.session_state["outline_confirmation_turn"] is regenerated_turn
+    assert at.session_state["outline_confirmation_conversation"] == [
+        {"role": "agent", "content": "Here's your learning plan."},
+        {"role": "user", "content": "can we add kubernetes?"},
+        {"role": "agent", "content": addition_ack_turn.message},
+        {"role": "agent", "content": regenerated_turn.message},
+    ]
+
+
+def test_outline_confirmation_addition_request_ungroundable_leaves_outline_unchanged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Never a fabricated source_url — if Tavily has nothing for the
+    extracted skill name, the outline must stay exactly as it was, with a
+    plain explanation appended to the conversation, not a crash or a
+    silently invented topic."""
+    fake_topics = _fake_outline_topics()
+    first_turn = OutlineConfirmationTurn(
+        state=OutlineConfirmationState(stage=OutlineConfirmationStage.REVIEWING),
+        message="Here's your learning plan.",
+        topics=fake_topics,
+    )
+    monkeypatch.setattr(
+        roa, "begin_outline_confirmation", AsyncMock(return_value=first_turn)
+    )
+
+    addition_ack_turn = OutlineConfirmationTurn(
+        state=OutlineConfirmationState(
+            stage=OutlineConfirmationStage.REVIEWING, rounds_used=1
+        ),
+        message="Got it — I'll add 'zzz nonsense' and update your outline.",
+        topics=fake_topics,
+        concluded=False,
+        action=OutlineReviewAction.ADDITION_REQUEST,
+    )
+    monkeypatch.setattr(
+        roa, "handle_review_turn", AsyncMock(return_value=addition_ack_turn)
+    )
+    monkeypatch.setattr(roa, "ground_addition_request", AsyncMock(return_value=None))
+    fake_regenerate = AsyncMock()
+    monkeypatch.setattr(roa, "regenerate_outline_with_addition", fake_regenerate)
+    fake_insert_outline_topics = MagicMock()
+    monkeypatch.setattr(
+        outline_topics_module, "insert_outline_topics", fake_insert_outline_topics
+    )
+
+    at = _make_at()
+    at.session_state["current_stage"] = "outline_confirmation"
+    at.session_state["resolved_role"] = "Backend Engineer"
+    at.session_state["outline_topics"] = fake_topics
+    at.session_state["user_id"] = "user-1"
+    at.run()
+
+    at.chat_input[0].set_value("add zzz nonsense").run()
+
+    assert not at.exception
+    fake_regenerate.assert_not_called()
+    fake_insert_outline_topics.assert_not_called()
+    assert at.session_state["outline_topics"] is fake_topics
+    assert at.session_state["outline_confirmation_conversation"][-1] == {
+        "role": "agent",
+        "content": (
+            "I couldn't find a reliable source for that addition, so "
+            "your outline wasn't changed."
+        ),
+    }
+
+
 def test_outline_confirmation_concluded_advances_to_lowest_hierarchy_not_started_topic(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -531,7 +761,14 @@ def test_day_by_day_coaching_start_verification_builds_source_and_advances(
     at.session_state["current_topic_id"] = "topic-1"
     at.session_state["user_id"] = "user-1"
     at.run()
-    at.button[0].click()  # "Start Verification"
+    # Stepped reveal: Summary, Theory, Hands-on, Review, Reflection,
+    # Preview — 5 "Next" clicks before the final "Start Quiz" button.
+    for _ in range(5):
+        assert at.button[0].label == "Next"
+        at.button[0].click()
+        at.run()
+    assert at.button[0].label == "Start Quiz"
+    at.button[0].click()
     at.run()
 
     assert not at.exception
@@ -571,6 +808,13 @@ def test_day_by_day_coaching_spillover_stays_and_increments_day(
     at.session_state["current_topic_id"] = "topic-1"
     at.session_state["user_id"] = "user-1"
     at.run()
+    # Stepped reveal: no hands-on/review this time (both None), so only
+    # Summary, Theory, Reflection, Preview — 3 "Next" clicks before the
+    # spillover button.
+    for _ in range(3):
+        assert at.button[0].label == "Next"
+        at.button[0].click()
+        at.run()
     at.button[0].click()  # "Continue to next day (same topic)"
     at.run()
 
@@ -586,6 +830,133 @@ def test_day_by_day_coaching_spillover_stays_and_increments_day(
     assert fake_generate_day_content.call_count == 2
     _, second_call_kwargs = fake_generate_day_content.call_args_list[1]
     assert second_call_kwargs["carried_over_content"] == "leftover material"
+
+
+def test_day_by_day_coaching_steps_reveal_progressively_via_next_button(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real, requested UX change: each Day-by-Day Coaching section must
+    appear one at a time as "Next" is clicked, not all at once on a
+    single page load."""
+    topic = _fake_topic()
+    monkeypatch.setattr(outline_topics_module, "get_topic", lambda *a, **k: topic)
+    monkeypatch.setattr(
+        outline_topics_module, "get_topics_in_group", lambda *a, **k: [topic]
+    )
+    monkeypatch.setattr(
+        users_module, "get_user", lambda *a, **k: {"available_time_per_week": 10}
+    )
+    fake_content = cpa.DayContent(
+        summary="SUMMARY_TEXT",
+        theory_framing="THEORY_TEXT",
+        theory_links=[],
+        hands_on_exercise="HANDSON_TEXT",
+        review_prompt="REVIEW_TEXT",
+        reflection_prompt="REFLECTION_TEXT",
+        preview="PREVIEW_TEXT",
+        remaining_content="",
+    )
+    monkeypatch.setattr(
+        cpa, "generate_day_content", AsyncMock(return_value=fake_content)
+    )
+    monkeypatch.setattr(cpa, "record_day_content", MagicMock())
+
+    at = _make_at()
+    at.session_state["current_stage"] = "day_by_day_coaching"
+    at.session_state["current_topic_id"] = "topic-1"
+    at.session_state["user_id"] = "user-1"
+    at.run()
+
+    def _visible_texts() -> set[str]:
+        return {m.value for m in at.markdown}
+
+    assert "SUMMARY_TEXT" in _visible_texts()
+    assert "THEORY_TEXT" not in _visible_texts()
+    assert at.button[0].label == "Next"
+
+    at.button[0].click()
+    at.run()
+    assert "THEORY_TEXT" in _visible_texts()
+    assert "HANDSON_TEXT" not in _visible_texts()
+
+    at.button[0].click()
+    at.run()
+    assert "HANDSON_TEXT" in _visible_texts()
+    assert "REVIEW_TEXT" not in _visible_texts()
+
+    at.button[0].click()
+    at.run()
+    assert "REVIEW_TEXT" in _visible_texts()
+    assert "REFLECTION_TEXT" not in _visible_texts()
+
+    at.button[0].click()
+    at.run()
+    assert "REFLECTION_TEXT" in _visible_texts()
+    assert "PREVIEW_TEXT" not in _visible_texts()
+
+    at.button[0].click()
+    at.run()
+    assert "PREVIEW_TEXT" in _visible_texts()
+    assert not at.exception
+    assert at.button[0].label == "Start Quiz"
+
+
+def test_day_by_day_coaching_citation_links_to_the_real_full_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for a real, reported bug: citations previously
+    rendered only the bare domain as plain text, so whatever became
+    clickable (inconsistently, depending on the markdown renderer's own
+    autolink heuristics) pointed at that site's homepage, not the actual
+    article/video — e.g. a YouTube citation went to a broken YouTube
+    landing page instead of the real video. The caption must now be an
+    explicit markdown link to the citation's real, full URL.
+    """
+    topic = _fake_topic()
+    monkeypatch.setattr(outline_topics_module, "get_topic", lambda *a, **k: topic)
+    monkeypatch.setattr(
+        outline_topics_module, "get_topics_in_group", lambda *a, **k: [topic]
+    )
+    monkeypatch.setattr(
+        users_module, "get_user", lambda *a, **k: {"available_time_per_week": 10}
+    )
+    real_video_url = "https://www.youtube.com/watch?v=abc123XYZ"
+    fake_content = cpa.DayContent(
+        summary="Summary",
+        theory_framing="Theory",
+        theory_links=[
+            {
+                "url": real_video_url,
+                "title": "Linux For Beginners - Full Course [NEW]",
+                "content": "...",
+            }
+        ],
+        hands_on_exercise=None,
+        review_prompt=None,
+        reflection_prompt="Reflect",
+        preview="Preview",
+        remaining_content="",
+    )
+    monkeypatch.setattr(
+        cpa, "generate_day_content", AsyncMock(return_value=fake_content)
+    )
+    monkeypatch.setattr(cpa, "record_day_content", MagicMock())
+
+    at = _make_at()
+    at.session_state["current_stage"] = "day_by_day_coaching"
+    at.session_state["current_topic_id"] = "topic-1"
+    at.session_state["user_id"] = "user-1"
+    at.run()
+    at.button[0].click()  # reveal the Theory step
+    at.run()
+
+    assert not at.exception
+    citation_captions = [c.value for c in at.caption if c.value.startswith("Source:")]
+    assert len(citation_captions) == 1
+    assert citation_captions[0] == (
+        f"Source: [Linux For Beginners - Full Course [NEW]]({real_video_url}) "
+        "— www.youtube.com"
+    )
 
 
 def test_verification_single_slot_wiring_begin_and_submit(

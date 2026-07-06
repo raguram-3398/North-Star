@@ -15,6 +15,7 @@ Sessions are passed in by the caller (dependency injection), matching
 """
 
 import uuid
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any, Protocol, runtime_checkable
 
@@ -160,7 +161,7 @@ def mark_topic_completed(
 def insert_outline_topics(
     session: Session,
     user_id: str,
-    topics: list[SequencedOutlineTopic],
+    topics: Sequence[SequencedOutlineTopic],
 ) -> list[dict[str, Any]]:
     """Persist a freshly-created or regenerated outline
     (`agents/research_outline_agent.py`'s `create_initial_outline`/

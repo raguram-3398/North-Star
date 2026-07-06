@@ -132,6 +132,17 @@ HEAVY_GENERATION_TIMEOUT_SECONDS = 45
 # applied to any other error (a 400 bad request, a 401/403 auth failure,
 # a genuine timeout) — those aren't transient, so retrying them would
 # only waste calls/time, never change the outcome.
+# Real, live-reproduced incidents on both `create_initial_outline` (the
+# outline-hierarchy call) and `_generate_topic_explanations` (~70 topics
+# in one shot): a genuine 200 OK response whose JSON body is syntactically
+# broken (once, a single missing `}` after the first list entry) —
+# not a 429/503, so GEMINI_RETRY_MAX_ATTEMPTS/`_generate_content_with_retry`
+# never engages; a bad structured-output generation roll, not a transient
+# network/rate-limit failure. `_call_gemini_json` retries this itself,
+# separately, per CLAUDE.md's "error-fed retry" LLM Call Discipline: each
+# retry's prompt includes the concrete parse/validation error from the
+# previous attempt, not a generic "try again".
+GEMINI_JSON_RETRY_MAX_ATTEMPTS = 2  # retries beyond the first attempt
 GEMINI_RETRYABLE_STATUS_CODES = frozenset({429, 503})
 GEMINI_RETRY_MAX_ATTEMPTS = 4  # retries beyond the first attempt
 GEMINI_RETRY_BASE_DELAY_SECONDS = 1.0
@@ -312,6 +323,33 @@ def _get_gemini_client() -> genai.Client:
     return _gemini_client
 
 
+def reset_gemini_client_for_new_event_loop() -> None:
+    """Discard the memoized Gemini client so the next `_get_gemini_client()`
+    call constructs a fresh one on the caller's own new event loop.
+
+    Real, live-reproduced root cause of "Outline Confirmation failed:
+    Gemini call failed: Event loop is closed": `genai.Client` lazily
+    creates and caches an async httpx transport bound to whichever event
+    loop is running the first time `client.aio` is used. `main.py` runs
+    every Gemini-backed call via a fresh `asyncio.run(...)` per Streamlit
+    script rerun (`_run_async`'s own docstring: a new loop per call is
+    correct here, not a workaround) — so without this reset, the
+    module-level client singleton (CLAUDE.md's "one client per module"
+    convention) keeps a transport bound to a loop that's already closed by
+    the time the *next* rerun's Gemini call reaches it. Reproduced with two
+    back-to-back `asyncio.run(_call_gemini_text(...))` calls sharing the
+    memoized client: the first succeeds, the second raises exactly
+    `RuntimeError: Event loop is closed` deep in httpcore's connection
+    teardown. `main.py._run_async` calls this after every `asyncio.run(...)`
+    completes, so the *next* call constructs a client (and transport) fresh,
+    inside its own new loop — cheap (holds only the API key until first
+    use), so paying construction cost once per rerun is not a regression of
+    the "one client per module" convention, just its correct grain here.
+    """
+    global _gemini_client
+    _gemini_client = None
+
+
 # CLAUDE.md's LLM Call Discipline: every prompt used for grounded or
 # safety-critical generation is versioned here, never deleted once its
 # baseline regression test (tests/test_research_outline_agent.py) locks
@@ -445,6 +483,16 @@ PROMPT_REGISTRY: dict[str, str] = {
         "Current outline topics: {topic_list}\n"
         "User's message: {user_message!r}\n\n"
         "Respond with only the response text, nothing else."
+    ),
+    "outline_addition_skill_name_extraction_v1": (
+        "A user asked for a new topic or skill to be added to their "
+        "learning outline. Extract just the specific skill or "
+        "technology name they are asking to add, as a short, clean "
+        "phrase suitable for a search engine query (e.g. 'Kubernetes', "
+        "'Rust', 'GraphQL APIs') — not their full sentence.\n\n"
+        "User's message: {user_message!r}\n\n"
+        "Respond with ONLY a JSON object matching this shape: "
+        '{{"skill_name": "<short skill/technology name>"}}.'
     ),
 }
 
@@ -738,37 +786,13 @@ async def _call_gemini_text(
     return str(text).strip()
 
 
-async def _call_gemini_json(
-    prompt: str,
-    required_keys: set[str],
-    model: str = SHORT_TURN_GEMINI_MODEL,
-    timeout: float | None = None,
-) -> dict[str, Any]:
-    """Call Gemini requesting a JSON object response and return it parsed.
-
-    Raises `GeminiCallError` if the call fails/times out, the response
-    is not valid JSON, the parsed value is not a JSON object, or any of
-    `required_keys` is missing — never returns a partially-valid dict for
-    the caller to guess at. See `_generate_content_with_retry` for the
-    retry/backoff/pacing this now goes through.
-
-    Shared across every Gemini-backed reasoning step in this module (not
-    clarify-gate-specific despite the default `model`) — callers pass an
-    explicit `model` (e.g. `OUTLINE_HIERARCHY_GEMINI_MODEL`) and, for a
-    one-shot structured generation rather than a short conversational
-    turn, an explicit `timeout=HEAVY_GENERATION_TIMEOUT_SECONDS`. Defaults
-    to `None` (resolved to `EXTERNAL_CALL_TIMEOUT_SECONDS` inside
-    `_generate_content_with_retry`), not the constant itself, for the same
-    monkeypatch-at-call-time reason documented there.
+def _parse_gemini_json_object(raw_text: str, required_keys: set[str]) -> dict[str, Any]:
+    """Parse and validate one Gemini JSON response. Raises `GeminiCallError`
+    with a specific, diagnosable message on an empty response, invalid
+    JSON syntax, a non-object JSON value, or a missing required key —
+    exactly the message `_call_gemini_json`'s retry loop feeds back into
+    its next attempt's prompt (CLAUDE.md's error-fed retry discipline).
     """
-    response = await _generate_content_with_retry(
-        model=model,
-        contents=prompt,
-        config=genai_types.GenerateContentConfig(response_mime_type="application/json"),
-        timeout=timeout,
-    )
-
-    raw_text = response.text
     if not raw_text or not raw_text.strip():
         raise GeminiCallError("Gemini returned an empty response")
     try:
@@ -785,6 +809,75 @@ async def _call_gemini_json(
             f"Gemini JSON response is missing required keys {missing}: {raw_text!r}"
         )
     return parsed
+
+
+async def _call_gemini_json(
+    prompt: str,
+    required_keys: set[str],
+    model: str = SHORT_TURN_GEMINI_MODEL,
+    timeout: float | None = None,
+) -> dict[str, Any]:
+    """Call Gemini requesting a JSON object response and return it parsed.
+
+    Raises `GeminiCallError` if the call fails/times out, or every attempt's
+    response is not valid JSON, is not a JSON object, or is missing any of
+    `required_keys` — never returns a partially-valid dict for the caller
+    to guess at. See `_generate_content_with_retry` for the transport-level
+    retry/backoff/pacing (429/503 only) every attempt below also goes
+    through.
+
+    Retries up to `GEMINI_JSON_RETRY_MAX_ATTEMPTS` additional times if the
+    response comes back but fails to parse/validate (`_parse_gemini_json_
+    object`) — a real, live-reproduced failure mode on a large one-shot
+    structured generation (see that constant's own comment), distinct from
+    the 429/503 transport retry above it. `prompt` is captured once as
+    `original_prompt` before the loop, never overwritten by a retry's
+    augmented prompt, so a later retry never contaminates itself with a
+    previous attempt's correction as if it were the original input.
+
+    Shared across every Gemini-backed reasoning step in this module (not
+    clarify-gate-specific despite the default `model`) — callers pass an
+    explicit `model` (e.g. `OUTLINE_HIERARCHY_GEMINI_MODEL`) and, for a
+    one-shot structured generation rather than a short conversational
+    turn, an explicit `timeout=HEAVY_GENERATION_TIMEOUT_SECONDS`. Defaults
+    to `None` (resolved to `EXTERNAL_CALL_TIMEOUT_SECONDS` inside
+    `_generate_content_with_retry`), not the constant itself, for the same
+    monkeypatch-at-call-time reason documented there.
+    """
+    original_prompt = prompt
+    last_error: GeminiCallError = GeminiCallError(
+        "Gemini JSON call failed: no attempt was made"
+    )
+    for attempt in range(GEMINI_JSON_RETRY_MAX_ATTEMPTS + 1):
+        call_prompt = (
+            original_prompt
+            if attempt == 0
+            else (
+                f"{original_prompt}\n\nYour previous response failed with this "
+                f"error: {last_error}\nReturn ONLY a single, complete, valid "
+                "JSON object this time — no other text, no truncation."
+            )
+        )
+        response = await _generate_content_with_retry(
+            model=model,
+            contents=call_prompt,
+            config=genai_types.GenerateContentConfig(
+                response_mime_type="application/json"
+            ),
+            timeout=timeout,
+        )
+        try:
+            return _parse_gemini_json_object(response.text, required_keys)
+        except GeminiCallError as exc:
+            last_error = exc
+            if attempt == GEMINI_JSON_RETRY_MAX_ATTEMPTS:
+                raise
+    # Unreachable: GEMINI_JSON_RETRY_MAX_ATTEMPTS + 1 >= 1, so the loop
+    # above always either returns or raises on its final iteration. Kept
+    # as an explicit fallback, mirroring `_generate_content_with_retry`'s
+    # own, so a future change to the loop bounds fails loudly with the
+    # real last error rather than silently returning `None`.
+    raise last_error
 
 
 # --- Clarify Gate (PRD §7.2) conversational content ---------------------
@@ -1095,13 +1188,19 @@ async def _fetch_himalayas_listings(role_name: str) -> list[ParsedJobListing]:
         ) from exc
 
 
-async def _fetch_tavily_results(role_name: str) -> list[ParsedSearchResult]:
-    """Call Tavily's search for `role_name` for the same query shape used
-    in tests/spike_grounding_connectivity.py, in a worker thread
-    (tavily-python's client is synchronous) with an explicit timeout —
-    both on the call itself (`timeout=` kwarg) and defensively via the
-    outer `asyncio.wait_for` — then parse the response via
-    `data/tavily_parser.py`.
+async def _fetch_tavily_results(query: str) -> list[ParsedSearchResult]:
+    """Call Tavily's search for `query`, in a worker thread (tavily-python's
+    client is synchronous) with an explicit timeout — both on the call
+    itself (`timeout=` kwarg) and defensively via the outer
+    `asyncio.wait_for` — then parse the response via `data/tavily_parser.py`.
+
+    `query` is a raw, ready-to-search string, not a role name — callers
+    build whatever query shape fits their case (`_safe_fetch_tavily`'s
+    `f"{role_name} job requirements and key skills"`, the same shape used
+    in tests/spike_grounding_connectivity.py, for role-grounding;
+    `ground_addition_request`'s own for a single ad hoc skill), so this
+    stays the one shared low-level Tavily-call/timeout/error-handling
+    primitive rather than being duplicated per caller.
 
     Raises `GroundingSourceCallError` on any Tavily-specific API failure
     or timeout, or if the response can't be parsed at all
@@ -1109,7 +1208,6 @@ async def _fetch_tavily_results(role_name: str) -> list[ParsedSearchResult]:
     contract. Never returns silently empty/wrong data.
     """
     client = _get_tavily_client()
-    query = f"{role_name} job requirements and key skills"
     try:
         response = await asyncio.wait_for(
             asyncio.to_thread(
@@ -1171,7 +1269,9 @@ async def _safe_fetch_tavily(
     score threshold.
     """
     try:
-        results = await _fetch_tavily_results(role_name)
+        results = await _fetch_tavily_results(
+            f"{role_name} job requirements and key skills"
+        )
     except GroundingSourceCallError:
         return [], "call_failed"
     if tavily_has_usable_signal(results):
@@ -1515,12 +1615,21 @@ class OutlineConfirmationTurn:
     `BOUND_REACHED` — no further outline editing occurs past that point
     (PRD §7.5's "one-time, pre-start window only"); the caller proceeds
     to Day 1 with `topics` exactly as they stand on this turn.
+
+    `action` is the `OutlineReviewAction` `handle_review_turn` classified
+    this turn as — `None` for the very first turn (`begin_outline_
+    confirmation`, which has no user message to classify) and for any
+    turn built directly by a caller rather than through `handle_review_
+    turn`. `main.py` reads this to decide whether to follow up with
+    `ground_addition_request`/`regenerate_outline_with_addition` on an
+    `ADDITION_REQUEST` turn — it is not used by this module itself.
     """
 
     state: OutlineConfirmationState
     message: str
     topics: list[InitialOutlineTopic]
     concluded: bool = False
+    action: OutlineReviewAction | None = None
 
 
 def _format_topic_list_for_prompt(topics: list[InitialOutlineTopic]) -> str:
@@ -1656,6 +1765,86 @@ async def _respond_to_review_message(
     return await _call_gemini_text(prompt)
 
 
+async def _extract_addition_skill_name(user_message: str) -> str:
+    """Extract a short, search-ready skill/topic name from a raw
+    addition-request message (PRD §7.5) — the user's own words are
+    frequently a full sentence ("can we add some kubernetes stuff please"),
+    not a usable search query on their own. A separate, dedicated
+    `PROMPT_REGISTRY` entry rather than folding this into
+    `outline_review_turn_classification_v1`, per CLAUDE.md's LLM Call
+    Discipline: that prompt is a single-responsibility classifier, and
+    this is a second, independent extraction step run only once an
+    `ADDITION_REQUEST` has already been classified.
+
+    Raises `GeminiCallError` if Gemini returns no usable `skill_name`.
+    """
+    prompt = PROMPT_REGISTRY["outline_addition_skill_name_extraction_v1"].format(
+        user_message=user_message
+    )
+    parsed = await _call_gemini_json(prompt, required_keys={"skill_name"})
+    skill_name = parsed["skill_name"]
+    if not isinstance(skill_name, str) or not skill_name.strip():
+        raise GeminiCallError(f"Gemini returned no usable skill_name: {parsed!r}")
+    return skill_name.strip()
+
+
+# Confidence assigned to a grounded addition request — reuses this
+# codebase's existing "Tavily confirmed it, nothing cross-validated it
+# against a role/job-listing anchor" meaning (`data/cross_validation.py`'s
+# tavily-only branch inside `ground_role`), rather than inventing a new
+# tier. There is no Himalayas equivalent for one ad hoc skill — Himalayas
+# is job-listing search keyed by role, not a per-skill lookup — so a
+# grounded addition can never reach `HIGH` the way a cross-validated role
+# skill can.
+SINGLE_SKILL_GROUNDING_CONFIDENCE = ConfidenceTier.MEDIUM
+
+
+async def ground_addition_request(user_message: str) -> ValidatedGroundedContent | None:
+    """Ground a raw, free-text Outline Confirmation addition request (PRD
+    §7.5) into a real, sourced `ValidatedGroundedContent` — closes the
+    gap `handle_review_turn`'s own docstring names: folding a user's
+    requested addition into the outline needs that addition to already
+    be grounded, which this function now does, rather than leaving it to
+    an unaddressed design question (previously Architecture §10/PRD §11
+    item 6).
+
+    Two steps: (1) `_extract_addition_skill_name` turns the user's full
+    sentence into a short, search-ready skill/topic name; (2) a live
+    Tavily search for that name — deliberately NOT `ground_role`'s full
+    Himalayas+Tavily+cross-validation pipeline, which is built around a
+    whole role's job-listing signal and has no per-skill lookup at all.
+    Any real Tavily result at all confirms the topic is a genuine,
+    publicly-documented subject, cited at `SINGLE_SKILL_GROUNDING_
+    CONFIDENCE` (medium).
+
+    Returns `None` if Tavily returns no usable result — never a
+    fabricated `source_url`/confidence (CLAUDE.md guardrail #1). The
+    caller (`main.py`) must tell the user this specific addition couldn't
+    be grounded and leave the outline unchanged, not silently drop or
+    invent it.
+
+    Raises `GeminiCallError` if skill-name extraction fails, or
+    `GroundingSourceCallError` if the Tavily call itself fails/times out
+    — both real, user-facing failures `main.py` degrades gracefully
+    around, per `_STAGE_EXCEPTIONS`.
+    """
+    skill_name = await _extract_addition_skill_name(user_message)
+    query = f"{skill_name} tutorial or official documentation"
+    results = await _fetch_tavily_results(query)
+    skill_bearing = [result for result in results if result.source_url]
+    if not skill_bearing:
+        return None
+    top_result = max(skill_bearing, key=lambda result: result.score)
+    return validate_output_object(
+        {
+            "source_url": top_result.source_url,
+            "source_type": TAVILY_SOURCE_TYPE,
+            "confidence": SINGLE_SKILL_GROUNDING_CONFIDENCE.value,
+            "skill": skill_name,
+        }
+    )
+
+
 async def begin_outline_confirmation(
     resolved_role: str, topics: list[InitialOutlineTopic]
 ) -> OutlineConfirmationTurn:
@@ -1683,11 +1872,12 @@ async def handle_review_turn(
     *grounded* `ValidatedGroundedContent` (a live grounding lookup for
     the user's specific requested topic, not something this function can
     invent per CLAUDE.md guardrail #1 — never fabricate a source_url).
-    The caller is responsible for grounding the request and then calling
-    `regenerate_outline_with_addition`. This is a genuine scope boundary,
-    not an oversight: how a raw addition request gets grounded (e.g. a
-    live single-skill lookup) is a separate, unaddressed design question
-    — see this task's spec reconciliation note.
+    The returned turn's `action` field tells the caller a grounding
+    follow-up is needed; the caller grounds the request via
+    `ground_addition_request` and then calls
+    `regenerate_outline_with_addition` — this function deliberately stays
+    a single, fast classify-and-acknowledge step so a slow/failing live
+    Tavily lookup never blocks the classification itself.
 
     Raises `ValueError` if `state.stage` is not `REVIEWING`.
     """
@@ -1705,13 +1895,18 @@ async def handle_review_turn(
             message=OUTLINE_CONFIRMATION_CONFIRMED_MESSAGE,
             topics=topics,
             concluded=True,
+            action=action,
         )
 
     if action is OutlineReviewAction.QUESTION:
         response = await _respond_to_review_message(resolved_role, topics, user_message)
         next_state = advance_after_review_turn(state, action)
         return OutlineConfirmationTurn(
-            state=next_state, message=response, topics=topics, concluded=False
+            state=next_state,
+            message=response,
+            topics=topics,
+            concluded=False,
+            action=action,
         )
 
     if action is OutlineReviewAction.CONCERN:
@@ -1721,7 +1916,11 @@ async def handle_review_turn(
         if concluded:
             response = f"{response} {OUTLINE_CONFIRMATION_BOUND_REACHED_MESSAGE}"
         return OutlineConfirmationTurn(
-            state=next_state, message=response, topics=topics, concluded=concluded
+            state=next_state,
+            message=response,
+            topics=topics,
+            concluded=concluded,
+            action=action,
         )
 
     # ADDITION_REQUEST
@@ -1733,7 +1932,11 @@ async def handle_review_turn(
     if concluded:
         message = f"{message} {OUTLINE_CONFIRMATION_BOUND_REACHED_MESSAGE}"
     return OutlineConfirmationTurn(
-        state=next_state, message=message, topics=topics, concluded=concluded
+        state=next_state,
+        message=message,
+        topics=topics,
+        concluded=concluded,
+        action=action,
     )
 
 

@@ -77,6 +77,11 @@ place these keys are declared):
   next day of the same topic, or `None`.
 - `day_content`: the current day's generated `DayContent`, or `None`
   before it's been generated for this day.
+- `day_coaching_step_index`: which Day-by-Day Coaching section (Summary,
+  Theory, ...) is the furthest one revealed so far for the current day —
+  a stepped, "Next"-button reveal rather than showing every section at
+  once. Reset to 0 whenever `day_content` is reset to `None` (a new day
+  or a new topic).
 - `verification_source_material` / `verification_source_url`: the single
   source pair (computed once per topic, when its content is generated —
   see `_build_verification_source`) that all 5 verification question
@@ -92,6 +97,7 @@ place these keys are declared):
 """
 
 import asyncio
+from collections.abc import Callable
 from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
@@ -118,12 +124,16 @@ from agents.research_outline_agent import (
     ClarifyGateTurn,
     LiveGroundingResult,
     OutlineConfirmationTurn,
+    ValidatedGroundedContent,
     advance_clarify_gate,
     begin_clarify_gate,
     begin_outline_confirmation,
     create_initial_outline,
+    ground_addition_request,
     ground_role,
     handle_review_turn,
+    regenerate_outline_with_addition,
+    reset_gemini_client_for_new_event_loop,
 )
 from data.grounding_fallback import CachedFallbackResult, GeneralKnowledgeFloorResult
 from data.outline_topics import (
@@ -134,7 +144,7 @@ from data.outline_topics import (
 )
 from data.users import create_user, get_user, set_resolved_role
 from db.connection import get_session
-from security.input_gate import ClarifyGateStage
+from security.input_gate import ClarifyGateStage, OutlineReviewAction
 from security.output_guard import ConfidenceTier
 from utils.exceptions import (
     ConfidenceValidationError,
@@ -210,8 +220,18 @@ def _run_async(coro: Any) -> Any:
     script execution. Each Streamlit rerun is its own fresh top-to-bottom
     script run, so a fresh event loop per call is correct here, not a
     workaround.
+
+    Always resets the memoized Gemini client afterward (success or
+    failure) — see `reset_gemini_client_for_new_event_loop`'s own
+    docstring for the live-reproduced "Event loop is closed" bug this
+    closes: the client's cached async transport is bound to *this* call's
+    loop, which is about to close, so it must not be reused by the next
+    `_run_async` call's own fresh loop.
     """
-    return asyncio.run(coro)
+    try:
+        return asyncio.run(coro)
+    finally:
+        reset_gemini_client_for_new_event_loop()
 
 
 def _init_session_state() -> None:
@@ -236,6 +256,7 @@ def _init_session_state() -> None:
         "day_number_for_topic": 1,
         "carried_over_content": None,
         "day_content": None,
+        "day_coaching_step_index": 0,
         "verification_source_material": None,
         "verification_source_url": None,
         "current_question_number": 1,
@@ -307,14 +328,28 @@ def _render_stamp(confidence: str, source_url: str, *, sample: bool = False) -> 
 
 
 def _render_citations(links: list[dict[str, str]]) -> None:
-    """One caption line per citation — title (or domain, if untitled) plus
-    the domain — native `st.caption`, no custom color.
+    """One caption line per citation — title (or domain, if untitled) as
+    an explicit markdown link to the citation's real, full `url`, plus
+    the bare domain for a quick trust glance — native `st.caption`, no
+    custom color.
+
+    A real, reported bug: this previously rendered only the bare domain
+    as plain text (`_domain_from_url(url)` discards the real path/query),
+    relying on whichever text happened to look link-shaped to Streamlit's
+    markdown renderer to become clickable at all — inconsistent (some
+    domains autolink, some don't) and, even when it did autolink, always
+    pointed at that site's homepage rather than the actual article/video,
+    since the real path was already thrown away before rendering. An
+    explicit `[label](url)` link to the real `url` fixes both: always
+    clickable, always the correct page (e.g. the actual YouTube video,
+    not youtube.com's homepage).
     """
     for link in links:
-        domain = _domain_from_url(link["url"])
+        url = link["url"]
+        domain = _domain_from_url(url)
         title = (link.get("title") or "").strip()
         label = title if title else domain
-        st.caption(f"Source: {label} — {domain}")
+        st.caption(f"Source: [{label}]({url}) — {domain}")
 
 
 def _render_progress_dots(current_question_number: int, total: int = 5) -> None:
@@ -608,22 +643,38 @@ def _render_research_grounding() -> None:
 # --- Outline Creation (PRD §7.1 stage 4 / §7.4) -------------------------
 
 
+def _core_and_emerging_skills(
+    result: object,
+) -> tuple[list[ValidatedGroundedContent], list[ValidatedGroundedContent]] | None:
+    """The core/emerging skill split `create_initial_outline`/
+    `regenerate_outline_with_addition` both need, from whichever grounding
+    rung `st.session_state.grounding_result` actually landed on. Returns
+    `None` if `result` carries no grounded skill list at all (the
+    general-knowledge-only floor) — shared by Outline Creation and the
+    Outline Confirmation addition-regeneration path, so the isinstance
+    split lives in exactly one place, not duplicated between them.
+    """
+    if isinstance(result, LiveGroundingResult):
+        # Degenerate core/emerging split — matches the established
+        # workaround already used at src/cron/refresh_roles.py's
+        # upsert_role call: LiveGroundingResult has no real split.
+        return result.skills, []
+    if isinstance(result, CachedFallbackResult):
+        return result.core_skills, result.emerging_skills
+    return None
+
+
 def _render_outline_creation() -> None:
     st.header("Outline Creation")
     session = _get_db_session()
     result = st.session_state.grounding_result
 
     if st.session_state.outline_topics is None:
-        if isinstance(result, LiveGroundingResult):
-            # Degenerate core/emerging split — matches the established
-            # workaround already used at src/cron/refresh_roles.py's
-            # upsert_role call: LiveGroundingResult has no real split.
-            core_skills, emerging_skills = result.skills, []
-        elif isinstance(result, CachedFallbackResult):
-            core_skills, emerging_skills = result.core_skills, result.emerging_skills
-        else:
+        split = _core_and_emerging_skills(result)
+        if split is None:
             st.error("Cannot create an outline without a grounded skill list.")
             return
+        core_skills, emerging_skills = split
 
         try:
             topics = _run_async(
@@ -672,34 +723,94 @@ def _advance_to_day_one() -> None:
     st.rerun()
 
 
+def _regenerate_outline_for_addition(
+    session: Session, turn: OutlineConfirmationTurn, user_message: str
+) -> OutlineConfirmationTurn:
+    """Ground the raw addition request in `user_message`
+    (`ground_addition_request`) and fold it into the outline
+    (`regenerate_outline_with_addition`), persisting the regenerated
+    hierarchy exactly as Outline Creation does (`insert_outline_topics`
+    already supports replacing a not-yet-started outline wholesale — see
+    that function's own docstring). Closes the gap `handle_review_turn`
+    used to flag as unaddressed (Architecture §10/PRD §11 item 6).
+
+    Never raises past this function — a grounding failure (Tavily has
+    nothing usable for the extracted skill name, or any `_STAGE_
+    EXCEPTIONS`) degrades to `turn` unchanged plus a message explaining
+    the addition could not be grounded, rather than crashing the whole
+    review turn or silently dropping the request.
+    """
+    try:
+        new_addition = _run_async(ground_addition_request(user_message))
+    except _STAGE_EXCEPTIONS as exc:
+        return OutlineConfirmationTurn(
+            state=turn.state,
+            message=f"Couldn't process that addition request: {exc}",
+            topics=turn.topics,
+            concluded=turn.concluded,
+        )
+
+    if new_addition is None:
+        return OutlineConfirmationTurn(
+            state=turn.state,
+            message=(
+                "I couldn't find a reliable source for that addition, so "
+                "your outline wasn't changed."
+            ),
+            topics=turn.topics,
+            concluded=turn.concluded,
+        )
+
+    split = _core_and_emerging_skills(st.session_state.grounding_result)
+    if split is None:
+        return OutlineConfirmationTurn(
+            state=turn.state,
+            message="Cannot add to an outline without a grounded skill list.",
+            topics=turn.topics,
+            concluded=turn.concluded,
+        )
+    core_skills, emerging_skills = split
+
+    try:
+        regenerated_turn: OutlineConfirmationTurn = _run_async(
+            regenerate_outline_with_addition(
+                turn.state,
+                st.session_state.resolved_role,
+                core_skills,
+                emerging_skills,
+                new_addition,
+            )
+        )
+        persisted = insert_outline_topics(
+            session, st.session_state.user_id, regenerated_turn.topics
+        )
+    except _STAGE_EXCEPTIONS as exc:
+        return OutlineConfirmationTurn(
+            state=turn.state,
+            message=f"Couldn't regenerate the outline: {exc}",
+            topics=turn.topics,
+            concluded=turn.concluded,
+        )
+
+    st.session_state.outline_topics = regenerated_turn.topics
+    st.session_state.persisted_topics = persisted
+    return regenerated_turn
+
+
 def _render_outline_confirmation() -> None:
     """The real bounded Outline Confirmation loop (PRD §7.5): the current
     outline shown alongside a `st.chat_message`/`st.chat_input` review
     conversation, every turn computed by `begin_outline_confirmation`/
-    `handle_review_turn` — this function renders exactly what those
-    return and owns no classification/round-bound logic of its own.
-
-    **Known, flagged scope boundary — addition requests are acknowledged
-    but never regenerate the outline.** `handle_review_turn`'s own
-    docstring states this explicitly: folding a user's requested addition
-    into the outline requires that addition to already be a grounded
-    `ValidatedGroundedContent` (a live single-skill lookup), which
-    `handle_review_turn` deliberately does not do itself — "how a raw
-    addition request gets grounded... is a separate, unaddressed design
-    question." Confirmed by grep before writing this function: no
-    single-skill grounding function exists anywhere in this codebase
-    (only `ground_role`, which grounds an entire role's full skill list).
-    Calling `regenerate_outline_with_addition` with a fabricated
-    `ValidatedGroundedContent` would violate CLAUDE.md guardrail #1
-    (never invent a `source_url`), so this function does not call it at
-    all — an addition request still consumes a round exactly as
-    `advance_after_review_turn` dictates (via `handle_review_turn`), the
-    acknowledgment message is shown, but the outline itself is left
-    unchanged (`handle_review_turn` already returns the same `topics` list
-    unchanged for this action) and the limitation is surfaced to the user
-    via the caption below rather than silently absorbed.
+    `handle_review_turn` — this function renders what those return, plus
+    one addition-specific follow-up: an `ADDITION_REQUEST` turn is passed
+    to `_regenerate_outline_for_addition`, which grounds the raw request
+    and regenerates the outline (see that function's own docstring). This
+    function still owns no classification/round-bound logic of its own —
+    that follow-up is a mechanical consequence of a round already
+    consumed by `handle_review_turn`, not a second review round.
     """
     st.header("Outline Confirmation")
+    session = _get_db_session()
 
     if st.session_state.outline_confirmation_turn is None:
         try:
@@ -738,12 +849,6 @@ def _render_outline_confirmation() -> None:
                 _advance_to_day_one()
             return
 
-        st.caption(
-            "Requesting an addition here is acknowledged and consumes a "
-            "review round, but can't yet regenerate the outline — "
-            "grounding a raw addition into a real, sourced topic isn't "
-            "wired up yet (see Architecture §10/PRD §11 item 6)."
-        )
         user_message = st.chat_input(
             "Ask a question, raise a concern, request an addition, or confirm"
         )
@@ -769,6 +874,15 @@ def _render_outline_confirmation() -> None:
         st.session_state.outline_confirmation_conversation.append(
             {"role": "agent", "content": next_turn.message}
         )
+
+        if next_turn.action is OutlineReviewAction.ADDITION_REQUEST:
+            next_turn = _regenerate_outline_for_addition(
+                session, next_turn, user_message
+            )
+            st.session_state.outline_confirmation_conversation.append(
+                {"role": "agent", "content": next_turn.message}
+            )
+
         st.session_state.outline_confirmation_turn = next_turn
         st.rerun()
 
@@ -806,6 +920,44 @@ def _build_verification_source(
         content.theory_links[0]["url"] if content.theory_links else topic["source_url"]
     )
     return topic_source_material, source_url
+
+
+def _day_coaching_steps(
+    content: DayContent,
+) -> list[tuple[str, str, Callable[[], None]]]:
+    """The Day-by-Day Coaching sections to reveal, in order, as
+    (container key, kicker label, render fn) — `_render_day_by_day_
+    coaching` shows one more of these each time "Next" is clicked
+    (`day_coaching_step_index`), rather than all at once. Hands-on/Review
+    are conditionally present, exactly as the old all-at-once rendering
+    already conditioned them on `content.hands_on_exercise`/
+    `content.review_prompt`.
+    """
+
+    def _render_theory() -> None:
+        st.write(content.theory_framing)
+        if content.theory_links:
+            _render_citations(content.theory_links)
+
+    steps: list[tuple[str, str, Callable[[], None]]] = [
+        ("day-summary", "Summary", lambda: st.write(content.summary)),
+        ("day-theory", "Theory", _render_theory),
+    ]
+    if content.hands_on_exercise:
+        steps.append(
+            (
+                "day-hands-on",
+                "Hands-on exercise",
+                lambda: st.write(content.hands_on_exercise),
+            )
+        )
+    if content.review_prompt:
+        steps.append(("day-review", "Review", lambda: st.write(content.review_prompt)))
+    steps.append(
+        ("day-reflection", "Reflection", lambda: st.write(content.reflection_prompt))
+    )
+    steps.append(("day-preview", "Preview", lambda: st.write(content.preview)))
+    return steps
 
 
 def _render_day_by_day_coaching() -> None:
@@ -846,6 +998,7 @@ def _render_day_by_day_coaching() -> None:
             generated_content,
         )
         st.session_state.day_content = generated_content
+        st.session_state.day_coaching_step_index = 0
 
     content: DayContent = st.session_state.day_content
 
@@ -855,33 +1008,18 @@ def _render_day_by_day_coaching() -> None:
     with stamp_col:
         _render_stamp(topic["confidence"], topic["source_url"])
 
-    with st.container(border=True, key="ns-card-day-summary"):
-        _render_kicker("Summary")
-        st.write(content.summary)
+    steps = _day_coaching_steps(content)
+    step_index = min(st.session_state.day_coaching_step_index, len(steps) - 1)
+    for key, label, render_step in steps[: step_index + 1]:
+        with st.container(border=True, key=f"ns-card-{key}"):
+            _render_kicker(label)
+            render_step()
 
-    with st.container(border=True, key="ns-card-day-theory"):
-        _render_kicker("Theory")
-        st.write(content.theory_framing)
-        if content.theory_links:
-            _render_citations(content.theory_links)
-
-    if content.hands_on_exercise:
-        with st.container(border=True, key="ns-card-day-hands-on"):
-            _render_kicker("Hands-on exercise")
-            st.write(content.hands_on_exercise)
-
-    if content.review_prompt:
-        with st.container(border=True, key="ns-card-day-review"):
-            _render_kicker("Review")
-            st.write(content.review_prompt)
-
-    with st.container(border=True, key="ns-card-day-reflection"):
-        _render_kicker("Reflection")
-        st.write(content.reflection_prompt)
-
-    with st.container(border=True, key="ns-card-day-preview"):
-        _render_kicker("Preview")
-        st.write(content.preview)
+    if step_index < len(steps) - 1:
+        if st.button("Next"):
+            st.session_state.day_coaching_step_index += 1
+            st.rerun()
+        return
 
     if content.remaining_content:
         st.info(
@@ -892,10 +1030,11 @@ def _render_day_by_day_coaching() -> None:
             st.session_state.day_number_for_topic += 1
             st.session_state.carried_over_content = content.remaining_content
             st.session_state.day_content = None
+            st.session_state.day_coaching_step_index = 0
             st.rerun()
         return
 
-    if st.button("Start Verification", type="primary"):
+    if st.button("Start Quiz", type="primary"):
         source_material, source_url = _build_verification_source(content, topic)
         st.session_state.verification_source_material = source_material
         st.session_state.verification_source_url = source_url
@@ -945,6 +1084,7 @@ def _advance_after_topic_completion(session: Session) -> None:
         st.session_state.day_number_for_topic = 1
         st.session_state.carried_over_content = None
         st.session_state.day_content = None
+        st.session_state.day_coaching_step_index = 0
         st.session_state.last_completion_result = None
         st.session_state.current_stage = PipelineStage.DAY_BY_DAY_COACHING.value
         st.rerun()
