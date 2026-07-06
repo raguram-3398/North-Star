@@ -123,6 +123,19 @@ GEMINI_RETRY_BASE_DELAY_SECONDS = 1.0
 # ~30-60s ceiling this was scoped against.
 GEMINI_RETRY_MAX_DELAY_SECONDS = 30.0
 
+# Outer ceiling on the ENTIRE retry sequence inside
+# `_generate_content_with_retry` (every attempt's own
+# EXTERNAL_CALL_TIMEOUT_SECONDS wait *plus* every backoff sleep between
+# them) — distinct from that per-attempt timeout. Worst case: 5 attempts
+# (1 + GEMINI_RETRY_MAX_ATTEMPTS) x EXTERNAL_CALL_TIMEOUT_SECONDS (50s)
+# + the 4 nominal backoff waits (1+2+4+8=15s) = ~65s. Set with generous
+# margin above that so the retry loop always gets to run its own full
+# course rather than being cut off by an outer deadline shorter than its
+# own worst case (the real incident this fixes: a live Outline Creation
+# call raised a bare TimeoutError during a burst of transient 503s,
+# before the retry loop had a chance to finish).
+GEMINI_RETRY_LOOP_TIMEOUT_SECONDS = 120.0
+
 # Simple pacing guard between Gemini calls (not a queue): a pipeline run
 # routinely fires several Gemini-backed steps back to back (Clarify Gate
 # -> Grounding -> Outline Creation), and Gemini's free tier enforces its
@@ -135,6 +148,15 @@ GEMINI_RETRY_MAX_DELAY_SECONDS = 30.0
 # across unrelated tests sharing one pytest process).
 GEMINI_MIN_CALL_INTERVAL_SECONDS = 1.0
 _last_gemini_call_started_at: float | None = None
+# Serializes the guard's check-wait-update sequence. Without this, two
+# concurrent callers can both read the same stale
+# `_last_gemini_call_started_at`, both compute a wait relative to it, and
+# both finish their waits and fire their real calls around the same time
+# — the guard would hold "by convention" but not actually prevent two
+# real Gemini calls from firing close together, since `await
+# asyncio.sleep(...)` yields the event loop between the check and the
+# update.
+_gemini_pacing_lock = asyncio.Lock()
 
 HIMALAYAS_MCP_URL = "https://mcp.himalayas.app/mcp"
 
@@ -518,14 +540,26 @@ async def _pace_gemini_call() -> None:
     two Gemini calls this process makes — see that constant's own comment
     for why this is a simple pacing guard, not a queue, and why it's
     module-level rather than per-caller.
+
+    Serialized via `_gemini_pacing_lock`: the check (read
+    `_last_gemini_call_started_at`), the wait, and the update all happen
+    while holding the lock, so a second concurrent caller can't read the
+    same stale timestamp while the first is still sleeping — without the
+    lock, `await asyncio.sleep(...)` yields the event loop between the
+    check and the update, letting two callers both compute a wait from
+    the same stale baseline and fire their real calls close together
+    anyway (the guard would hold "by convention" but not in fact).
     """
     global _last_gemini_call_started_at
-    now = time.monotonic()
-    if _last_gemini_call_started_at is not None:
-        wait = GEMINI_MIN_CALL_INTERVAL_SECONDS - (now - _last_gemini_call_started_at)
-        if wait > 0:
-            await asyncio.sleep(wait)
-    _last_gemini_call_started_at = time.monotonic()
+    async with _gemini_pacing_lock:
+        now = time.monotonic()
+        if _last_gemini_call_started_at is not None:
+            wait = GEMINI_MIN_CALL_INTERVAL_SECONDS - (
+                now - _last_gemini_call_started_at
+            )
+            if wait > 0:
+                await asyncio.sleep(wait)
+        _last_gemini_call_started_at = time.monotonic()
 
 
 async def _generate_content_with_retry(
@@ -552,41 +586,65 @@ async def _generate_content_with_retry(
     raises `GeminiCallError` immediately, with a real, diagnosable
     message (`_format_gemini_error`) rather than a bare
     "Gemini call failed:" with nothing after the colon.
+
+    The whole retry sequence (every attempt plus every backoff wait) is
+    itself wrapped in `GEMINI_RETRY_LOOP_TIMEOUT_SECONDS` — see that
+    constant's own comment for why: without an outer ceiling here, only
+    each *individual* attempt was ever bounded, so nothing prevented some
+    other, tighter external deadline from cutting the whole sequence off
+    with a bare, unhelpful `TimeoutError` before it could finish.
     """
-    client = _get_gemini_client()
-    last_error: Exception = GeminiCallError("Gemini call failed: no attempt was made")
-    for attempt in range(GEMINI_RETRY_MAX_ATTEMPTS + 1):
-        await _pace_gemini_call()
-        try:
-            return await asyncio.wait_for(
-                client.aio.models.generate_content(
-                    model=model, contents=contents, config=config
-                ),
-                timeout=EXTERNAL_CALL_TIMEOUT_SECONDS,
-            )
-        except Exception as exc:  # noqa: BLE001 — see this function's own
-            # docstring: every Gemini-side failure becomes a
-            # GeminiCallError with a real message; only a transient
-            # 429/503 is retried, everything else raises immediately.
-            last_error = exc
-            if attempt < GEMINI_RETRY_MAX_ATTEMPTS and _is_retryable_gemini_error(exc):
-                delay = min(
-                    GEMINI_RETRY_MAX_DELAY_SECONDS,
-                    GEMINI_RETRY_BASE_DELAY_SECONDS * (2**attempt),
+
+    async def _run_attempts() -> Any:
+        client = _get_gemini_client()
+        last_error: Exception = GeminiCallError(
+            "Gemini call failed: no attempt was made"
+        )
+        for attempt in range(GEMINI_RETRY_MAX_ATTEMPTS + 1):
+            await _pace_gemini_call()
+            try:
+                return await asyncio.wait_for(
+                    client.aio.models.generate_content(
+                        model=model, contents=contents, config=config
+                    ),
+                    timeout=EXTERNAL_CALL_TIMEOUT_SECONDS,
                 )
-                await asyncio.sleep(delay / 2 + random.uniform(0, delay / 2))
-                continue
-            raise GeminiCallError(
-                f"Gemini call failed: {_format_gemini_error(exc)}"
-            ) from exc
-    # Unreachable: GEMINI_RETRY_MAX_ATTEMPTS + 1 >= 1, so the loop above
-    # always either returns or raises on its final iteration. Kept as an
-    # explicit fallback (not `assert False`) so a future change to the
-    # loop bounds fails loudly with the real last error, not a silent
-    # `None`/missing-return bug.
-    raise GeminiCallError(
-        f"Gemini call failed: {_format_gemini_error(last_error)}"
-    ) from last_error
+            except Exception as exc:  # noqa: BLE001 — see this function's
+                # own docstring: every Gemini-side failure becomes a
+                # GeminiCallError with a real message; only a transient
+                # 429/503 is retried, everything else raises immediately.
+                last_error = exc
+                if attempt < GEMINI_RETRY_MAX_ATTEMPTS and _is_retryable_gemini_error(
+                    exc
+                ):
+                    delay = min(
+                        GEMINI_RETRY_MAX_DELAY_SECONDS,
+                        GEMINI_RETRY_BASE_DELAY_SECONDS * (2**attempt),
+                    )
+                    await asyncio.sleep(delay / 2 + random.uniform(0, delay / 2))
+                    continue
+                raise GeminiCallError(
+                    f"Gemini call failed: {_format_gemini_error(exc)}"
+                ) from exc
+        # Unreachable: GEMINI_RETRY_MAX_ATTEMPTS + 1 >= 1, so the loop
+        # above always either returns or raises on its final iteration.
+        # Kept as an explicit fallback (not `assert False`) so a future
+        # change to the loop bounds fails loudly with the real last
+        # error, not a silent `None`/missing-return bug.
+        raise GeminiCallError(
+            f"Gemini call failed: {_format_gemini_error(last_error)}"
+        ) from last_error
+
+    try:
+        return await asyncio.wait_for(
+            _run_attempts(), timeout=GEMINI_RETRY_LOOP_TIMEOUT_SECONDS
+        )
+    except TimeoutError as exc:  # asyncio.TimeoutError is this since 3.11
+        raise GeminiCallError(
+            "Gemini call failed: the full retry sequence exceeded "
+            f"GEMINI_RETRY_LOOP_TIMEOUT_SECONDS ({GEMINI_RETRY_LOOP_TIMEOUT_SECONDS}s) "
+            "across all attempts and backoff waits"
+        ) from exc
 
 
 async def _call_gemini_text(prompt: str, model: str = SHORT_TURN_GEMINI_MODEL) -> str:
