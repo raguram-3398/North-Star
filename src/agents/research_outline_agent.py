@@ -40,6 +40,8 @@ CLAUDE.md's LLM Call Discipline.
 
 import asyncio
 import json
+import random
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Literal
@@ -104,6 +106,35 @@ from utils.exceptions import (
 # Reuses the 10s convention already established in db/connection.py and
 # tests/spike_grounding_connectivity.py.
 EXTERNAL_CALL_TIMEOUT_SECONDS = 10
+
+# Retry/backoff for transient Gemini errors only — 429 (RESOURCE_EXHAUSTED,
+# rate limit) and 503 (UNAVAILABLE, transient overload), Google's own
+# documented pattern for these two specific response codes: exponential
+# backoff with jitter, bounded by a small retry count. Deliberately never
+# applied to any other error (a 400 bad request, a 401/403 auth failure,
+# a genuine timeout) — those aren't transient, so retrying them would
+# only waste calls/time, never change the outcome.
+GEMINI_RETRYABLE_STATUS_CODES = frozenset({429, 503})
+GEMINI_RETRY_MAX_ATTEMPTS = 4  # retries beyond the first attempt
+GEMINI_RETRY_BASE_DELAY_SECONDS = 1.0
+# Per-attempt cap. Nominal (jitter-free) delays across 4 retries starting
+# at 1s double each time (1, 2, 4, 8s) — this cap is headroom, not the
+# expected value, sized to keep worst-case total retry time within the
+# ~30-60s ceiling this was scoped against.
+GEMINI_RETRY_MAX_DELAY_SECONDS = 30.0
+
+# Simple pacing guard between Gemini calls (not a queue): a pipeline run
+# routinely fires several Gemini-backed steps back to back (Clarify Gate
+# -> Grounding -> Outline Creation), and Gemini's free tier enforces its
+# rate limit per-project across every call this process makes, not
+# per-key (confirmed via Google's own docs) — so a minimum gap between
+# calls is real pacing, not a workaround for a key-specific limit.
+# Module-level state, not per-caller, since the limit itself is
+# process-wide. tests/conftest.py disables this globally for the test
+# suite (module-level state would otherwise persist and trigger delays
+# across unrelated tests sharing one pytest process).
+GEMINI_MIN_CALL_INTERVAL_SECONDS = 1.0
+_last_gemini_call_started_at: float | None = None
 
 HIMALAYAS_MCP_URL = "https://mcp.himalayas.app/mcp"
 
@@ -445,35 +476,136 @@ def _last_agent_message(conversation: ConversationHistory) -> str:
     )
 
 
+def _format_gemini_error(exc: BaseException) -> str:
+    """Build a diagnosable message from a Gemini SDK exception — never
+    just the bare exception with nothing after it (the "swallowed error"
+    bug this function exists to fix). Prefers the google-genai SDK's own
+    structured `code`/`status`/`message` fields, present on
+    `google.genai.errors.APIError` and its `ClientError`/`ServerError`
+    subclasses (e.g. `429 RESOURCE_EXHAUSTED: <quota message>` for a rate
+    limit) — `str(exc)` already includes these for that SDK's own error
+    types, but this is defensive against any exception type where it
+    doesn't. Falls back to `str(exc)` if that's non-empty, and to
+    `repr(exc)` as a last resort: a bare `asyncio.TimeoutError()` (raised
+    by `asyncio.wait_for` on a real timeout) stringifies to an EMPTY
+    string, which previously produced exactly "Gemini call failed: " with
+    nothing after the colon.
+    """
+    code = getattr(exc, "code", None)
+    status = getattr(exc, "status", None)
+    message = getattr(exc, "message", None)
+    if code is not None or status is not None or message is not None:
+        return f"{code} {status}: {message}".strip()
+    text = str(exc)
+    if text:
+        return text
+    return repr(exc)
+
+
+def _is_retryable_gemini_error(exc: BaseException) -> bool:
+    """True only for a transient 429/503 (`GEMINI_RETRYABLE_STATUS_CODES`)
+    — identified via the google-genai SDK's own `.code` attribute, the
+    real HTTP status code on `ClientError`/`ServerError`
+    (`google.genai.errors.APIError` subclasses). Any exception without a
+    matching `.code` (a malformed-request 400, an auth failure, a bare
+    `asyncio.TimeoutError`, a connection error) is never retryable here.
+    """
+    return getattr(exc, "code", None) in GEMINI_RETRYABLE_STATUS_CODES
+
+
+async def _pace_gemini_call() -> None:
+    """Enforce `GEMINI_MIN_CALL_INTERVAL_SECONDS` between the start of any
+    two Gemini calls this process makes — see that constant's own comment
+    for why this is a simple pacing guard, not a queue, and why it's
+    module-level rather than per-caller.
+    """
+    global _last_gemini_call_started_at
+    now = time.monotonic()
+    if _last_gemini_call_started_at is not None:
+        wait = GEMINI_MIN_CALL_INTERVAL_SECONDS - (now - _last_gemini_call_started_at)
+        if wait > 0:
+            await asyncio.sleep(wait)
+    _last_gemini_call_started_at = time.monotonic()
+
+
+async def _generate_content_with_retry(
+    model: str,
+    contents: str,
+    config: genai_types.GenerateContentConfig | None = None,
+) -> Any:
+    """The one shared low-level Gemini call every reasoning step in this
+    codebase eventually routes through — directly here, or via
+    `_call_gemini_text`/`_call_gemini_json` below, which every other
+    module's Gemini-backed function calls (`agents/coaching_pace_agent.py`,
+    `.agent/skills/verification_question_generator/generator.py`). This
+    was previously duplicated between `_call_gemini_text` and
+    `_call_gemini_json` (each called `client.aio.models.generate_content`
+    directly); now there is genuinely one place, not two, that owns
+    pacing, the explicit timeout (CLAUDE.md guardrail #14), and retry.
+
+    Retries only a transient 429/503 (`_is_retryable_gemini_error`), up to
+    `GEMINI_RETRY_MAX_ATTEMPTS` additional attempts, with exponential
+    backoff plus equal-jitter (half the computed delay, plus a random
+    amount up to the other half) — Google's own documented pattern for
+    these two specific transient errors. Any other failure (a bad
+    request, an auth error, a genuine timeout, an exhausted retry budget)
+    raises `GeminiCallError` immediately, with a real, diagnosable
+    message (`_format_gemini_error`) rather than a bare
+    "Gemini call failed:" with nothing after the colon.
+    """
+    client = _get_gemini_client()
+    last_error: Exception = GeminiCallError("Gemini call failed: no attempt was made")
+    for attempt in range(GEMINI_RETRY_MAX_ATTEMPTS + 1):
+        await _pace_gemini_call()
+        try:
+            return await asyncio.wait_for(
+                client.aio.models.generate_content(
+                    model=model, contents=contents, config=config
+                ),
+                timeout=EXTERNAL_CALL_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:  # noqa: BLE001 — see this function's own
+            # docstring: every Gemini-side failure becomes a
+            # GeminiCallError with a real message; only a transient
+            # 429/503 is retried, everything else raises immediately.
+            last_error = exc
+            if attempt < GEMINI_RETRY_MAX_ATTEMPTS and _is_retryable_gemini_error(exc):
+                delay = min(
+                    GEMINI_RETRY_MAX_DELAY_SECONDS,
+                    GEMINI_RETRY_BASE_DELAY_SECONDS * (2**attempt),
+                )
+                await asyncio.sleep(delay / 2 + random.uniform(0, delay / 2))
+                continue
+            raise GeminiCallError(
+                f"Gemini call failed: {_format_gemini_error(exc)}"
+            ) from exc
+    # Unreachable: GEMINI_RETRY_MAX_ATTEMPTS + 1 >= 1, so the loop above
+    # always either returns or raises on its final iteration. Kept as an
+    # explicit fallback (not `assert False`) so a future change to the
+    # loop bounds fails loudly with the real last error, not a silent
+    # `None`/missing-return bug.
+    raise GeminiCallError(
+        f"Gemini call failed: {_format_gemini_error(last_error)}"
+    ) from last_error
+
+
 async def _call_gemini_text(prompt: str, model: str = SHORT_TURN_GEMINI_MODEL) -> str:
     """Call Gemini with a plain-text prompt and return the response text,
     stripped. Raises `GeminiCallError` if the call fails, times out, or
-    returns no text at all.
+    returns no text at all — see `_generate_content_with_retry` for the
+    retry/backoff/pacing this now goes through.
 
     Shared across every Gemini-backed reasoning step in this module (not
     clarify-gate-specific despite the default `model`) — callers pass an
     explicit `model` when they need a different tier (e.g.
     `OUTLINE_HIERARCHY_GEMINI_MODEL`).
     """
-    client = _get_gemini_client()
-    try:
-        response = await asyncio.wait_for(
-            client.aio.models.generate_content(
-                model=model,
-                contents=prompt,
-            ),
-            timeout=EXTERNAL_CALL_TIMEOUT_SECONDS,
-        )
-    except Exception as exc:  # noqa: BLE001 — see module docstring: any
-        # Gemini-side failure (connection, API error, or timeout) is a
-        # GeminiCallError, never left as a bare SDK/asyncio exception
-        # for the caller to guess at.
-        raise GeminiCallError(f"Gemini call failed: {exc}") from exc
+    response = await _generate_content_with_retry(model=model, contents=prompt)
 
     text = response.text
     if not text or not text.strip():
         raise GeminiCallError("Gemini returned an empty response")
-    return text.strip()
+    return str(text).strip()
 
 
 async def _call_gemini_json(
@@ -486,27 +618,19 @@ async def _call_gemini_json(
     Raises `GeminiCallError` if the call fails/times out, the response
     is not valid JSON, the parsed value is not a JSON object, or any of
     `required_keys` is missing — never returns a partially-valid dict for
-    the caller to guess at.
+    the caller to guess at. See `_generate_content_with_retry` for the
+    retry/backoff/pacing this now goes through.
 
     Shared across every Gemini-backed reasoning step in this module (not
     clarify-gate-specific despite the default `model`) — callers pass an
     explicit `model` when they need a different tier (e.g.
     `OUTLINE_HIERARCHY_GEMINI_MODEL`).
     """
-    client = _get_gemini_client()
-    try:
-        response = await asyncio.wait_for(
-            client.aio.models.generate_content(
-                model=model,
-                contents=prompt,
-                config=genai_types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                ),
-            ),
-            timeout=EXTERNAL_CALL_TIMEOUT_SECONDS,
-        )
-    except Exception as exc:  # noqa: BLE001 — see _call_gemini_text
-        raise GeminiCallError(f"Gemini call failed: {exc}") from exc
+    response = await _generate_content_with_retry(
+        model=model,
+        contents=prompt,
+        config=genai_types.GenerateContentConfig(response_mime_type="application/json"),
+    )
 
     raw_text = response.text
     if not raw_text or not raw_text.strip():

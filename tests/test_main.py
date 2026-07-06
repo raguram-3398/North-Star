@@ -72,6 +72,10 @@ def test_intake_creates_user_and_advances_to_clarify_gate(
 
     at = _make_at()
     at.run()
+    assert at.session_state["current_stage"] == "landing"
+    at.button[0].click()  # "Begin" on the new Landing stage
+    at.run()
+
     at.text_input[1].input("Backend Engineer")
     at.button[0].click()
     at.run()

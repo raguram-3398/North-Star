@@ -95,12 +95,14 @@ import asyncio
 from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
+from urllib.parse import urlparse
 
 import streamlit as st
 from dotenv import load_dotenv
 from sqlalchemy.orm import Session
 
 from agents.coaching_pace_agent import (
+    FULL_CREDIT,
     DayContent,
     TopicCompletionResult,
     VerificationSlotState,
@@ -152,11 +154,14 @@ NOT_STARTED_STATUS = "not_started"
 
 
 class PipelineStage(Enum):
-    """The 8 pipeline stages a user navigates through (PRD §7.1). Pace
-    tracking / patch-notes / enrichment are intentionally absent — see
-    module docstring.
+    """The 8 pipeline stages a user navigates through (PRD §7.1), plus
+    `LANDING` — a new, purely presentational entry point ahead of Intake
+    (the visual-pass task), not a PRD-numbered pipeline stage of its own.
+    Pace tracking / patch-notes / enrichment are intentionally absent —
+    see module docstring.
     """
 
+    LANDING = "landing"
     INTAKE = "intake"
     CLARIFY_GATE = "clarify_gate"
     RESEARCH_GROUNDING = "research_grounding"
@@ -216,7 +221,7 @@ def _init_session_state() -> None:
     """
     defaults: dict[str, Any] = {
         "db_session": None,
-        "current_stage": PipelineStage.INTAKE.value,
+        "current_stage": PipelineStage.LANDING.value,
         "user_id": None,
         "stated_goal": None,
         "clarify_turn": None,
@@ -250,23 +255,172 @@ def _get_db_session() -> Session:
     return session
 
 
+# --- Shared presentation helpers (visual-pass task, native-Streamlit) ---
+#
+# Pure presentation, no session-state, no business logic. A prior version
+# of this module injected a custom CSS color-token system (a from-scratch
+# palette as raw `<style>`). That caused a real contrast bug: it forced
+# every page's *background* to a fixed light color without also forcing
+# every element's *text* color, so plain text left on Streamlit's own
+# theme-dependent default color could render near-white-on-near-white
+# whenever the active Streamlit theme was dark. Per product decision,
+# this reverts to Streamlit's default theme entirely rather than patching
+# the custom palette in place — every helper below renders through a
+# native Streamlit component (`st.caption`/`st.info`/`st.success`/
+# `st.warning`), each of which Streamlit itself keeps legible against
+# whatever theme is active, not a fixed hex value this module owns.
+
+
+def _domain_from_url(url: str) -> str:
+    """Presentation-only: the host portion of `url`, for a compact
+    citation display. Falls back to the full URL if it can't be parsed —
+    never raises, since a citation must always be shown, not dropped.
+    """
+    return urlparse(url).netloc or url
+
+
+def _render_kicker(label: str) -> None:
+    """A small section label (e.g. "Summary", "Theory") — native
+    `st.caption`, Streamlit's own muted small-text component.
+    """
+    st.caption(f"**{label.upper()}**")
+
+
+def _render_stamp(confidence: str, source_url: str, *, sample: bool = False) -> None:
+    """Render the Confidence Stamp — this product's signature element —
+    via native `st.info`, so it always matches Streamlit's own theme
+    rather than a fixed custom color. Pure presentation over an
+    already-computed/fetched confidence tier and source_url — never
+    computes or validates either itself (that's `security/output_guard.py`
+    and the confidence ladder, upstream of this function).
+
+    `sample=True` prefixes the message with an explicit "SAMPLE" label on
+    the same line as the stamp itself, so a demo viewer can never mistake
+    the Landing page's illustrative mockup for a real grounded result —
+    this product's whole pitch is honesty about real confidence, so the
+    one place this stamp isn't real data must say so unambiguously, not
+    just be implied by page context.
+    """
+    domain = _domain_from_url(source_url)
+    prefix = "SAMPLE — " if sample else ""
+    st.info(f"{prefix}CONFIDENCE: {confidence.upper()} · source: {domain}")
+
+
+def _render_citations(links: list[dict[str, str]]) -> None:
+    """One caption line per citation — title (or domain, if untitled) plus
+    the domain — native `st.caption`, no custom color.
+    """
+    for link in links:
+        domain = _domain_from_url(link["url"])
+        title = (link.get("title") or "").strip()
+        label = title if title else domain
+        st.caption(f"Source: {label} — {domain}")
+
+
+def _render_progress_dots(current_question_number: int, total: int = 5) -> None:
+    """The Verification screen's step tracker — plain markdown text (done
+    questions struck through, the current one bolded) via `st.caption`,
+    no custom color needed to distinguish state.
+    """
+    parts = []
+    for n in range(1, total + 1):
+        if n < current_question_number:
+            parts.append(f"~~{n}~~")
+        elif n == current_question_number:
+            parts.append(f"**{n}**")
+        else:
+            parts.append(str(n))
+    st.caption("Question " + "  ·  ".join(parts) + f" of {total}")
+
+
+def _render_attempt_chips(attempt_number: int, max_attempts: int = 3) -> None:
+    """Attempt-number markers (1/2/3) for the current verification
+    question — same plain-markdown treatment as `_render_progress_dots`.
+    """
+    parts = []
+    for n in range(1, max_attempts + 1):
+        if n < attempt_number:
+            parts.append(f"~~attempt {n}~~")
+        elif n == attempt_number:
+            parts.append(f"**attempt {n}**")
+        else:
+            parts.append(f"attempt {n}")
+    st.caption("  ·  ".join(parts))
+
+
+# --- Landing (visual-pass task — new entry point ahead of Intake) -------
+
+
+def _render_landing() -> None:
+    st.subheader(
+        "Grounded, verified, adaptive career learning coaching — for "
+        "people without a bootcamp or a mentor."
+    )
+    st.write(
+        "No bootcamp. No mentor. Just a cited, adaptive study plan built "
+        "from what companies are actually hiring for right now — every "
+        "topic and every check-in traces back to a real source, "
+        "labeled with how confident we actually are in it."
+    )
+
+    col1, col2, col3 = st.columns(3)
+    pillars = (
+        (col1, "GROUNDED", "Every topic comes from live job-market data, not a guess."),
+        (
+            col2,
+            "VERIFIED",
+            "Five source-anchored questions confirm real understanding.",
+        ),
+        (
+            col3,
+            "ADAPTIVE",
+            "Pace adjusts to you — content is never removed, only extended.",
+        ),
+    )
+    for col, kicker, body in pillars:
+        with col.container(border=True, key=f"ns-card-landing-{kicker.lower()}"):
+            _render_kicker(kicker)
+            st.write(body)
+
+    st.write("")
+    _render_kicker("What a real citation looks like")
+    _render_stamp("high", "https://www.example-job-board.com/listing", sample=True)
+
+    st.write("")
+    if st.button("Begin", type="primary"):
+        st.session_state.current_stage = PipelineStage.INTAKE.value
+        st.rerun()
+
+
 # --- Intake (PRD §7.1 stage 1 / §7.2) ------------------------------------
 
 
 def _render_intake() -> None:
+    """Restyled per the approved visual-pass design plan — same fields,
+    same validation, same `create_user` call below, only their layout
+    changed (columns for the paired fields, a bordered "Destination" card
+    around the goal/time fields since everything downstream depends on
+    them). No widget was added, removed, or changed in type.
+    """
     st.header("Intake")
+    _render_kicker("Step 1 — tell us where you're starting from")
     with st.form("intake_form"):
-        background = st.text_area("Background")
-        current_job = st.text_input("Current job")
-        years_experience = st.number_input(
+        job_col, years_col = st.columns(2)
+        current_job = job_col.text_input("Current job")
+        years_experience = years_col.number_input(
             "Years of experience", min_value=0, step=1, value=0
         )
+        background = st.text_area("Background")
         prior_self_study = st.text_area("Prior self-study (specific, not yes/no)")
-        goal = st.text_input("What tech role or skill do you want to learn?")
-        available_time_per_week = st.number_input(
-            "Available time per week (hours)", min_value=1, step=1, value=10
-        )
-        submitted = st.form_submit_button("Submit")
+
+        with st.container(border=True, key="ns-card-intake-destination"):
+            _render_kicker("Your destination")
+            goal = st.text_input("What tech role or skill do you want to learn?")
+            available_time_per_week = st.number_input(
+                "Available time per week (hours)", min_value=1, step=1, value=10
+            )
+
+        submitted = st.form_submit_button("Submit", type="primary")
 
     if not submitted:
         return
@@ -694,23 +848,40 @@ def _render_day_by_day_coaching() -> None:
         st.session_state.day_content = generated_content
 
     content: DayContent = st.session_state.day_content
-    st.caption(f"Day {st.session_state.day_number_for_topic} of this topic")
-    st.write("**Summary**")
-    st.write(content.summary)
-    st.write("**Theory**")
-    st.write(content.theory_framing)
-    for link in content.theory_links:
-        st.write(f"- [{link['title'] or link['url']}]({link['url']})")
+
+    badge_col, stamp_col = st.columns([1, 2])
+    with badge_col:
+        _render_kicker(f"Day {st.session_state.day_number_for_topic} of this topic")
+    with stamp_col:
+        _render_stamp(topic["confidence"], topic["source_url"])
+
+    with st.container(border=True, key="ns-card-day-summary"):
+        _render_kicker("Summary")
+        st.write(content.summary)
+
+    with st.container(border=True, key="ns-card-day-theory"):
+        _render_kicker("Theory")
+        st.write(content.theory_framing)
+        if content.theory_links:
+            _render_citations(content.theory_links)
+
     if content.hands_on_exercise:
-        st.write("**Hands-on exercise**")
-        st.write(content.hands_on_exercise)
+        with st.container(border=True, key="ns-card-day-hands-on"):
+            _render_kicker("Hands-on exercise")
+            st.write(content.hands_on_exercise)
+
     if content.review_prompt:
-        st.write("**Review**")
-        st.write(content.review_prompt)
-    st.write("**Reflection**")
-    st.write(content.reflection_prompt)
-    st.write("**Preview**")
-    st.write(content.preview)
+        with st.container(border=True, key="ns-card-day-review"):
+            _render_kicker("Review")
+            st.write(content.review_prompt)
+
+    with st.container(border=True, key="ns-card-day-reflection"):
+        _render_kicker("Reflection")
+        st.write(content.reflection_prompt)
+
+    with st.container(border=True, key="ns-card-day-preview"):
+        _render_kicker("Preview")
+        st.write(content.preview)
 
     if content.remaining_content:
         st.info(
@@ -724,7 +895,7 @@ def _render_day_by_day_coaching() -> None:
             st.rerun()
         return
 
-    if st.button("Start Verification"):
+    if st.button("Start Verification", type="primary"):
         source_material, source_url = _build_verification_source(content, topic)
         st.session_state.verification_source_material = source_material
         st.session_state.verification_source_url = source_url
@@ -807,7 +978,7 @@ def _render_verification() -> None:
         return
 
     question_number = st.session_state.current_question_number
-    st.write(f"Question {question_number} of 5")
+    _render_progress_dots(question_number)
 
     if st.session_state.verification_slot_state is None:
         try:
@@ -825,23 +996,38 @@ def _render_verification() -> None:
         st.session_state.verification_slot_state = first_slot_state
 
     state: VerificationSlotState = st.session_state.verification_slot_state
-    st.write(state.current_question.question_text)
+
+    with st.container(border=True, key="ns-card-verification-question"):
+        _render_kicker(f"Question {question_number} of 5")
+        st.write(state.current_question.question_text)
+        # Deliberately a plain citation, not `_render_stamp` — a
+        # verification question carries a `source_url` but no confidence
+        # tier of its own (that lives on the topic, not the question), so
+        # labeling it "CONFIDENCE: ..." here would fabricate a value this
+        # product's whole premise is to never fabricate.
+        _render_citations(
+            [{"title": "Source material", "url": state.current_question.source_url}]
+        )
 
     if state.resolved:
-        st.success(f"Resolved — credit: {state.credit}")
-        if state.taught_answer_message:
-            st.info(state.taught_answer_message)
-        if st.button("Next question"):
+        if state.credit == FULL_CREDIT:
+            st.success("✓ Correct — full credit")
+        else:
+            st.warning("◐ Partial credit — here's what you missed:")
+            if state.taught_answer_message:
+                st.write(state.taught_answer_message)
+        if st.button("Next question", type="primary"):
             st.session_state.current_question_number += 1
             st.session_state.verification_slot_state = None
             st.rerun()
         return
 
+    _render_attempt_chips(state.attempt_number)
     answer = st.text_input(
         f"Your answer (attempt {state.attempt_number} of 3)",
         key=f"verification_answer_{question_number}_{state.attempt_number}",
     )
-    if st.button("Submit answer"):
+    if st.button("Submit answer", type="primary"):
         try:
             new_state = _run_async(
                 submit_verification_answer(
@@ -889,6 +1075,7 @@ def _render_goal_completion() -> None:
 
 
 _STAGE_RENDERERS = {
+    PipelineStage.LANDING.value: _render_landing,
     PipelineStage.INTAKE.value: _render_intake,
     PipelineStage.CLARIFY_GATE.value: _render_clarify_gate,
     PipelineStage.RESEARCH_GROUNDING.value: _render_research_grounding,

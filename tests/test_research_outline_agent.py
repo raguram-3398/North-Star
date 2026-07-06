@@ -558,16 +558,26 @@ class _FakeGeminiModels:
     """Returns each of `responses` in order, one per call. Raises
     `AssertionError` (a test-authoring bug, not a code-under-test bug) if
     a test calls the fake client more times than it queued responses for.
+
+    `raise_exc` (always raised, every call) and `raise_exc_sequence` (one
+    entry consumed per call — `None` means "fall through to the next
+    queued response instead of raising") are mutually exclusive; the
+    latter is what the retry/backoff tests use to simulate "fails once,
+    then succeeds."
     """
 
     def __init__(
         self,
         responses: list[str] | None = None,
         raise_exc: Exception | None = None,
+        raise_exc_sequence: list[Exception | None] | None = None,
         sleep_seconds: float = 0.0,
     ) -> None:
         self._responses = list(responses or [])
         self._raise_exc = raise_exc
+        self._raise_exc_sequence = (
+            list(raise_exc_sequence) if raise_exc_sequence is not None else None
+        )
         self._sleep_seconds = sleep_seconds
         self.calls: list[dict] = []
 
@@ -575,7 +585,17 @@ class _FakeGeminiModels:
         self.calls.append({"model": model, "contents": contents, "config": config})
         if self._sleep_seconds:
             await asyncio.sleep(self._sleep_seconds)
-        if self._raise_exc is not None:
+        if self._raise_exc_sequence is not None:
+            if not self._raise_exc_sequence:
+                raise AssertionError(
+                    "_FakeGeminiModels ran out of queued raise_exc_sequence "
+                    "entries — the test queued fewer outcomes than the code "
+                    "under test actually calls Gemini"
+                )
+            exc = self._raise_exc_sequence.pop(0)
+            if exc is not None:
+                raise exc
+        elif self._raise_exc is not None:
             raise self._raise_exc
         if not self._responses:
             raise AssertionError(
@@ -596,10 +616,11 @@ class _FakeGeminiClient:
         self,
         responses: list[str] | None = None,
         raise_exc: Exception | None = None,
+        raise_exc_sequence: list[Exception | None] | None = None,
         sleep_seconds: float = 0.0,
     ) -> None:
         self.aio = _FakeGeminiAio(
-            _FakeGeminiModels(responses, raise_exc, sleep_seconds)
+            _FakeGeminiModels(responses, raise_exc, raise_exc_sequence, sleep_seconds)
         )
 
 
@@ -607,10 +628,14 @@ def _patch_gemini(
     monkeypatch: pytest.MonkeyPatch,
     responses: list[str] | None = None,
     raise_exc: Exception | None = None,
+    raise_exc_sequence: list[Exception | None] | None = None,
     sleep_seconds: float = 0.0,
 ) -> _FakeGeminiClient:
     client = _FakeGeminiClient(
-        responses=responses, raise_exc=raise_exc, sleep_seconds=sleep_seconds
+        responses=responses,
+        raise_exc=raise_exc,
+        raise_exc_sequence=raise_exc_sequence,
+        sleep_seconds=sleep_seconds,
     )
     monkeypatch.setattr(roa, "_get_gemini_client", lambda: client)
     return client
@@ -904,6 +929,168 @@ async def test_gemini_timeout_raises_gemini_call_error(
 
     with pytest.raises(GeminiCallError):
         await roa._generate_narrowing_question("Data stuff", [])
+
+
+class _FakeGeminiAPIError(Exception):
+    """A minimal stand-in for `google.genai.errors.APIError`'s shape
+    (`.code`/`.status`/`.message`, the real attributes `_is_retryable_
+    gemini_error`/`_format_gemini_error` read) — the real `APIError`
+    requires a genuine HTTP response object to construct, which these
+    tests have no need for.
+    """
+
+    def __init__(self, code: int, status: str, message: str) -> None:
+        self.code = code
+        self.status = status
+        self.message = message
+        super().__init__(f"{code} {status}. {message}")
+
+
+def _fast_retry_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Shrink the retry backoff delays to near-zero so retry tests run
+    fast — a separate concern from tests/conftest.py's pacing-guard
+    fixture (`GEMINI_MIN_CALL_INTERVAL_SECONDS`), which only covers the
+    gap *before* each call, not the backoff *between* retries of the
+    same call.
+    """
+    monkeypatch.setattr(roa, "GEMINI_RETRY_BASE_DELAY_SECONDS", 0.001)
+    monkeypatch.setattr(roa, "GEMINI_RETRY_MAX_DELAY_SECONDS", 0.005)
+
+
+async def test_gemini_retries_transient_429_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient 429 (RESOURCE_EXHAUSTED) on the first attempt is
+    retried, and the second attempt's success is returned normally — the
+    caller never sees the transient failure at all.
+    """
+    _fast_retry_backoff(monkeypatch)
+    client = _patch_gemini(
+        monkeypatch,
+        responses=["Backend, frontend, or something else?"],
+        raise_exc_sequence=[
+            _FakeGeminiAPIError(429, "RESOURCE_EXHAUSTED", "quota exceeded"),
+            None,
+        ],
+    )
+
+    result = await roa._call_gemini_text("some prompt")
+
+    assert result == "Backend, frontend, or something else?"
+    assert len(client.aio.models.calls) == 2
+
+
+async def test_gemini_retries_transient_503_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same as the 429 case above, for the other retryable status (503
+    UNAVAILABLE) — both are named explicitly in
+    `GEMINI_RETRYABLE_STATUS_CODES`, not inferred from one shared branch.
+    """
+    _fast_retry_backoff(monkeypatch)
+    client = _patch_gemini(
+        monkeypatch,
+        responses=["ok"],
+        raise_exc_sequence=[
+            _FakeGeminiAPIError(503, "UNAVAILABLE", "model overloaded"),
+            None,
+        ],
+    )
+
+    result = await roa._call_gemini_text("some prompt")
+
+    assert result == "ok"
+    assert len(client.aio.models.calls) == 2
+
+
+async def test_gemini_does_not_retry_non_transient_400(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-transient error (400 bad request) must never be retried —
+    retrying it would just waste a call on an outcome that can't change.
+    Exactly one call is made, and the real error surfaces.
+    """
+    _fast_retry_backoff(monkeypatch)
+    client = _patch_gemini(
+        monkeypatch,
+        raise_exc_sequence=[
+            _FakeGeminiAPIError(400, "INVALID_ARGUMENT", "bad request shape")
+        ],
+    )
+
+    with pytest.raises(GeminiCallError) as exc_info:
+        await roa._call_gemini_text("some prompt")
+
+    assert len(client.aio.models.calls) == 1
+    assert "400" in str(exc_info.value)
+    assert "bad request shape" in str(exc_info.value)
+
+
+async def test_gemini_retry_is_capped_and_still_surfaces_real_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient error that never clears exhausts the retry budget
+    (`GEMINI_RETRY_MAX_ATTEMPTS` retries beyond the first attempt) rather
+    than retrying forever, and the final failure still carries the real
+    429 message, not a generic "gave up" placeholder.
+    """
+    _fast_retry_backoff(monkeypatch)
+    always_429 = _FakeGeminiAPIError(429, "RESOURCE_EXHAUSTED", "quota exceeded")
+    client = _patch_gemini(
+        monkeypatch,
+        raise_exc_sequence=[always_429] * (roa.GEMINI_RETRY_MAX_ATTEMPTS + 1),
+    )
+
+    with pytest.raises(GeminiCallError) as exc_info:
+        await roa._call_gemini_text("some prompt")
+
+    assert len(client.aio.models.calls) == roa.GEMINI_RETRY_MAX_ATTEMPTS + 1
+    assert "429" in str(exc_info.value)
+    assert "quota exceeded" in str(exc_info.value)
+
+
+async def test_gemini_call_error_message_is_never_swallowed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real bug this task fixes: some exceptions (a bare
+    `asyncio.TimeoutError`/`TimeoutError`, raised directly rather than via
+    a real timeout) stringify to an EMPTY string, which previously
+    produced exactly "Gemini call failed: " with nothing after the colon.
+    The fix must surface something diagnosable even then.
+    """
+    _fast_retry_backoff(monkeypatch)
+    _patch_gemini(monkeypatch, raise_exc_sequence=[TimeoutError()])
+
+    with pytest.raises(GeminiCallError) as exc_info:
+        await roa._call_gemini_text("some prompt")
+
+    message = str(exc_info.value)
+    assert message != "Gemini call failed: "
+    assert message.strip() != "Gemini call failed:"
+    assert "TimeoutError" in message
+
+
+async def test_gemini_call_error_message_surfaces_api_error_details(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-retryable API error's real `code`/`status`/`message` (not
+    just a bare `str(exc)`) end up in the raised `GeminiCallError`, so a
+    future 429/503/400 is diagnosable from the message alone.
+    """
+    _patch_gemini(
+        monkeypatch,
+        raise_exc_sequence=[
+            _FakeGeminiAPIError(403, "PERMISSION_DENIED", "API key invalid")
+        ],
+    )
+
+    with pytest.raises(GeminiCallError) as exc_info:
+        await roa._call_gemini_text("some prompt")
+
+    message = str(exc_info.value)
+    assert "403" in message
+    assert "PERMISSION_DENIED" in message
+    assert "API key invalid" in message
 
 
 # --- Initial Outline Creation: create_initial_outline ---------------------
