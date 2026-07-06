@@ -84,7 +84,8 @@ north-star/
 │   ├── models/
 │   │   └── schemas.py
 │   ├── db/
-│   │   └── connection.py
+│   │   ├── connection.py
+│   │   └── create_schema.py            # one-time Base.metadata.create_all() script — `python -m src.db.create_schema`, no Alembic
 │   └── utils/
 │       ├── logger.py                   # NOT BUILT — explicitly descoped for this submission, see Cost & Usage Tracking below
 │       └── exceptions.py

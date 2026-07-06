@@ -638,3 +638,241 @@ only — nothing here duplicates CLAUDE.md.
 - Nothing from this session has been staged or committed — same standing
   workflow (implement → test → ruff/black/mypy clean → reconcile specs →
   report → stop).
+
+---
+
+# Context Transfer — Session 4: roles_cache Refresh, Patch-Note Pipeline,
+# Pace-Drift Wiring, Goal Completion
+
+Written at the end of a session covering four sequential tasks, each
+building on the last: the roles_cache refresh mechanism, wiring
+significant-event detection into that refresh cycle plus the patch-note
+delivery-decision logic, wiring `detect_sustained_drift` into live pace
+tracking (enrichment + pacing-extension branches), and finally wiring
+patch-note delivery itself plus the goal-completion closing note. Session
+narrative and judgment-call rationale only — nothing here duplicates
+CLAUDE.md's standing policy.
+
+## What was accomplished this session
+
+1. **`src/cron/refresh_roles.py`** — `refresh_roles_cache` (shared
+   refresh function, calls `ground_role` + `upsert_role` per seed role,
+   sequential not parallel), `get_stale_or_missing_roles`/
+   `check_and_refresh_stale_roles` (startup staleness check, refreshes
+   only the stale/missing subset), and a `__main__` entry point the
+   already-scaffolded `.github/workflows/refresh_roles.yml` invokes
+   directly (`python -m src.cron.refresh_roles`) — no separate `scripts/`
+   file needed.
+2. **Cost/usage logging dropped as an explicit scope cut**: `utils/logger.py`
+   deleted outright (was an unused `NotImplementedError` stub with zero
+   callers anywhere) — not deferred, not left as a permanent placeholder.
+   PRD §6, Architecture §10, and CLAUDE.md's Cost & Usage Tracking section
+   all updated to record this as a real product decision, not a gap.
+3. **Significant-event → patch-note wiring**: `refresh_roles_cache` now
+   fetches a role's pre-refresh `roles_cache` row before overwriting it,
+   diffs it against the fresh grounding result via the already-existing
+   `outline/significant_event.py`, and creates `PENDING` patch-notes for
+   every user with a matching completed topic. New
+   `data/outline_topics.py`'s `get_completed_topics_matching_skill`, new
+   `data/patch_notes.py` module (`create_patch_note`/
+   `get_pending_patch_notes`/`get_deferred_patch_notes`/
+   `update_patch_note_status`), `models/schemas.py`'s `PatchNote` mapped
+   fully for the first time (was a bare placeholder).
+4. **Patch-note delivery-decision logic**: `patches/patch_manager.py` gained
+   `decide_patch_delivery`/`PatchDeliveryDecision` (high-confidence
+   auto-prioritize vs. low-confidence ask-user, single-action-per-call)
+   and `PatchDecisionState`/`resolve_patch_decision` (the learn-now-or-
+   defer state machine) — decision logic only, not yet wired to any real
+   caller at this point in the session.
+5. **Pace-drift wiring**: `complete_topic_verification`, right after
+   writing a topic's `pace_snapshots` row (only when `is_enrichment=False`),
+   now reads the user's full snapshot history, recomputes each entry's
+   combined signal, and calls `pace/calculator.py`'s
+   `detect_sustained_drift` — previously computed and persisted but never
+   called. `"ahead"` → new `maybe_trigger_enrichment` (selects an unused
+   `roles_cache` emerging skill, inserts it via `outline/hierarchy.py`'s
+   `insert_new_topic` — its first real caller anywhere in the codebase).
+   `"behind"` → new `data/users.py`'s `extend_pacing`, backed by a new
+   `users.pace_extension_days` column. Required mapping `models.User`
+   fully for the first time (was the last remaining bare placeholder
+   model). New `data/pace_snapshots.py`'s `get_pace_snapshot_history`,
+   new `data/outline_topics.py`'s `get_all_topics_for_user`/
+   `has_pending_enrichment_topic`/`insert_new_outline_topic`.
+6. **Patch-note delivery wiring + goal completion**: new
+   `maybe_deliver_patch`, called unconditionally (not pace-gated,
+   unlike enrichment) alongside `maybe_trigger_enrichment` in
+   `complete_topic_verification` — reuses the identical
+   `insert_new_outline_topic` wrapper, not a second insertion path. New
+   `is_goal_complete`/`generate_closing_note`/`ClosingNote`: the closing
+   note makes a real Gemini call (new `PROMPT_REGISTRY` entry, new model
+   constant) to compose real prose, with PRD's hard "no seniority/
+   grading/leveling" constraint enforced by a deterministic post-
+   generation banned-term check, not trusted to the prompt alone.
+
+Every module passed ruff/black/mypy clean with dedicated tests; full
+suite ended at 403 passed / 1 pre-existing unrelated failure
+(`test_research_grounding.py`'s placeholder, same as every prior
+session). All four tasks were committed by the user personally
+(`e124d28`, `67daddb`, `849948f`, `f4b5c71`) — nothing staged or
+committed by the assistant.
+
+## Key decisions and why
+
+**Cron refresh is sequential, not `asyncio.gather`-parallel**
+- Runs at most monthly (cron) or against a handful of stale roles
+  (startup check) — simplicity and deterministic test ordering were
+  chosen over the marginal latency benefit of concurrency.
+
+**`refresh_roles_cache` only writes `roles_cache` on a genuine
+`LiveGroundingResult`, never on a fallback rung**
+- A `CachedFallbackResult`/`GeneralKnowledgeFloorResult` means live
+  grounding produced no usable signal this cycle; writing either back
+  through `upsert_role` would re-stamp `last_updated` as "just
+  refreshed" for data that wasn't actually freshly re-verified.
+
+**Discovered and reported: no migration tool or schema-push mechanism
+exists anywhere in this codebase**
+- No Alembic dependency, no `Base.metadata.create_all()` call, no DDL
+  file, and (confirmed by direct check) no `Dockerfile`/`requirements.txt`/
+  `ci.yml` exist yet either. Every table in `models/schemas.py` is, today,
+  only a Python class definition — never created against a real
+  Postgres/Neon instance. Surfaced when the user asked directly ("confirm
+  the patch_notes table actually exists") rather than something caught
+  proactively; documented as a named, cross-referenced "Known limitation"
+  in Architecture §5 applying retroactively to every already-mapped
+  table, not just the one that made it concrete enough to name.
+
+**`new_content` (the market-event patch-note placeholder) promoted from
+an in-code comment to a named, cross-referenced spec limitation**
+- Also prompted by direct user follow-up: an in-code flag plus a chat
+  report footnote were judged insufficient for a real, load-bearing
+  finding. Now a standalone, bolded "Known limitation" line in both PRD
+  §7.9 and Architecture (Cron job section), matching the doc's existing
+  precedent style exactly (not buried inside a "Resolved" bullet list).
+
+**A task's own framing can rest on a false premise — checked via grep,
+not assumed, twice this session**
+- The delivery-decision task said to reuse whatever ordering mechanism
+  `outline/hierarchy.py` exposes for `decide_patch_delivery` — but that
+  module exposes no generic ordering function at all (only insertion/
+  augmentation). `patch_manager.py`'s own pre-existing `order_pending_items`
+  was already the reusable mechanism; used directly, and the false
+  premise was corrected explicitly in the spec rather than silently
+  worked around.
+- The pace-drift task (and again the patch-delivery task) described
+  enrichment/patch content as reusing "the same insertion mechanism
+  market-driven patch content already uses" — but `outline/hierarchy.py`'s
+  `insert_new_topic` had never been wired into any real caller before
+  the pace-drift task. Verified via `grep` before proceeding each time,
+  and the correction was written into Architecture explicitly both
+  times, not silently absorbed into an unrelated bullet.
+
+**Enrichment/patch-delivery topics get their own singleton `topic_group`**
+- The relevant skill/origin-topic name plus a literal suffix (`" (Enrichment)"`/
+  `" (Update)"`), not folded into any existing group — so
+  `compute_hands_on_intensity`'s existing `group_size == 1` special case
+  (full intensity immediately) applies naturally; both are always exactly
+  one day.
+
+**`resolved_role` read from the database, not threaded as a parameter**
+- Required mapping `models.User` fully (previously a bare, unmapped
+  placeholder, the last one remaining) rather than adding a redundant
+  caller-supplied parameter — chosen because the field already
+  conceptually belongs to the user's own profile, and the pacing-extension
+  mechanism needed a real place to persist state on that same table
+  anyway (`pace_extension_days`, a new accumulator column — considered
+  and rejected repurposing `pacing_profile`, which is documented as a
+  static, background-derived *initial* expectation, not a running
+  adjustment).
+
+**Patch-note delivery is not pace-gated; enrichment is**
+- `maybe_deliver_patch` runs unconditionally on every non-enrichment
+  completion regardless of `drift`'s value — market events have nothing
+  to do with the completing user's own pace. `maybe_trigger_enrichment`
+  only fires on sustained-ahead. Both can therefore fire in the *same*
+  call (independent conditions, no priority suppression); sequential
+  execution (enrichment first, matching existing code order) is
+  well-defined because `insert_new_outline_topic` always re-reads a
+  fresh hierarchy snapshot immediately before inserting — net effect is
+  a deterministic but arbitrary ordering, flagged as a low-stakes
+  tie-break, not a spec-mandated rule.
+
+**Goal-completion closing note: a real Gemini call, unlike the patch-note
+placeholder — decided explicitly, not defaulted either way**
+- The closing note is genuine user-facing content composed by an agent
+  (which can call an LLM), unlike the cron job's `new_content` (which
+  structurally cannot). PRD's hard "no seniority/grading/leveling"
+  constraint is enforced by a deterministic, deliberately over-inclusive
+  banned-term check against Gemini's *actual output* after generation —
+  not trusted to the prompt instruction alone, consistent with this
+  codebase's "gates are structural, not advisory" principle.
+
+## Traps / failed approaches — don't repeat
+
+- **`MagicMock`'s default `__iter__` silently returns empty on any
+  unconfigured attribute** — this repeatedly made new DB-reading code
+  (`get_role` in refresh-cycle tests, later `get_pace_snapshot_history`
+  and `get_pending_patch_notes` in coaching-pace-agent tests) appear to
+  pass "by accident" in pre-existing tests that never explicitly mocked
+  the newly-added dependency: an unmocked `session.query(...).all()` on a
+  `MagicMock` iterates as `[]`, which happened to be harmless every time
+  but for the wrong reason. Caught and fixed retroactively each time by
+  adding explicit mocks (or a shared fixture-helper covering most call
+  sites at once) rather than leaving tests coincidentally green. Check
+  specifically for this whenever a new DB read is added inside an
+  already-tested function — old tests keep passing whether or not the
+  new mock is added, so a green suite alone doesn't prove the new code
+  path was deliberately exercised.
+- **The wrong-patch-target anti-pattern recurred even in a test explicitly
+  named to guard against a missing feature.** An old test patched
+  `pace.calculator.detect_sustained_drift` (where it's defined) instead of
+  `agents.coaching_pace_agent.detect_sustained_drift` (where it's used,
+  via a direct import) — it "passed" but never actually verified its own
+  claim, for two compounding reasons at once (wrong patch target *and*
+  the `MagicMock`-empty-iteration accident above masking the gap).
+  Removed and replaced with real wiring tests once the feature it was
+  guarding against was actually built.
+- **When a placeholder model needs one new field, map the whole table in
+  one pass, not just the field needed.** Happened twice (`PatchNote`,
+  then `User`) — both times the natural trigger was "I need to persist
+  one new thing," but leaving the rest of an already-specified table
+  unmapped is its own form of spec/code drift, easy to forget to finish
+  later.
+
+## Open items
+
+- **No orchestration layer anywhere.** Nothing calls
+  `ground_role` → `create_initial_outline` → `insert_outline_topics` in
+  sequence; nothing decides when `maybe_trigger_enrichment`/
+  `maybe_deliver_patch`/`is_goal_complete`/`generate_closing_note` should
+  run relative to a real day-by-day flow. Every function built this
+  session remains directly callable only by its own tests and by "a
+  future orchestration layer," per every task's explicit scope fence.
+- **Consuming `users.pace_extension_days` is unbuilt** — the column
+  accumulates correctly, but nothing yet factors it into a future
+  `days_expected` calculation before calling `complete_topic_verification`.
+- **No migration tool / schema-creation mechanism exists for any table**
+  — flagged loudly as a real demo-blocking gap; needs either a one-time
+  `Base.metadata.create_all()` call or Alembic before any run against a
+  real Neon instance.
+- **`new_content` (the market-event patch-note placeholder) is still
+  deterministic/mechanical** — real Agent-1-authored content generation
+  for it remains unbuilt, named explicitly as a "Known limitation" in
+  both PRD and Architecture, not just implied.
+- **The closing note's banned-language rejection has no retry-with-
+  feedback** — `generate_closing_note` raises and stops rather than
+  re-prompting Gemini with the specific violation; flagged as a
+  reasonable minimal implementation for this task, not solved further.
+- **`agents/research_outline_agent.py`'s private Gemini/Tavily helpers
+  keep gaining consumers with no extraction attempted** —
+  `coaching_pace_agent.py` alone now uses them for day-content
+  generation, gap-study content, and the new closing note. Same
+  open item carried from Session 3, now with more load-bearing callers.
+- **`generate_gap_study_content` is still built but never wired** —
+  carried unchanged from Session 3.
+- Unchanged from Session 3: the `.agent/skills/` `sys.path` bootstrap
+  duplication, `roles_cache`/`db/connection.py` never exercised against a
+  real Neon instance, no `pytest --cov` run yet, no `README.md`.
+- `Dockerfile`, `requirements.txt`, and `.github/workflows/ci.yml` are
+  confirmed literally absent (checked directly this session while
+  investigating the migration-tool gap) — not just unmentioned.
