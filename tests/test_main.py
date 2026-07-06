@@ -85,33 +85,125 @@ def test_intake_creates_user_and_advances_to_clarify_gate(
     assert kwargs["available_time_per_week"] == 10
 
 
-def test_clarify_gate_accept_uses_stated_goal_as_is(
+def test_clarify_gate_real_answer_resolves_and_advances(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A REAL-classified stated goal resolves immediately (no narrowing
+    round needed) — the resulting `Continue` button uses the gate's real
+    `resolved_role`, not a placeholder pass-through of the raw stated goal.
+    """
     fake_turn = ClarifyGateTurn(
         gate_state=ClarifyGateState(stage=ClarifyGateStage.RESOLVED),
-        context=ClarifyGateContext(original_stated_goal="I want to make apps"),
-        message="Great — I'll build your plan around Something Else Entirely.",
-        resolved_role="Something Else Entirely",
+        context=ClarifyGateContext(original_stated_goal="Backend Engineer"),
+        message="Great — I'll build your plan around Backend Engineer.",
+        resolved_role="Backend Engineer",
     )
     fake_begin_clarify_gate = AsyncMock(return_value=fake_turn)
     monkeypatch.setattr(roa, "begin_clarify_gate", fake_begin_clarify_gate)
 
     at = _make_at()
     at.session_state["current_stage"] = "clarify_gate"
-    at.session_state["stated_goal"] = "I want to make apps"
+    at.session_state["stated_goal"] = "Backend Engineer"
     at.session_state["user_id"] = "user-1"
     at.run()
 
-    fake_begin_clarify_gate.assert_called_once_with("I want to make apps")
+    fake_begin_clarify_gate.assert_called_once_with("Backend Engineer")
+    # No chat_input is offered once RESOLVED — the round bound must never
+    # be bypassable, and there's nothing left to advance.
+    assert len(at.chat_input) == 0
 
     at.button[0].click()
     at.run()
 
     assert not at.exception
-    # Stub deliberately ignores turn.resolved_role and proceeds with the
-    # raw stated goal instead — the whole point of this task's stub.
-    assert at.session_state["resolved_role"] == "I want to make apps"
+    assert at.session_state["resolved_role"] == "Backend Engineer"
+    assert at.session_state["current_stage"] == "research_grounding"
+
+
+def test_clarify_gate_narrowing_round_calls_advance_clarify_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A VAGUE stated goal enters NARROWING; a chat reply calls
+    `advance_clarify_gate` with the real gate_state/context/conversation,
+    and a second narrowing round (bound not yet reached) keeps
+    `st.chat_input` available rather than exposing a bypass.
+    """
+    first_turn = ClarifyGateTurn(
+        gate_state=ClarifyGateState(
+            stage=ClarifyGateStage.NARROWING, narrowing_rounds_used=0
+        ),
+        context=ClarifyGateContext(original_stated_goal="coding"),
+        message="What kind of coding interests you most?",
+    )
+    monkeypatch.setattr(roa, "begin_clarify_gate", AsyncMock(return_value=first_turn))
+
+    at = _make_at()
+    at.session_state["current_stage"] = "clarify_gate"
+    at.session_state["stated_goal"] = "coding"
+    at.session_state["user_id"] = "user-1"
+    at.run()
+
+    assert len(at.chat_input) == 1
+
+    second_turn = ClarifyGateTurn(
+        gate_state=ClarifyGateState(
+            stage=ClarifyGateStage.NARROWING, narrowing_rounds_used=1
+        ),
+        context=ClarifyGateContext(original_stated_goal="coding"),
+        message="Backend, frontend, or something else?",
+    )
+    fake_advance = AsyncMock(return_value=second_turn)
+    monkeypatch.setattr(roa, "advance_clarify_gate", fake_advance)
+
+    at.chat_input[0].set_value("Backend stuff").run()
+
+    assert not at.exception
+    fake_advance.assert_called_once()
+    args = fake_advance.call_args[0]
+    assert args[0] == first_turn.gate_state
+    assert args[1] == first_turn.context
+    assert args[2] == [{"role": "agent", "content": first_turn.message}]
+    assert args[3] == "Backend stuff"
+    assert at.session_state["clarify_turn"] is second_turn
+    assert at.session_state["clarify_conversation"] == [
+        {"role": "agent", "content": first_turn.message},
+        {"role": "user", "content": "Backend stuff"},
+        {"role": "agent", "content": second_turn.message},
+    ]
+    # Bound not yet reached — still offers a way to reply, still no way to
+    # skip past the gate.
+    assert len(at.chat_input) == 1
+    assert len(at.button) == 0
+
+
+def test_clarify_gate_exited_uses_original_stated_goal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The zero-market-signal exit (PRD §7.2) routes to Research & Market
+    Grounding using the gate's `context.original_stated_goal` — the real
+    resolved goal for this path, since `resolved_role` stays None on an
+    EXITED turn by contract.
+    """
+    exited_turn = ClarifyGateTurn(
+        gate_state=ClarifyGateState(stage=ClarifyGateStage.EXITED),
+        context=ClarifyGateContext(original_stated_goal="Dragon Whisperer II"),
+        message="I couldn't find any current hiring activity for this.",
+        exited=True,
+    )
+    monkeypatch.setattr(roa, "begin_clarify_gate", AsyncMock(return_value=exited_turn))
+
+    at = _make_at()
+    at.session_state["current_stage"] = "clarify_gate"
+    at.session_state["stated_goal"] = "Dragon Whisperer II"
+    at.session_state["user_id"] = "user-1"
+    at.run()
+
+    assert len(at.chat_input) == 0
+    at.button[0].click()
+    at.run()
+
+    assert not at.exception
+    assert at.session_state["resolved_role"] == "Dragon Whisperer II"
     assert at.session_state["current_stage"] == "research_grounding"
 
 
@@ -246,10 +338,8 @@ def test_outline_creation_calls_insert_outline_topics_with_its_output(
     assert at.session_state["current_stage"] == "outline_confirmation"
 
 
-def test_outline_confirmation_confirm_picks_lowest_hierarchy_not_started_topic(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    fake_topics = [
+def _fake_outline_topics() -> list[InitialOutlineTopic]:
+    return [
         InitialOutlineTopic(
             topic_name="Docker basics",
             hierarchy_position=1,
@@ -262,13 +352,101 @@ def test_outline_confirmation_confirm_picks_lowest_hierarchy_not_started_topic(
             status="not_started",
         )
     ]
+
+
+def test_outline_confirmation_initial_render_shows_outline_and_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_topics = _fake_outline_topics()
     fake_turn = OutlineConfirmationTurn(
         state=OutlineConfirmationState(stage=OutlineConfirmationStage.REVIEWING),
         message="Here's your learning plan.",
         topics=fake_topics,
     )
+    fake_begin = AsyncMock(return_value=fake_turn)
+    monkeypatch.setattr(roa, "begin_outline_confirmation", fake_begin)
+
+    at = _make_at()
+    at.session_state["current_stage"] = "outline_confirmation"
+    at.session_state["resolved_role"] = "Backend Engineer"
+    at.session_state["outline_topics"] = fake_topics
+    at.session_state["user_id"] = "user-1"
+    at.run()
+
+    assert not at.exception
+    fake_begin.assert_called_once_with("Backend Engineer", fake_topics)
+    assert at.session_state["outline_confirmation_conversation"] == [
+        {"role": "agent", "content": "Here's your learning plan."}
+    ]
+    # REVIEWING is not concluded — a chat_input is offered, not a button.
+    assert len(at.chat_input) == 1
+    assert len(at.button) == 0
+
+
+def test_outline_confirmation_review_turn_calls_handle_review_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A concern consumes a round (per `advance_after_review_turn`, not
+    yet concluded) — the reply is rendered in-chat and the outline stays
+    on screen, still awaiting further review.
+    """
+    fake_topics = _fake_outline_topics()
+    first_turn = OutlineConfirmationTurn(
+        state=OutlineConfirmationState(stage=OutlineConfirmationStage.REVIEWING),
+        message="Here's your learning plan.",
+        topics=fake_topics,
+    )
     monkeypatch.setattr(
-        roa, "begin_outline_confirmation", AsyncMock(return_value=fake_turn)
+        roa, "begin_outline_confirmation", AsyncMock(return_value=first_turn)
+    )
+
+    at = _make_at()
+    at.session_state["current_stage"] = "outline_confirmation"
+    at.session_state["resolved_role"] = "Backend Engineer"
+    at.session_state["outline_topics"] = fake_topics
+    at.session_state["user_id"] = "user-1"
+    at.run()
+
+    next_turn = OutlineConfirmationTurn(
+        state=OutlineConfirmationState(
+            stage=OutlineConfirmationStage.REVIEWING, rounds_used=1
+        ),
+        message="Docker is included because it's core to this role.",
+        topics=fake_topics,
+        concluded=False,
+    )
+    fake_handle_review_turn = AsyncMock(return_value=next_turn)
+    monkeypatch.setattr(roa, "handle_review_turn", fake_handle_review_turn)
+
+    at.chat_input[0].set_value("Why is Docker in here?").run()
+
+    assert not at.exception
+    fake_handle_review_turn.assert_called_once_with(
+        first_turn.state, "Backend Engineer", fake_topics, "Why is Docker in here?"
+    )
+    assert at.session_state["outline_confirmation_turn"] is next_turn
+    assert at.session_state["outline_confirmation_conversation"] == [
+        {"role": "agent", "content": "Here's your learning plan."},
+        {"role": "user", "content": "Why is Docker in here?"},
+        {"role": "agent", "content": next_turn.message},
+    ]
+    assert at.session_state["current_stage"] == "outline_confirmation"
+    assert len(at.chat_input) == 1
+    assert len(at.button) == 0
+
+
+def test_outline_confirmation_concluded_advances_to_lowest_hierarchy_not_started_topic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_topics = _fake_outline_topics()
+    concluded_turn = OutlineConfirmationTurn(
+        state=OutlineConfirmationState(stage=OutlineConfirmationStage.CONFIRMED),
+        message="Great — let's get started!",
+        topics=fake_topics,
+        concluded=True,
+    )
+    monkeypatch.setattr(
+        roa, "begin_outline_confirmation", AsyncMock(return_value=concluded_turn)
     )
     all_topics = [
         {"id": "topic-completed", "hierarchy_position": 1, "status": "completed"},
@@ -285,6 +463,9 @@ def test_outline_confirmation_confirm_picks_lowest_hierarchy_not_started_topic(
     at.session_state["outline_topics"] = fake_topics
     at.session_state["user_id"] = "user-1"
     at.run()
+
+    # Concluded — no chat_input offered, only the continue button.
+    assert len(at.chat_input) == 0
     at.button[0].click()
     at.run()
 

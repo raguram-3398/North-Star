@@ -876,3 +876,246 @@ placeholder — decided explicitly, not defaulted either way**
 - `Dockerfile`, `requirements.txt`, and `.github/workflows/ci.yml` are
   confirmed literally absent (checked directly this session while
   investigating the migration-tool gap) — not just unmentioned.
+
+---
+
+# Context Transfer — Session 5: Schema Creation Script + main.py
+# Orchestration Skeleton
+
+Written at the end of a session covering two sequential, independent
+tasks: a one-time `Base.metadata.create_all()` schema-creation script run
+against the real Neon instance, and the first real orchestration skeleton
+(`src/main.py`) wiring the full pipeline together as a Streamlit app.
+Session narrative and judgment-call rationale only — nothing here
+duplicates CLAUDE.md's standing policy (which already lists both
+`db/create_schema.py` and `main.py` in its repo-structure tree with
+one-line descriptions).
+
+## What was accomplished this session
+
+1. **`src/db/create_schema.py`** — one-time, non-Alembic
+   `python -m src.db.create_schema` script matching
+   `cron/refresh_roles.py`'s `__main__` pattern. Imports every model
+   class explicitly so a test can assert registration on `Base.metadata`,
+   calls `Base.metadata.create_all(get_engine())`. Run twice against the
+   real Neon instance (idempotency confirmed — second run: no error).
+   Verified independently via a raw `information_schema.tables` query:
+   all 7 expected tables (`users`, `roles_cache`, `outline_topics`,
+   `progress_log`, `verification_attempts`, `patch_notes`,
+   `pace_snapshots`) exist in the connected `public` schema.
+   `tests/test_create_schema.py` (3 tests): structural registration
+   checks + a mocked-engine `create_all()` call check.
+2. **`src/main.py`** — the first real Streamlit orchestration skeleton,
+   wiring Intake -> Clarify Gate (stubbed) -> Research/Grounding ->
+   Outline Creation -> Outline Confirmation (stubbed) -> Day-by-Day
+   Coaching -> Verification (wired for real, turn-based) -> Goal
+   Completion. `PipelineStage` (8-stage enum), full `st.session_state`
+   shape documented in a header comment block.
+3. **`data/users.py` gained `create_user`/`set_resolved_role`** — a
+   discovered gap, not a pre-existing stub: no function anywhere created
+   a `users` row, and nothing wrote `resolved_role`/`role_confidence`
+   back after Research/Grounding resolved them, despite
+   `maybe_trigger_enrichment`/`generate_closing_note` already reading
+   `user["resolved_role"]` as an existing precondition. Both plain CRUD,
+   tested (`tests/test_users.py` gained 4 new tests).
+4. **`tests/test_main.py`** (14 tests) — built on
+   `streamlit.testing.v1.AppTest`, the real Streamlit test harness
+   (chosen deliberately since the render functions call
+   `st.write`/`st.button` directly and cannot be unit-tested any other
+   way). Covers every stage transition, confirms `insert_outline_topics`
+   receives `create_initial_outline`'s exact output object by identity,
+   confirms `is_goal_complete`/`generate_closing_note` are actually
+   composed by `main.py` (not merged into one function), and directly
+   unit-tests the new pure `_build_verification_source` helper.
+5. Live smoke-test: booted the real Streamlit server
+   (`streamlit run src/main.py`, real `.env` loaded) and confirmed
+   HTTP 200 with no import errors, beyond the automated test suite.
+6. Spec reconciliation across both tasks — Architecture/PRD "Known
+   limitation"/"Resolved"/Future-Improvements blocks updated (see Key
+   decisions below for what got written where).
+
+Every module passed ruff/black/mypy clean. Full suite: 423 passed / 1
+pre-existing unrelated failure (`test_research_grounding.py`'s
+placeholder, unchanged from every prior session). Nothing staged or
+committed by the assistant — same standing workflow (implement -> test ->
+clean -> reconcile specs -> report -> stop).
+
+## Key decisions and why
+
+**`data/users.py`'s `create_user`/`set_resolved_role` — plain CRUD, not a
+decision point**
+- Justified as *not* violating "main.py must not invent business logic"
+  because neither function branches on anything or applies a
+  confidence-ladder/source-validation gate (User profile fields have no
+  `source_url`/`confidence` concept, unlike outline items/patch-notes/
+  grounding results — CLAUDE.md guardrail #12's scope). Without
+  `set_resolved_role`, `maybe_trigger_enrichment` would silently never
+  fire (its `user["resolved_role"]` precondition would always be `None`)
+  and `generate_closing_note` would always raise `ValueError` — a real,
+  load-bearing gap discovered by reading `coaching_pace_agent.py`'s
+  existing preconditions closely, not something `main.py` could route
+  around.
+
+**`DAYS_EXPECTED_PER_TOPIC = 1` flat baseline (`main.py`), not an invented
+formula**
+- `pace/calculator.py`'s own docstring says `days_expected` is "supplied
+  by the caller as already derived from the user's own established
+  baseline" — PRD §7.8 explicitly defers that baseline calculation to
+  future work, and no function anywhere computes it. Rather than
+  inventing an unbaked formula (which the task explicitly forbade) or
+  blocking on it, decided on the most honest minimal reading: 1 day
+  expected per topic, with `days_taken` derived from the *already-
+  existing* spillover mechanism (`DayContent.remaining_content` — a topic
+  that spills over multiple days already reads as genuinely "behind" via
+  `timing_ratio`; same-day resolution reads as exactly on-baseline).
+  Flagged loudly in a code comment, Architecture §3, and PRD §11 item 10
+  — considered whether to stop and ask (per CLAUDE.md's "stop and ask on
+  missing requirements" instruction) but judged consistent with this
+  codebase's established pattern of deciding-and-flagging revisable
+  constants (`STUDY_DAYS_PER_WEEK`, `PACE_EXTENSION_DAYS_PER_TRIGGER`)
+  rather than pausing on every one.
+
+**Verification questions anchored to `theory_framing` + `theory_links`,
+never the topic's market-grounding `source_url`**
+- No real caller of `begin_verification_question` existed before this
+  task to establish this convention. `generate_day_content`'s own
+  docstring already distinguishes the topic's market-grounding
+  `source_url` (why this skill matters to employers) from `theory_links`
+  (a fresh Tavily search for genuine teaching material) — reusing the
+  market-grounding URL to source verification questions would have been
+  provenance-wrong. `_build_verification_source` uses the first
+  (highest-relevance) theory link's URL, falling back to the topic's
+  market-grounding URL only if Tavily's theory search returned zero links
+  (a real, already-documented possibility per `data/tavily_parser.py`'s
+  own finding), so the demo never hard-blocks on it.
+
+**`PipelineStage` stored as `.value` strings in `session_state`, never the
+`Enum` member**
+- A real bug, reproduced live via `streamlit.testing.v1.AppTest`, not a
+  hypothetical: Streamlit re-executes a script's entire top-level code —
+  including every `class` statement — from scratch on every rerun when
+  that script is the literal `streamlit run`/`AppTest.from_file` target.
+  An `Enum` member stored in `session_state` from one rerun is a
+  different, non-equal object once the next rerun redefines the class,
+  causing a genuine `KeyError` on the very first interaction after page
+  load (`_STAGE_RENDERERS[st.session_state.current_stage]`). Confirmed
+  the fix by re-running the exact reproduction after applying it. Every
+  read/write site in `main.py` (9 writes/init, 8 dict keys, 1 read —
+  checked exhaustively via grep, not just the one call site where the bug
+  surfaced) consistently uses `.value`. Classes imported from
+  `agents/`/`data/`/etc. are unaffected (those modules are cached
+  normally via `sys.modules`, never re-executed) — only classes defined
+  directly inside the `streamlit run` target script itself are at risk.
+
+**Clarify Gate / Outline Confirmation stubbed exactly as scoped, not
+partially wired**
+- `begin_clarify_gate`/`begin_outline_confirmation` are each called once
+  for real and displayed; `advance_clarify_gate`/`handle_review_turn`/
+  `regenerate_outline_with_addition` are not touched at all this task.
+  The stub's "Accept and continue" button uses the raw stated goal as-is,
+  deliberately discarding `turn.resolved_role` — verified directly in a
+  test (`test_clarify_gate_accept_uses_stated_goal_as_is` mocks
+  `begin_clarify_gate` to resolve to a *different* role than the stated
+  goal, asserting the app still proceeds with the stated goal) rather
+  than merely asserting the stage transitioned.
+
+**Testing approach: `streamlit.testing.v1.AppTest`, not direct function
+calls or a mocked `streamlit` module**
+- `main.py`'s render functions call `st.write`/`st.button`/
+  `st.session_state` directly and cannot execute outside a live Streamlit
+  script-run context — confirmed by trying to call one directly first
+  (`AttributeError`/missing `ScriptRunContext`). `AppTest` runs the real
+  script; every underlying agent/data function is mocked at the module
+  that defines it (e.g. `agents.research_outline_agent.ground_role`),
+  which still counts as this codebase's "patch where it's used"
+  convention for this specific harness because `AppTest` re-executes
+  `main.py`'s entire top level (including every `from x import y`
+  statement) fresh on every `.run()` call — confirmed this
+  experimentally before writing the full suite, not assumed from
+  documentation.
+- Discovered mid-suite-writing: `AppTest.run()` follows through an
+  internal `st.rerun()` automatically (i.e. it settles to the
+  post-rerun state within one `.run()` call, not just the pre-rerun
+  snapshot) — an early test assertion (`day_content is None` right after
+  a spillover "continue" click) failed because content had already been
+  regenerated for the new day by the time `.run()` returned. Not a bug;
+  the test assertion was naive. Fixed by asserting on
+  `generate_day_content`'s *second* call's kwargs instead.
+
+## Traps / failed approaches — don't repeat
+
+- **Pre-setting `at.session_state` before the very first `AppTest.run()`
+  call works and is the efficient way to jump into any pipeline stage for
+  a test** — confirmed directly (values set before the first `.run()`
+  survive `_init_session_state()`'s "only default missing keys" guard).
+  Used throughout `test_main.py` instead of replaying the whole pipeline
+  from Intake every test.
+- **`at.session_state["key"]`, not `at.session_state.get("key")`** — the
+  latter raises `AttributeError` (`SafeSessionState` has no real `.get`),
+  discovered via a first failed smoke-test attempt.
+- **`AsyncMock`, not `MagicMock`, for every async function being patched**
+  (`begin_clarify_gate`, `ground_role`, `create_initial_outline`,
+  `begin_outline_confirmation`, `generate_day_content`,
+  `begin_verification_question`, `submit_verification_answer`,
+  `generate_closing_note`) — `main.py`'s `_run_async` does
+  `asyncio.run(coro)`, which needs a real awaitable; a plain `MagicMock`
+  return value isn't one. `complete_topic_verification`/
+  `is_goal_complete`/`insert_outline_topics`/`create_user`/
+  `set_resolved_role`/`get_*` are all plain `def`, confirmed by reading
+  each definition before mocking — an easy, unverified assumption to get
+  backwards in either direction.
+- **A locally-defined class instance in `st.session_state` is only safe
+  if the script is never the literal `streamlit run` target** — see the
+  `PipelineStage` finding above. Worth checking again the moment
+  `streamlit_app.py` is eventually built as a thin wrapper: if it ever
+  becomes the new `streamlit run` target and correctly `import`s (not
+  re-execs) `src/main.py`, the underlying bug disappears architecturally
+  and the `.value`-string workaround becomes unnecessary-but-harmless,
+  not wrong.
+- **`mypy` flagged re-annotating a variable already assigned earlier in
+  the same function** (`turn: ClarifyGateTurn = ...` after an unannotated
+  `turn = ...` inside an `if` block above it) as a redefinition error in
+  three separate stage functions — fixed by renaming the first
+  (try-block) assignment (`first_turn`, `generated_content`,
+  `first_slot_state`) rather than dropping the second's type annotation.
+  Same shape recurred three times before being generalized; worth
+  recognizing the pattern (assign-then-conditionally-fetch-with-
+  annotation) up front next time to avoid three separate rounds of the
+  same fix.
+
+## Open items
+
+- **Clarify Gate / Outline Confirmation's real bounded loops are still
+  unbuilt** — `advance_clarify_gate`/`handle_review_turn`/
+  `regenerate_outline_with_addition` exist and are tested in isolation,
+  but `main.py` never calls them; both stages are single-button stubs,
+  named explicitly as deferred UI work in this task's own scope fence.
+- **`days_expected` still has no real baseline formula** — `main.py`'s
+  flat `DAYS_EXPECTED_PER_TOPIC = 1` gets the pipeline wired end-to-end
+  but doesn't consume `available_time_per_week`, topic-group size, or the
+  accumulated `users.pace_extension_days`. PRD §11 item 10.
+- **`streamlit_app.py` (the root-level `streamlit run` entry point
+  CLAUDE.md's own repo tree already names) still doesn't exist** —
+  `main.py` works around the Enum/session_state bug defensively, but
+  building `streamlit_app.py` as a thin `import`-and-call wrapper would
+  close that whole class of bug architecturally instead, per Architecture
+  §3's new "Known limitation" block. PRD §11 item 11.
+- **No `Dockerfile`/`requirements.txt`/`.github/workflows/ci.yml`, no
+  `README.md`, no `pytest --cov` run** — unchanged from every prior
+  session.
+- **No Alembic / FK constraints** — `db/create_schema.py` closes the
+  "tables don't exist at all" gap but does not add either; still named
+  as separately open in Architecture §5/§10.
+- **Grounding a user's raw outline-confirmation addition request into a
+  real, sourced skill is still unbuilt** — moot for now since Outline
+  Confirmation is stubbed and never exercises that path, but still open
+  the moment the real bounded loop gets built (PRD §11 item 6).
+- **`agents/research_outline_agent.py`'s private Gemini/Tavily helpers
+  gain no new consumers this session, but the extraction itself remains
+  unattempted** — unchanged from Session 4.
+- Everything else already open at the end of Session 4 and not touched
+  this session remains open: `new_content`'s deterministic placeholder,
+  the closing note's no-retry-on-banned-language rejection,
+  `generate_gap_study_content` unwired, the `.agent/skills/` `sys.path`
+  bootstrap duplication, `roles_cache`/`db/connection.py` never exercised
+  against real Neon *data* (only schema creation was, this session).

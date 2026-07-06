@@ -41,8 +41,14 @@ place these keys are declared):
   `PipelineStage.X.value`, never `PipelineStage.X` itself.
 - `user_id`: the persisted `users.id` (str), set once Intake completes.
 - `stated_goal`: the raw Intake goal text, threaded into the Clarify Gate.
-- `clarify_turn`: the `ClarifyGateTurn` from the one `begin_clarify_gate`
-  call (Clarify Gate is stubbed this pass — see that stage's own comment).
+- `clarify_turn`: the most recent `ClarifyGateTurn` returned by
+  `begin_clarify_gate`/`advance_clarify_gate` — carries the loop state
+  (`gate_state`/`context`) needed to advance the next real user reply.
+- `clarify_conversation`: the Clarify Gate's displayed chat history, a
+  `list[{"role": "agent" | "user", "content": str}]` — also the exact
+  shape `advance_clarify_gate`'s `conversation` parameter expects
+  (`role="agent"` is load-bearing: `_last_agent_message` in
+  `agents/research_outline_agent.py` looks for that literal string).
 - `resolved_role`: the role name Research/Grounding and everything
   downstream operates on.
 - `grounding_result`: `ground_role`'s return value (`LiveGroundingResult`
@@ -52,8 +58,13 @@ place these keys are declared):
   needs that exact dataclass shape, not the persisted dict rows.
   `persisted_topics`: the same outline after `insert_outline_topics`
   (real `id`s/`hierarchy_position`s).
-- `outline_confirmation_turn`: the `OutlineConfirmationTurn` from the one
-  `begin_outline_confirmation` call (also stubbed this pass).
+- `outline_confirmation_turn`: the most recent `OutlineConfirmationTurn`
+  from `begin_outline_confirmation`/`handle_review_turn` — carries
+  `state`/`topics` needed to advance the next real review turn; `topics`
+  is also the single source of truth for the outline list rendered
+  alongside the chat.
+- `outline_confirmation_conversation`: the Outline Confirmation chat
+  history, same shape as `clarify_conversation`.
 - `current_topic_id`: the outline topic currently being taught/verified —
   looked up fresh from the DB each time (never a stale index), since
   `maybe_trigger_enrichment`/`maybe_deliver_patch` can insert new topics
@@ -104,10 +115,13 @@ from agents.coaching_pace_agent import (
 from agents.research_outline_agent import (
     ClarifyGateTurn,
     LiveGroundingResult,
+    OutlineConfirmationTurn,
+    advance_clarify_gate,
     begin_clarify_gate,
     begin_outline_confirmation,
     create_initial_outline,
     ground_role,
+    handle_review_turn,
 )
 from data.grounding_fallback import CachedFallbackResult, GeneralKnowledgeFloorResult
 from data.outline_topics import (
@@ -118,6 +132,7 @@ from data.outline_topics import (
 )
 from data.users import create_user, get_user, set_resolved_role
 from db.connection import get_session
+from security.input_gate import ClarifyGateStage
 from security.output_guard import ConfidenceTier
 from utils.exceptions import (
     ConfidenceValidationError,
@@ -205,11 +220,13 @@ def _init_session_state() -> None:
         "user_id": None,
         "stated_goal": None,
         "clarify_turn": None,
+        "clarify_conversation": None,
         "resolved_role": None,
         "grounding_result": None,
         "outline_topics": None,
         "persisted_topics": None,
         "outline_confirmation_turn": None,
+        "outline_confirmation_conversation": None,
         "current_topic_id": None,
         "day_number_for_topic": 1,
         "carried_over_content": None,
@@ -276,15 +293,25 @@ def _render_intake() -> None:
 
 
 def _render_clarify_gate() -> None:
+    """The real bounded Clarify Gate loop (PRD §7.2): a `st.chat_message`
+    history plus `st.chat_input` for the next reply, with every turn
+    computed by `begin_clarify_gate`/`advance_clarify_gate` — this
+    function owns no narrowing/proposal/acceptance logic of its own, only
+    rendering and round-tripping `st.session_state`.
+
+    Dispatches on `turn.gate_state.stage` exactly as
+    `security/input_gate.py`'s `ClarifyGateState` defines it:
+    NARROWING/PROPOSE_BEST_GUESS/EXPLAIN_ROLE all collect the next free-text
+    reply (they differ only in what `advance_clarify_gate` does with it
+    internally, not in what this UI needs to do); RESOLVED and EXITED are
+    both terminal and stop offering `st.chat_input` (CLAUDE.md guardrail
+    #8 — the round bound must never be bypassable from the UI, so once a
+    terminal stage is reached, `advance_clarify_gate` is never called
+    again). ACCEPT_OWN_WORDS is asserted unreachable here: `advance_clarify_gate`
+    always resolves it (to RESOLVED or EXITED) within the same call that
+    entered it, so a turn's returned stage can never actually be it.
+    """
     st.header("Clarify Gate")
-    st.caption(
-        "Stand-in for this pass — the real bounded narrowing/proposal/"
-        "explanation loop (security/input_gate.py's ClarifyGateState, "
-        "advance_clarify_gate) is a later UI task. begin_clarify_gate is "
-        "called once for real and its output is shown below, but "
-        "'Accept and continue' always proceeds with the stated goal "
-        "exactly as typed, regardless of what the gate classified it as."
-    )
 
     if st.session_state.clarify_turn is None:
         try:
@@ -293,14 +320,81 @@ def _render_clarify_gate() -> None:
             st.error(f"Clarify Gate failed: {exc}")
             return
         st.session_state.clarify_turn = first_turn
+        st.session_state.clarify_conversation = [
+            {"role": "agent", "content": first_turn.message}
+        ]
 
     turn: ClarifyGateTurn = st.session_state.clarify_turn
-    st.write(turn.message)
+    for entry in st.session_state.clarify_conversation:
+        with st.chat_message("assistant" if entry["role"] == "agent" else "user"):
+            st.write(entry["content"])
 
-    if st.button("Accept and continue"):
-        st.session_state.resolved_role = st.session_state.stated_goal
-        st.session_state.current_stage = PipelineStage.RESEARCH_GROUNDING.value
-        st.rerun()
+    stage = turn.gate_state.stage
+
+    if stage is ClarifyGateStage.RESOLVED:
+        if st.button("Continue to Research & Market Grounding"):
+            assert turn.resolved_role is not None  # guaranteed by RESOLVED
+            st.session_state.resolved_role = turn.resolved_role
+            st.session_state.current_stage = PipelineStage.RESEARCH_GROUNDING.value
+            st.rerun()
+        return
+
+    if stage is ClarifyGateStage.EXITED:
+        if st.button("Continue to Research & Market Grounding"):
+            # PRD §7.2's zero-market-signal exit: resolved_role stays None
+            # on `turn` (no role was accepted), but the gate already
+            # confirmed there's no live signal for the user's own original
+            # words specifically (that's how EXITED was reached). Routing
+            # to Research & Market Grounding on that same goal is
+            # deliberate, not a bug: `_render_research_grounding` already
+            # renders the "no outline can be built" floor-rung outcome and
+            # offers no way past it, so every confidence-ladder result
+            # still surfaces through the one stage built to display it,
+            # rather than this function duplicating that rendering. The
+            # cost is one redundant live grounding call for an outcome
+            # already known.
+            st.session_state.resolved_role = turn.context.original_stated_goal
+            st.session_state.current_stage = PipelineStage.RESEARCH_GROUNDING.value
+            st.rerun()
+        return
+
+    if stage not in (
+        ClarifyGateStage.NARROWING,
+        ClarifyGateStage.PROPOSE_BEST_GUESS,
+        ClarifyGateStage.EXPLAIN_ROLE,
+    ):
+        raise AssertionError(f"unexpected clarify gate stage reached the UI: {stage}")
+
+    user_response = st.chat_input("Your response")
+    if not user_response:
+        return
+
+    conversation_so_far = list(st.session_state.clarify_conversation)
+    session = _get_db_session()
+    reference_time = datetime.now(UTC).replace(tzinfo=None)
+    try:
+        next_turn = _run_async(
+            advance_clarify_gate(
+                turn.gate_state,
+                turn.context,
+                conversation_so_far,
+                user_response,
+                session,
+                reference_time,
+            )
+        )
+    except _STAGE_EXCEPTIONS as exc:
+        st.error(f"Clarify Gate failed: {exc}")
+        return
+
+    st.session_state.clarify_conversation.append(
+        {"role": "user", "content": user_response}
+    )
+    st.session_state.clarify_conversation.append(
+        {"role": "agent", "content": next_turn.message}
+    )
+    st.session_state.clarify_turn = next_turn
+    st.rerun()
 
 
 # --- Research & Market Grounding (PRD §7.1 stage 3 / §7.3) --------------
@@ -406,18 +500,56 @@ def _render_outline_creation() -> None:
 # --- Outline Confirmation (PRD §7.1 stage 5 / §7.5) ---------------------
 
 
+def _advance_to_day_one() -> None:
+    """Shared terminal action for Outline Confirmation (PRD §7.5): pick
+    the lowest-`hierarchy_position` not-started persisted topic and move
+    to Day-by-Day Coaching — identical target/lookup this stage's stub
+    always used, now reached from either `CONFIRM` or bound exhaustion.
+    """
+    session = _get_db_session()
+    all_topics = get_all_topics_for_user(session, st.session_state.user_id)
+    not_started = [t for t in all_topics if t["status"] == NOT_STARTED_STATUS]
+    if not not_started:
+        st.error("No topics were persisted — cannot start Day 1.")
+        return
+    first_topic = min(not_started, key=lambda t: t["hierarchy_position"])
+    st.session_state.current_topic_id = str(first_topic["id"])
+    st.session_state.current_stage = PipelineStage.DAY_BY_DAY_COACHING.value
+    st.rerun()
+
+
 def _render_outline_confirmation() -> None:
+    """The real bounded Outline Confirmation loop (PRD §7.5): the current
+    outline shown alongside a `st.chat_message`/`st.chat_input` review
+    conversation, every turn computed by `begin_outline_confirmation`/
+    `handle_review_turn` — this function renders exactly what those
+    return and owns no classification/round-bound logic of its own.
+
+    **Known, flagged scope boundary — addition requests are acknowledged
+    but never regenerate the outline.** `handle_review_turn`'s own
+    docstring states this explicitly: folding a user's requested addition
+    into the outline requires that addition to already be a grounded
+    `ValidatedGroundedContent` (a live single-skill lookup), which
+    `handle_review_turn` deliberately does not do itself — "how a raw
+    addition request gets grounded... is a separate, unaddressed design
+    question." Confirmed by grep before writing this function: no
+    single-skill grounding function exists anywhere in this codebase
+    (only `ground_role`, which grounds an entire role's full skill list).
+    Calling `regenerate_outline_with_addition` with a fabricated
+    `ValidatedGroundedContent` would violate CLAUDE.md guardrail #1
+    (never invent a `source_url`), so this function does not call it at
+    all — an addition request still consumes a round exactly as
+    `advance_after_review_turn` dictates (via `handle_review_turn`), the
+    acknowledgment message is shown, but the outline itself is left
+    unchanged (`handle_review_turn` already returns the same `topics` list
+    unchanged for this action) and the limitation is surfaced to the user
+    via the caption below rather than silently absorbed.
+    """
     st.header("Outline Confirmation")
-    st.caption(
-        "Stand-in for this pass — the real bounded review loop "
-        "(security/input_gate.py's OutlineConfirmationState, "
-        "handle_review_turn/regenerate_outline_with_addition) is a later "
-        "UI task. begin_outline_confirmation is called once for real."
-    )
 
     if st.session_state.outline_confirmation_turn is None:
         try:
-            turn = _run_async(
+            first_turn = _run_async(
                 begin_outline_confirmation(
                     st.session_state.resolved_role, st.session_state.outline_topics
                 )
@@ -425,20 +557,65 @@ def _render_outline_confirmation() -> None:
         except _STAGE_EXCEPTIONS as exc:
             st.error(f"Outline Confirmation failed: {exc}")
             return
-        st.session_state.outline_confirmation_turn = turn
+        st.session_state.outline_confirmation_turn = first_turn
+        st.session_state.outline_confirmation_conversation = [
+            {"role": "agent", "content": first_turn.message}
+        ]
 
-    st.write(st.session_state.outline_confirmation_turn.message)
+    turn: OutlineConfirmationTurn = st.session_state.outline_confirmation_turn
 
-    if st.button("Confirm and start Day 1"):
-        session = _get_db_session()
-        all_topics = get_all_topics_for_user(session, st.session_state.user_id)
-        not_started = [t for t in all_topics if t["status"] == NOT_STARTED_STATUS]
-        if not not_started:
-            st.error("No topics were persisted — cannot start Day 1.")
+    outline_col, chat_col = st.columns([1, 2])
+    with outline_col:
+        st.subheader("Current outline")
+        current_group: str | None = None
+        for topic in turn.topics:
+            if topic.topic_group != current_group:
+                current_group = topic.topic_group
+                st.markdown(f"**{current_group}**")
+            st.write(f"- {topic.topic_name}")
+
+    with chat_col:
+        for entry in st.session_state.outline_confirmation_conversation:
+            with st.chat_message("assistant" if entry["role"] == "agent" else "user"):
+                st.write(entry["content"])
+
+        if turn.concluded:
+            if st.button("Continue to Day 1"):
+                _advance_to_day_one()
             return
-        first_topic = min(not_started, key=lambda t: t["hierarchy_position"])
-        st.session_state.current_topic_id = str(first_topic["id"])
-        st.session_state.current_stage = PipelineStage.DAY_BY_DAY_COACHING.value
+
+        st.caption(
+            "Requesting an addition here is acknowledged and consumes a "
+            "review round, but can't yet regenerate the outline — "
+            "grounding a raw addition into a real, sourced topic isn't "
+            "wired up yet (see Architecture §10/PRD §11 item 6)."
+        )
+        user_message = st.chat_input(
+            "Ask a question, raise a concern, request an addition, or confirm"
+        )
+        if not user_message:
+            return
+
+        try:
+            next_turn = _run_async(
+                handle_review_turn(
+                    turn.state,
+                    st.session_state.resolved_role,
+                    turn.topics,
+                    user_message,
+                )
+            )
+        except _STAGE_EXCEPTIONS as exc:
+            st.error(f"Outline review failed: {exc}")
+            return
+
+        st.session_state.outline_confirmation_conversation.append(
+            {"role": "user", "content": user_message}
+        )
+        st.session_state.outline_confirmation_conversation.append(
+            {"role": "agent", "content": next_turn.message}
+        )
+        st.session_state.outline_confirmation_turn = next_turn
         st.rerun()
 
 
