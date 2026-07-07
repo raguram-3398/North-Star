@@ -1,40 +1,4 @@
-"""Tests for agents/research_outline_agent.py's `ground_role` — the
-cross-validation/grounding orchestrator (Architecture §3's "cross-
-validation normalization judgment") — and its `begin_clarify_gate`/
-`advance_clarify_gate` — the Clarify Gate's conversational half (PRD
-§7.2).
-
-Himalayas MCP and Tavily are both mocked with small fake clients rather
-than a real McpToolset/TavilyClient, so these tests are fast, offline,
-and deterministic — matching tests/test_roles_cache.py's and
-tests/test_grounding_fallback.py's mocked-Session precedent. Where
-realistic Himalayas response text is needed, the real fixtures gathered
-for tests/test_himalayas_parser.py and tests/test_himalayas_relevance.py
-are reused rather than inventing new synthetic text. Tavily content
-strings are constructed to deliberately clear or miss
-data/cross_validation.py's TAVILY_DISTINCT_SKILLS_TRUST_THRESHOLD (real
-vocabulary terms vs. generic prose), since that's what now decides
-Tavily's own signal, not `score`.
-
-The clarify-gate tests mock Gemini with a small fake client (`_patch_gemini`/
-`_FakeGeminiClient`, imported from tests/test_gemini_client.py rather than
-redefined here) rather than a real `google.genai.Client`, for the same
-reason — fast, offline, deterministic, and focused on this module's own
-orchestration logic (dispatch on ClarifyGateStage, context threading, the
-ACCEPT_OWN_WORDS original-goal-not-latest-message rule) rather than on
-Gemini's actual behavior. `ground_role` itself is mocked directly in
-these tests (it already has its own dedicated tests above) so the
-clarify-gate tests aren't re-exercising Himalayas/Tavily mocking too.
-
-Patches target `agents.research_outline_agent.<name>` (where each name is
-*used*), not where it's defined — CLAUDE.md's flagged
-wrong-patch-target anti-pattern. `_patch_gemini` itself patches
-`utils.gemini_client._get_gemini_client` (see that fixture's home in
-tests/test_gemini_client.py for why: `_generate_content_with_retry`'s own
-internal call to `_get_gemini_client()` resolves in *that* module's
-namespace now that the shared infrastructure lives there, not in this
-module's).
-"""
+"""Tests for research_outline_agent.py's ground_role grounding orchestrator and its clarify-gate turn functions, using mocked Himalayas/Tavily/ADK call layers for fast, offline, deterministic runs."""
 
 import asyncio
 import json
@@ -46,7 +10,7 @@ import pytest
 from tavily.errors import InvalidAPIKeyError
 
 import agents.research_outline_agent as roa
-import utils.gemini_client as gc
+import utils.adk_runtime as adk_runtime
 from data.grounding_fallback import CachedFallbackResult, GeneralKnowledgeFloorResult
 from security.input_gate import (
     ClarifyGateStage,
@@ -56,7 +20,7 @@ from security.input_gate import (
     OutlineReviewAction,
 )
 from security.output_guard import ConfidenceTier, ValidatedGroundedContent
-from tests.test_gemini_client import _patch_gemini
+from tests.test_adk_runtime import _patch_adk_runtime
 from utils.exceptions import GeminiCallError
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
@@ -76,10 +40,7 @@ def _tavily_response(results: list[dict]) -> dict:
     return {"results": results}
 
 
-# Clears TAVILY_DISTINCT_SKILLS_TRUST_THRESHOLD (3) on its own: 4 distinct
-# real vocabulary terms in one result.
 _SKILL_BEARING_CONTENT = "You need Python, SQL, Excel, and Tableau for this role."
-# Real prose with zero vocabulary hits.
 _GENERIC_CONTENT = "Great communication and teamwork skills are essential."
 
 
@@ -138,9 +99,6 @@ BACKEND_ENGINEER_TEXT = (
 NONSENSE_TEXT = (
     FIXTURES_DIR / "himalayas_search_jobs_nonsense_keyword_fallback.txt"
 ).read_text()
-
-
-# --- ground_role: full confidence-ladder branches ------------------------
 
 
 async def test_high_confidence_both_sources_agree_with_anchor(
@@ -275,12 +233,7 @@ async def test_medium_confidence_genuine_conflict_with_anchor(
 async def test_medium_confidence_tavily_only_himalayas_no_signal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The scenario this task exists for: Himalayas has no usable signal
-    (the real captured nonsense-keyword fallback text), but Tavily
-    clears the distinct-skill trust threshold on its own — this must now
-    reach medium confidence with Tavily-sourced, output_guard-validated
-    skills, instead of always falling through to the fallback chain.
-    """
+    """Himalayas has no usable signal but Tavily clears the distinct-skill trust threshold on its own, reaching medium confidence with Tavily-sourced, validated skills."""
     _patch_himalayas(
         monkeypatch,
         _FakeHimalayasTool("search_jobs", _himalayas_response(NONSENSE_TEXT)),
@@ -315,7 +268,6 @@ async def test_medium_confidence_tavily_only_himalayas_no_signal(
     for skill in result.skills:
         assert isinstance(skill, ValidatedGroundedContent)
         assert skill.source_type == "web_search"
-        # the high-score, skill-less result must never win citation
         assert skill.source_url == "https://good.test"
     assert {skill.extra["skill"] for skill in result.skills} == {
         "Python",
@@ -328,11 +280,7 @@ async def test_medium_confidence_tavily_only_himalayas_no_signal(
 async def test_cached_fallback_when_both_sources_have_no_usable_signal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Himalayas has no signal (real nonsense-keyword fallback text) and
-    Tavily also fails its distinct-skill trust threshold — both sources
-    contribute nothing, so this must still route to grounding_fallback,
-    unchanged from before Tavily-only signal was possible.
-    """
+    """Both sources contribute no usable signal, so grounding routes to the cached fallback."""
     _patch_himalayas(
         monkeypatch,
         _FakeHimalayasTool("search_jobs", _himalayas_response(NONSENSE_TEXT)),
@@ -390,9 +338,6 @@ async def test_general_knowledge_floor_when_everything_fails(
 
     assert result is sentinel
     get_floor_mock.assert_called_once_with("ghost_role")
-
-
-# --- source-level failure modes: distinguished, not accidental -----------
 
 
 async def test_himalayas_call_failure_wraps_connection_error(
@@ -455,19 +400,13 @@ async def test_tavily_specific_error_wraps_as_call_error(
 async def test_tavily_malformed_response_wraps_as_call_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A result missing 'url'/'title' is a TavilyParseError inside
-    data/tavily_parser.py — must be wrapped the same way a Himalayas
-    HimalayasParseError is, not conflated with "no usable signal."
-    """
+    """A Tavily result missing 'url'/'title' is wrapped as a call error, not conflated with no usable signal."""
     _patch_tavily(
         monkeypatch,
         _FakeTavilyClient({"results": [{"title": "x", "content": "y", "score": 0.5}]}),
     )
     with pytest.raises(roa.GroundingSourceCallError):
         await roa._fetch_tavily_results("Data Analyst")
-
-
-# --- timeout paths, tested explicitly, not just happy path ---------------
 
 
 async def test_himalayas_timeout_raises_grounding_source_call_error(
@@ -497,9 +436,6 @@ async def test_tavily_timeout_raises_grounding_source_call_error(
     )
     with pytest.raises(roa.GroundingSourceCallError):
         await roa._fetch_tavily_results("Data Analyst")
-
-
-# --- _safe_fetch_*: call_failed vs no_signal is intentional, not lost ----
 
 
 async def test_safe_fetch_himalayas_distinguishes_call_failed_from_no_signal(
@@ -555,9 +491,6 @@ async def test_safe_fetch_tavily_distinguishes_call_failed_from_no_signal(
     assert signal_status == "signal"
 
 
-# --- Clarify Gate conversational content: begin_clarify_gate / advance_clarify_gate ---
-
-
 def _agent_turn(content: str) -> dict:
     return {"role": "agent", "content": content}
 
@@ -572,27 +505,22 @@ REFERENCE_TIME = datetime(2026, 7, 5, 12, 0, 0)
 async def test_begin_clarify_gate_real_role_resolves_without_any_gemini_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """PRD §7.2: 'Clearly real role -> accept, proceed to Research' — no
-    LLM call is needed at all, since classification is fully deterministic
-    (security/input_gate.py).
-    """
-    client = _patch_gemini(monkeypatch, responses=[])
+    """A clearly real role resolves immediately with no LLM call needed."""
+    client = _patch_adk_runtime(monkeypatch, responses=[])
 
     turn = await roa.begin_clarify_gate("Data Analyst")
 
     assert turn.gate_state.stage is ClarifyGateStage.RESOLVED
     assert turn.resolved_role == "Data Analyst"
     assert not turn.exited
-    assert client.aio.models.calls == []
+    assert client.calls == []
 
 
 async def test_begin_clarify_gate_nonsense_loops_back_without_any_gemini_call(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """PRD §7.2: nonsense routes to 'ask to clarify' — a loop, not an
-    exit — and does not consume a narrowing round.
-    """
-    client = _patch_gemini(monkeypatch, responses=[])
+    """Nonsense input loops back with a re-prompt instead of exiting, without consuming a narrowing round."""
+    client = _patch_adk_runtime(monkeypatch, responses=[])
 
     turn = await roa.begin_clarify_gate("asdkjfh")
 
@@ -601,16 +529,14 @@ async def test_begin_clarify_gate_nonsense_loops_back_without_any_gemini_call(
     assert turn.resolved_role is None
     assert not turn.exited
     assert turn.message == roa.CLARIFY_GATE_NONSENSE_REPROMPT
-    assert client.aio.models.calls == []
+    assert client.calls == []
 
 
 async def test_begin_clarify_gate_vague_asks_one_narrowing_question(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """PRD §7.2: vague-but-genuine enters the narrowing loop with one
-    question at a time.
-    """
-    client = _patch_gemini(
+    """A vague-but-genuine goal enters the narrowing loop with one question at a time."""
+    client = _patch_adk_runtime(
         monkeypatch, responses=["What kind of apps do you want to build?"]
     )
 
@@ -620,17 +546,14 @@ async def test_begin_clarify_gate_vague_asks_one_narrowing_question(
     assert turn.gate_state.narrowing_rounds_used == 0
     assert turn.message == "What kind of apps do you want to build?"
     assert turn.context.original_stated_goal == "I want to make apps"
-    assert len(client.aio.models.calls) == 1
+    assert len(client.calls) == 1
 
 
 async def test_advance_clarify_gate_narrowing_round_resolves_immediately(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A narrowing answer that resolves a concrete role moves straight to
-    RESOLVED regardless of rounds used so far (mirrors
-    tests/test_input_gate.py's `advance_after_narrowing_round` case).
-    """
-    _patch_gemini(
+    """A narrowing answer that resolves a concrete role moves straight to RESOLVED regardless of rounds used so far."""
+    _patch_adk_runtime(
         monkeypatch,
         responses=[json.dumps({"resolved": True, "role": "Backend Engineer"})],
     )
@@ -656,27 +579,23 @@ async def test_advance_clarify_gate_narrowing_round_resolves_immediately(
 async def test_full_clarify_gate_sequence_rejects_proposal_and_explanation_then_exits(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """End-to-end Gherkin: vague goal -> two unresolved narrowing rounds
-    (bound reached) -> best-guess proposal rejected -> explanation
-    rejected -> grounding check on the user's ORIGINAL words -> zero
-    market signal -> exit, no outline built.
-    """
-    client = _patch_gemini(
+    """End-to-end sequence: unresolved narrowing rounds, a rejected best-guess proposal and explanation, then a zero-market-signal exit with no outline built."""
+    client = _patch_adk_runtime(
         monkeypatch,
         responses=[
-            "What area of app development interests you?",  # narrowing Q1
-            json.dumps({"resolved": False, "role": None}),  # eval answer 1
-            "Do you prefer frontend or backend work?",  # narrowing Q2
-            json.dumps({"resolved": False, "role": None}),  # eval answer 2
+            "What area of app development interests you?",
+            json.dumps({"resolved": False, "role": None}),
+            "Do you prefer frontend or backend work?",
+            json.dumps({"resolved": False, "role": None}),
             json.dumps(
                 {
                     "role": "Backend Engineer",
                     "message": "Sounds like Backend Engineer — right?",
                 }
-            ),  # best-guess proposal
-            json.dumps({"accepted": False}),  # proposal rejected
-            "Backend engineers build server-side logic and APIs.",  # explanation
-            json.dumps({"accepted": False}),  # explanation rejected
+            ),
+            json.dumps({"accepted": False}),
+            "Backend engineers build server-side logic and APIs.",
+            json.dumps({"accepted": False}),
         ],
     )
     ground_role_mock = MagicMock(
@@ -748,16 +667,14 @@ async def test_full_clarify_gate_sequence_rejects_proposal_and_explanation_then_
     assert "I want to make apps" in turn.message
     ground_role_mock.assert_called_once()
     assert ground_role_mock.call_args.args[0] == "I want to make apps"
-    assert len(client.aio.models.calls) == 8
+    assert len(client.calls) == 8
 
 
 async def test_advance_clarify_gate_resolves_at_low_confidence_on_weak_signal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Same rejection path, but any market signal (even weak) resolves at
-    low confidence instead of exiting (PRD §7.2), grounding the user's
-    ORIGINAL stated goal, never the most recent message."""
-    _patch_gemini(monkeypatch, responses=[json.dumps({"accepted": False})])
+    """Same rejection path, but any market signal, even weak, resolves at low confidence instead of exiting, grounding the user's original stated goal."""
+    _patch_adk_runtime(monkeypatch, responses=[json.dumps({"accepted": False})])
 
     async def _fake_ground_role(role_name, session, reference_time):
         assert role_name == "something with computers"
@@ -820,29 +737,22 @@ async def test_last_agent_message_raises_without_a_prior_agent_turn() -> None:
 async def test_create_initial_outline_uses_heavy_generation_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Wiring regression test: `create_initial_outline`'s Gemini call must
-    always pass `timeout=HEAVY_GENERATION_TIMEOUT_SECONDS` explicitly,
-    never fall back to the short-turn default — that fallback is exactly
-    what caused the real production incident this test guards against.
-    """
+    """Wiring regression test: create_initial_outline's Gemini call must always pass the heavy-generation timeout explicitly."""
     captured_kwargs: dict[str, object] = {}
 
-    async def _fake_call_gemini_json(
-        prompt: str, required_keys: set[str], **kwargs: object
+    async def _fake_call_agent_json(
+        agent: object, prompt: str, required_keys: set[str], **kwargs: object
     ) -> dict:
         captured_kwargs.update(kwargs)
         return json.loads(_WELL_FORMED_HIERARCHY_RESPONSE)
 
-    monkeypatch.setattr(roa, "_call_gemini_json", _fake_call_gemini_json)
+    monkeypatch.setattr(roa, "call_agent_json", _fake_call_agent_json)
 
     await roa.create_initial_outline(
         "Backend Engineer", [GIT_SKILL, PYTHON_SKILL], [DJANGO_SKILL]
     )
 
     assert captured_kwargs["timeout"] == roa.HEAVY_GENERATION_TIMEOUT_SECONDS
-
-
-# --- Initial Outline Creation: create_initial_outline ---------------------
 
 
 def _grounded(
@@ -868,9 +778,6 @@ DJANGO_SKILL = _grounded(
     confidence=ConfidenceTier.MEDIUM,
 )
 
-# One group per skill except Python, which fans out into 3 topics —
-# exercises both cross-group ordering (Git, then Python*, then Django)
-# and within-group ordering (Python syntax -> functions -> OOP).
 _WELL_FORMED_HIERARCHY_RESPONSE = json.dumps(
     {
         "groups": [
@@ -909,9 +816,8 @@ _WELL_FORMED_HIERARCHY_RESPONSE = json.dumps(
 async def test_create_initial_outline_orders_groups_in_prerequisite_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Global cross-group ordering: Git and all of Python's topics must
-    precede Django (task's explicit example)."""
-    _patch_gemini(monkeypatch, responses=[_WELL_FORMED_HIERARCHY_RESPONSE])
+    """Global cross-group ordering: Git and all of Python's topics must precede Django."""
+    _patch_adk_runtime(monkeypatch, responses=[_WELL_FORMED_HIERARCHY_RESPONSE])
 
     topics = await roa.create_initial_outline(
         "Backend Engineer", [GIT_SKILL, PYTHON_SKILL], [DJANGO_SKILL]
@@ -931,10 +837,8 @@ async def test_create_initial_outline_orders_groups_in_prerequisite_order(
 async def test_create_initial_outline_orders_within_group_in_prerequisite_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Within-group ordering: inside the 'Python' group, syntax must
-    precede functions must precede OOP — both by position_in_group and by
-    the global hierarchy_position."""
-    _patch_gemini(monkeypatch, responses=[_WELL_FORMED_HIERARCHY_RESPONSE])
+    """Within a group, topics keep their prerequisite order by both position_in_group and hierarchy_position."""
+    _patch_adk_runtime(monkeypatch, responses=[_WELL_FORMED_HIERARCHY_RESPONSE])
 
     topics = await roa.create_initial_outline(
         "Backend Engineer", [GIT_SKILL, PYTHON_SKILL], [DJANGO_SKILL]
@@ -955,10 +859,8 @@ async def test_create_initial_outline_orders_within_group_in_prerequisite_order(
 async def test_create_initial_outline_carries_source_fields_through_unaltered(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Every output topic's source_url/source_type/confidence must equal
-    its input skill's exactly — Gemini's JSON never even contains these
-    fields, so this also proves they can't be silently altered."""
-    _patch_gemini(monkeypatch, responses=[_WELL_FORMED_HIERARCHY_RESPONSE])
+    """Every output topic's source_url/source_type/confidence equals its input skill's exactly, unaltered."""
+    _patch_adk_runtime(monkeypatch, responses=[_WELL_FORMED_HIERARCHY_RESPONSE])
 
     topics = await roa.create_initial_outline(
         "Backend Engineer", [GIT_SKILL, PYTHON_SKILL], [DJANGO_SKILL]
@@ -988,7 +890,7 @@ async def test_create_initial_outline_carries_source_fields_through_unaltered(
 async def test_create_initial_outline_sets_is_enrichment_false_and_not_started(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _patch_gemini(monkeypatch, responses=[_WELL_FORMED_HIERARCHY_RESPONSE])
+    _patch_adk_runtime(monkeypatch, responses=[_WELL_FORMED_HIERARCHY_RESPONSE])
 
     topics = await roa.create_initial_outline(
         "Backend Engineer", [GIT_SKILL, PYTHON_SKILL], [DJANGO_SKILL]
@@ -1003,10 +905,10 @@ async def test_create_initial_outline_sets_is_enrichment_false_and_not_started(
 async def test_create_initial_outline_raises_on_missing_groups_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _patch_gemini(
+    _patch_adk_runtime(
         monkeypatch,
         responses=[json.dumps({"unexpected": "shape"})]
-        * (gc.GEMINI_JSON_RETRY_MAX_ATTEMPTS + 1),
+        * (adk_runtime.GEMINI_JSON_RETRY_MAX_ATTEMPTS + 1),
     )
 
     with pytest.raises(GeminiCallError):
@@ -1016,8 +918,7 @@ async def test_create_initial_outline_raises_on_missing_groups_key(
 async def test_create_initial_outline_raises_on_fabricated_source_skill(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The LLM referencing a skill that isn't in the grounded input at all
-    must raise, not silently pass through an unattributable topic."""
+    """The LLM referencing a skill absent from the grounded input raises rather than passing through silently."""
     response = json.dumps(
         {
             "groups": [
@@ -1033,7 +934,7 @@ async def test_create_initial_outline_raises_on_fabricated_source_skill(
             ]
         }
     )
-    _patch_gemini(monkeypatch, responses=[response])
+    _patch_adk_runtime(monkeypatch, responses=[response])
 
     with pytest.raises(GeminiCallError):
         await roa.create_initial_outline("Backend Engineer", [GIT_SKILL], [])
@@ -1042,9 +943,7 @@ async def test_create_initial_outline_raises_on_fabricated_source_skill(
 async def test_create_initial_outline_raises_when_a_skill_is_never_covered(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Dropping a grounded skill entirely (never referenced by any topic)
-    must raise — CLAUDE.md guardrail #1's 'never drop' extended to mean
-    every grounded skill must end up somewhere in the outline."""
+    """Dropping a grounded skill entirely, never referenced by any topic, raises."""
     response = json.dumps(
         {
             "groups": [
@@ -1055,7 +954,7 @@ async def test_create_initial_outline_raises_when_a_skill_is_never_covered(
             ]
         }
     )
-    _patch_gemini(monkeypatch, responses=[response])
+    _patch_adk_runtime(monkeypatch, responses=[response])
 
     with pytest.raises(GeminiCallError):
         await roa.create_initial_outline(
@@ -1069,7 +968,7 @@ async def test_create_initial_outline_raises_on_malformed_topic_entry(
     response = json.dumps(
         {"groups": [{"topic_group": "Git", "topics": [{"topic_name": "Git basics"}]}]}
     )
-    _patch_gemini(monkeypatch, responses=[response])
+    _patch_adk_runtime(monkeypatch, responses=[response])
 
     with pytest.raises(GeminiCallError):
         await roa.create_initial_outline("Backend Engineer", [GIT_SKILL], [])
@@ -1086,19 +985,11 @@ def test_build_grounded_skill_map_raises_on_duplicate_skill_name() -> None:
         roa._build_grounded_skill_map([GIT_SKILL], [duplicate])
 
 
-# --- Outline Confirmation: begin_outline_confirmation / handle_review_turn ---
-
-
 async def _build_sample_topics(
     monkeypatch: pytest.MonkeyPatch,
 ) -> list[roa.InitialOutlineTopic]:
-    """5 real topics across 3 groups (Git, Python, Django), built via the
-    already-tested create_initial_outline + the existing well-formed
-    hierarchy fixture above — avoids hand-constructing InitialOutlineTopic
-    instances that could drift from what the real function actually
-    produces.
-    """
-    _patch_gemini(monkeypatch, responses=[_WELL_FORMED_HIERARCHY_RESPONSE])
+    """Build 5 real topics across 3 groups by calling the already-tested create_initial_outline."""
+    _patch_adk_runtime(monkeypatch, responses=[_WELL_FORMED_HIERARCHY_RESPONSE])
     return await roa.create_initial_outline(
         "Backend Engineer", [GIT_SKILL, PYTHON_SKILL], [DJANGO_SKILL]
     )
@@ -1123,15 +1014,13 @@ async def test_begin_outline_confirmation_presents_grounded_why_reasoning(
 ) -> None:
     topics = await _build_sample_topics(monkeypatch)
 
-    _patch_gemini(monkeypatch, responses=[_topic_explanations_response(topics)])
+    _patch_adk_runtime(monkeypatch, responses=[_topic_explanations_response(topics)])
     turn = await roa.begin_outline_confirmation("Backend Engineer", topics)
 
     assert turn.state.stage is OutlineConfirmationStage.REVIEWING
     assert turn.state.rounds_used == 0
     assert turn.topics == topics
     assert not turn.concluded
-    # every topic's real source_url must appear in the presentation —
-    # never fabricated, never dropped (CLAUDE.md guardrail #1)
     for topic in topics:
         assert topic.topic_name in turn.message
         assert topic.source_url in turn.message
@@ -1148,7 +1037,7 @@ async def test_generate_topic_explanations_raises_on_uncovered_topic(
             ]
         }
     )
-    _patch_gemini(monkeypatch, responses=[incomplete_response])
+    _patch_adk_runtime(monkeypatch, responses=[incomplete_response])
 
     with pytest.raises(GeminiCallError):
         await roa._generate_topic_explanations("Backend Engineer", topics)
@@ -1167,7 +1056,7 @@ async def test_generate_topic_explanations_raises_on_unknown_topic(
             + [{"topic_name": "Not A Real Topic", "explanation": "Made up."}]
         }
     )
-    _patch_gemini(monkeypatch, responses=[response_with_fabricated_topic])
+    _patch_adk_runtime(monkeypatch, responses=[response_with_fabricated_topic])
 
     with pytest.raises(GeminiCallError):
         await roa._generate_topic_explanations("Backend Engineer", topics)
@@ -1181,7 +1070,7 @@ async def test_handle_review_turn_question_does_not_consume_round(
         stage=OutlineConfirmationStage.REVIEWING, rounds_used=0
     )
 
-    _patch_gemini(
+    _patch_adk_runtime(
         monkeypatch,
         responses=[
             json.dumps({"action": "question"}),
@@ -1207,7 +1096,7 @@ async def test_handle_review_turn_question_never_consumes_a_round_even_repeated(
     )
 
     for _ in range(4):
-        _patch_gemini(
+        _patch_adk_runtime(
             monkeypatch,
             responses=[json.dumps({"action": "question"}), "Here's the answer."],
         )
@@ -1227,7 +1116,7 @@ async def test_handle_review_turn_concern_consumes_a_round(
         stage=OutlineConfirmationStage.REVIEWING, rounds_used=0
     )
 
-    _patch_gemini(
+    _patch_adk_runtime(
         monkeypatch,
         responses=[
             json.dumps({"action": "concern"}),
@@ -1246,17 +1135,15 @@ async def test_handle_review_turn_concern_consumes_a_round(
 async def test_handle_review_turn_addition_request_consumes_round_without_regenerating(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """handle_review_turn classifies and consumes the round for an
-    addition request, but does NOT regenerate the outline itself — topics
-    must come back unchanged; regeneration is a separate, explicit call
-    (regenerate_outline_with_addition) once the addition is grounded.
-    """
+    """An addition request consumes a round but does not itself regenerate the outline; topics come back unchanged."""
     topics = await _build_sample_topics(monkeypatch)
     state = OutlineConfirmationState(
         stage=OutlineConfirmationStage.REVIEWING, rounds_used=0
     )
 
-    _patch_gemini(monkeypatch, responses=[json.dumps({"action": "addition_request"})])
+    _patch_adk_runtime(
+        monkeypatch, responses=[json.dumps({"action": "addition_request"})]
+    )
     turn = await roa.handle_review_turn(
         state, "Backend Engineer", topics, "Can you add GraphQL?"
     )
@@ -1276,7 +1163,7 @@ async def test_handle_review_turn_confirm_ends_review_immediately(
         stage=OutlineConfirmationStage.REVIEWING, rounds_used=1
     )
 
-    _patch_gemini(monkeypatch, responses=[json.dumps({"action": "confirm"})])
+    _patch_adk_runtime(monkeypatch, responses=[json.dumps({"action": "confirm"})])
     turn = await roa.handle_review_turn(
         state, "Backend Engineer", topics, "Looks great, let's start!"
     )
@@ -1289,16 +1176,13 @@ async def test_handle_review_turn_confirm_ends_review_immediately(
 async def test_handle_review_turn_round_bound_reached_after_two_concerns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Bound-exhausted exit: after exactly 2 round-consuming actions, the
-    loop concludes and the response is framed 'starting here, refine as
-    we go' — never exceeding the 2-round bound.
-    """
+    """After exactly 2 round-consuming actions, the review loop concludes rather than exceeding its bound."""
     topics = await _build_sample_topics(monkeypatch)
     state = OutlineConfirmationState(
         stage=OutlineConfirmationStage.REVIEWING, rounds_used=0
     )
 
-    _patch_gemini(
+    _patch_adk_runtime(
         monkeypatch,
         responses=[json.dumps({"action": "concern"}), "First response."],
     )
@@ -1308,7 +1192,7 @@ async def test_handle_review_turn_round_bound_reached_after_two_concerns(
     assert turn.state.rounds_used == 1
     assert not turn.concluded
 
-    _patch_gemini(
+    _patch_adk_runtime(
         monkeypatch,
         responses=[json.dumps({"action": "concern"}), "Second response."],
     )
@@ -1341,7 +1225,9 @@ async def test_classify_review_turn_raises_on_unrecognized_action(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     topics = await _build_sample_topics(monkeypatch)
-    _patch_gemini(monkeypatch, responses=[json.dumps({"action": "not_a_real_action"})])
+    _patch_adk_runtime(
+        monkeypatch, responses=[json.dumps({"action": "not_a_real_action"})]
+    )
 
     with pytest.raises(GeminiCallError):
         await roa._classify_review_turn("Backend Engineer", topics, "hello")
@@ -1350,7 +1236,9 @@ async def test_classify_review_turn_raises_on_unrecognized_action(
 async def test_extract_addition_skill_name_returns_clean_name(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _patch_gemini(monkeypatch, responses=[json.dumps({"skill_name": "Kubernetes"})])
+    _patch_adk_runtime(
+        monkeypatch, responses=[json.dumps({"skill_name": "Kubernetes"})]
+    )
 
     result = await roa._extract_addition_skill_name("can we add some kubernetes stuff")
 
@@ -1360,10 +1248,10 @@ async def test_extract_addition_skill_name_returns_clean_name(
 async def test_extract_addition_skill_name_raises_on_missing_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _patch_gemini(
+    _patch_adk_runtime(
         monkeypatch,
         responses=[json.dumps({"unexpected": "shape"})]
-        * (gc.GEMINI_JSON_RETRY_MAX_ATTEMPTS + 1),
+        * (adk_runtime.GEMINI_JSON_RETRY_MAX_ATTEMPTS + 1),
     )
 
     with pytest.raises(GeminiCallError):
@@ -1373,14 +1261,10 @@ async def test_extract_addition_skill_name_raises_on_missing_key(
 async def test_ground_addition_request_closes_the_previously_flagged_gap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Regression test for the real, user-reported gap: Outline
-    Confirmation's addition-request path previously always said grounding
-    a raw addition wasn't wired up (Architecture §10/PRD §11 item 6).
-    `ground_addition_request` closes it: extract a clean skill name, then
-    confirm it via a live Tavily search, never a fabricated source_url
-    (CLAUDE.md guardrail #1).
-    """
-    _patch_gemini(monkeypatch, responses=[json.dumps({"skill_name": "Kubernetes"})])
+    """ground_addition_request extracts a clean skill name and confirms it via a live Tavily search."""
+    _patch_adk_runtime(
+        monkeypatch, responses=[json.dumps({"skill_name": "Kubernetes"})]
+    )
     _patch_tavily(
         monkeypatch,
         _FakeTavilyClient(
@@ -1402,9 +1286,10 @@ async def test_ground_addition_request_closes_the_previously_flagged_gap(
 async def test_ground_addition_request_returns_none_when_tavily_has_nothing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Never a fabricated source_url — a Tavily batch with no usable
-    result must return `None`, not invent a citation."""
-    _patch_gemini(monkeypatch, responses=[json.dumps({"skill_name": "Kubernetes"})])
+    """A Tavily batch with no usable result returns None rather than inventing a citation."""
+    _patch_adk_runtime(
+        monkeypatch, responses=[json.dumps({"skill_name": "Kubernetes"})]
+    )
     _patch_tavily(monkeypatch, _FakeTavilyClient(_tavily_response([])))
 
     result = await roa.ground_addition_request("add kubernetes")
@@ -1415,12 +1300,7 @@ async def test_ground_addition_request_returns_none_when_tavily_has_nothing(
 async def test_regenerate_outline_with_addition_produces_valid_sourced_outline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Accepted addition: regenerate via create_initial_outline (never
-    outline/hierarchy.py's insertion logic), producing a fully valid,
-    fully sourced outline — strictly-increasing hierarchy positions,
-    every topic's sourcing traceable to an input skill (reusing the same
-    checks as tests/test_pipeline_integration.py's
-    _assert_valid_outline)."""
+    """An accepted addition regenerates via create_initial_outline into a fully valid, fully sourced outline."""
     topics = await _build_sample_topics(monkeypatch)
     state = OutlineConfirmationState(
         stage=OutlineConfirmationStage.REVIEWING, rounds_used=1
@@ -1466,7 +1346,7 @@ async def test_regenerate_outline_with_addition_produces_valid_sourced_outline(
             ]
         }
     )
-    _patch_gemini(monkeypatch, responses=[new_response])
+    _patch_adk_runtime(monkeypatch, responses=[new_response])
 
     turn = await roa.regenerate_outline_with_addition(
         state, "Backend Engineer", [GIT_SKILL, PYTHON_SKILL], [DJANGO_SKILL], new_skill
@@ -1495,7 +1375,6 @@ async def test_regenerate_outline_with_addition_produces_valid_sourced_outline(
         assert topic.is_enrichment is False
         assert topic.status == "not_started"
 
-    # unchanged topics' sourcing must be untouched by regeneration
     old_by_name = {t.topic_name: t for t in topics}
     for topic in new_topics:
         if topic.topic_name in old_by_name:
@@ -1528,7 +1407,7 @@ async def test_regenerate_outline_with_addition_frames_bound_reached_message(
             ]
         }
     )
-    _patch_gemini(monkeypatch, responses=[response])
+    _patch_adk_runtime(monkeypatch, responses=[response])
 
     turn = await roa.regenerate_outline_with_addition(
         state, "Backend Engineer", [GIT_SKILL], [], new_skill

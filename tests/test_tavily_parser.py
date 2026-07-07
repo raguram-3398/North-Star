@@ -1,13 +1,4 @@
-"""Tests for data/tavily_parser.py — the coarse, vocabulary-based skill
-extractor for Tavily search results.
-
-Real fixtures (tests/fixtures/tavily_search_*.json) were captured live
-via TavilyClient.search for the same 4 seed roles as the Himalayas
-fixtures (Backend Engineer, Frontend Engineer, Data Analyst, DevOps
-Engineer), so cross-validation tests can later use both sources for the
-same role. Per this project's multi-example testing discipline, these
-tests check several different real results, not just one.
-"""
+"""Tests for data/tavily_parser.py: the coarse, vocabulary-based skill extractor for Tavily search results."""
 
 import json
 from pathlib import Path
@@ -37,9 +28,6 @@ def _result_by_title_prefix(response: dict, title_prefix: str) -> dict:
     raise AssertionError(f"no result titled {title_prefix!r} in fixture")
 
 
-# --- extract_skills_from_content -----------------------------------------
-
-
 def test_extract_skills_from_content_finds_multiple_real_terms() -> None:
     assert extract_skills_from_content(
         "you need strong programming skills in languages like Java, Python, or Node.js"
@@ -65,21 +53,13 @@ def test_extract_skills_from_content_is_case_insensitive() -> None:
 
 
 def test_extract_skills_from_content_uses_word_boundaries() -> None:
-    """ "R" is in the vocabulary but must not match inside an unrelated
-    word like "Regression" or "correlation" — a substring-only match
-    would false-positive constantly on a single-letter term like this.
-    """
+    """ "R" is in the vocabulary but must not match inside an unrelated word like "Regression"."""
     assert "R" not in extract_skills_from_content("correlation and regression analysis")
     assert "R" in extract_skills_from_content("statistical modeling in R for analysts")
 
 
-# --- parse_tavily_result / parse_tavily_response, real fixtures ----------
-
-
 def test_parse_result_with_clearly_extractable_skills() -> None:
-    """A real, mid-scoring Data Analyst result that explicitly names
-    several tools — the clearly-extractable case.
-    """
+    """A real, mid-scoring Data Analyst result that explicitly names several tools."""
     response = _load_fixture("tavily_search_data_analyst.json")
     raw_result = _result_by_title_prefix(response, "What Skills Are Needed")
 
@@ -99,12 +79,7 @@ def test_parse_result_with_clearly_extractable_skills() -> None:
 
 
 def test_parse_result_with_no_extractable_skills() -> None:
-    """A real, highest-scoring Backend Engineer result whose content is
-    generic ("Degree in Computer Science...") and names no specific
-    technology at all — confirms score alone doesn't guarantee anything
-    is extractable, and confirms the module doesn't fabricate skills to
-    compensate.
-    """
+    """A real, highest-scoring Backend Engineer result that is generic and names no specific technology."""
     response = _load_fixture("tavily_search_backend_engineer.json")
     raw_result = _result_by_title_prefix(response, "Back-end Engineer Job Description")
 
@@ -115,14 +90,7 @@ def test_parse_result_with_no_extractable_skills() -> None:
 
 
 def test_high_score_does_not_guarantee_extractable_skills() -> None:
-    """The single highest-scoring result across all 4 gathered fixtures
-    (Indeed's Data Analyst page) is a sitemap-style list of unrelated job
-    titles (Zookeeper, Welder, Teacher, ...) — real, off-topic, and the
-    top-scored result for its query. Documents the module docstring's
-    real-data finding directly: score does not reliably predict
-    extractability, so it must not be used as an implicit filter inside
-    this module.
-    """
+    """The single highest-scoring fixture result is an off-topic sitemap page, showing score doesn't predict extractability."""
     response = _load_fixture("tavily_search_data_analyst.json")
     raw_result = _result_by_title_prefix(response, "Data Analyst Job Description")
 
@@ -130,15 +98,11 @@ def test_high_score_does_not_guarantee_extractable_skills() -> None:
 
     assert parsed.score == pytest.approx(raw_result["score"])
     assert parsed.skills == []
-    # confirm this really is the highest-scoring result in the fixture,
-    # not an arbitrary one — that's the whole point of this test.
     assert raw_result["score"] == max(r["score"] for r in response["results"])
 
 
 def test_parse_tavily_response_across_multiple_real_roles() -> None:
-    """Cross-checked against three different real, live-captured roles —
-    not just one.
-    """
+    """Cross-checked against three different real, live-captured roles, not just one."""
     cases = [
         ("tavily_search_frontend_engineer.json", 10),
         ("tavily_search_data_analyst.json", 9),
@@ -156,11 +120,7 @@ def test_parse_tavily_response_across_multiple_real_roles() -> None:
 
 
 def test_parse_tavily_response_at_least_one_result_per_role_has_skills() -> None:
-    """A sanity check that the extractor isn't silently returning empty
-    skills for everything — at least one real result per role should
-    have matched something, given the vocabulary is grounded in real
-    skills for these exact roles.
-    """
+    """A sanity check that the extractor isn't silently returning empty skills for every result."""
     for filename in [
         "tavily_search_frontend_engineer.json",
         "tavily_search_data_analyst.json",
@@ -176,9 +136,6 @@ def test_parse_tavily_response_empty_results_is_empty_list() -> None:
 
 def test_parse_tavily_response_missing_results_key_is_empty_list() -> None:
     assert parse_tavily_response({}) == []
-
-
-# --- malformed input (structural errors, not "nothing extractable") ------
 
 
 def test_parse_tavily_result_missing_url_raises() -> None:

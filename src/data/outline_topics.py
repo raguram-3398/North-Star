@@ -1,18 +1,4 @@
-"""outline_topics I/O.
-
-Per Architecture_North_Star.md §5. Reads/status-updates existing rows
-(`get_topic`, `get_topics_in_group`, `mark_topic_completed` —
-`agents/coaching_pace_agent.py`'s original consumers), plus
-`insert_outline_topics`, which closes the previously-flagged integration
-gap (PRD §11 / Architecture §10): persisting
-`agents/research_outline_agent.py`'s `create_initial_outline`/
-`regenerate_outline_with_addition` output into real rows. Every other
-function in this module still assumes the row already exists by the time
-it runs — only `insert_outline_topics` is a create path.
-
-Sessions are passed in by the caller (dependency injection), matching
-`data/roles_cache.py`'s established pattern.
-"""
+"""Read, status-update, and insert outline_topics rows, including persisting a freshly generated or regenerated outline."""
 
 import uuid
 from collections.abc import Sequence
@@ -26,12 +12,6 @@ from models.schemas import OutlineTopic
 from outline.hierarchy import augment_existing_topic, insert_new_topic
 from security.output_guard import ConfidenceTier
 
-# Match Architecture §5's `status TEXT` column comment
-# (`not_started | in_progress | completed | completed_test_out`) exactly.
-# `NOT_STARTED_STATUS` duplicated here rather than imported from
-# `agents/research_outline_agent.py` (which also defines it) deliberately:
-# data/ modules do not import from agents/ (see `SequencedOutlineTopic`
-# below) — agents call this module as a tool, never the other way around.
 NOT_STARTED_STATUS = "not_started"
 COMPLETED_STATUS = "completed"
 COMPLETED_TEST_OUT_STATUS = "completed_test_out"
@@ -40,28 +20,8 @@ _VALID_COMPLETION_STATUSES = frozenset({COMPLETED_STATUS, COMPLETED_TEST_OUT_STA
 
 @runtime_checkable
 class SequencedOutlineTopic(Protocol):
-    """The structural shape `insert_outline_topics` requires — matches
-    `agents/research_outline_agent.py`'s `InitialOutlineTopic` (the
-    output of `create_initial_outline`/`regenerate_outline_with_addition`)
-    field-for-field.
+    """The structural shape a sequenced outline topic must have to be persisted, checked at runtime instead of via an imported dataclass."""
 
-    Checked at runtime via `@runtime_checkable` rather than importing that
-    agent-owned dataclass directly and using `isinstance` against it:
-    `agents/research_outline_agent.py` is a *caller* of this module (see
-    Architecture §3, "Calls as tools... data/outline_topics.py"), so this
-    module importing back from `agents/` would invert that dependency
-    direction and risks a real circular import the moment the agent's own
-    caller wires `insert_outline_topics` in. A `runtime_checkable`
-    Protocol gives the same practical guarantee CLAUDE.md guardrail #12
-    asks for — a raw dict is structurally rejected (`isinstance` is False:
-    a dict has no `.topic_name` attribute) — without that dependency.
-    """
-
-    # Declared as read-only `@property` members, not plain attribute
-    # annotations: a plain `name: str` Protocol attribute is implicitly
-    # read-write, which `InitialOutlineTopic` (a frozen, read-only
-    # dataclass) structurally does not satisfy under static type checking
-    # even though it satisfies the runtime `isinstance` check just fine.
     @property
     def topic_name(self) -> str: ...
     @property
@@ -110,12 +70,7 @@ def get_topic(session: Session, topic_id: str) -> dict[str, Any] | None:
 def get_topics_in_group(
     session: Session, user_id: str, topic_group: str
 ) -> list[dict[str, Any]]:
-    """Read every topic in `topic_group` for `user_id`, ordered by
-    `position_in_group` — used to determine a topic-group's total size
-    for hands-on ramping (Architecture §3's ramping rule needs
-    `position_in_group` *and* the group's size, not a fixed day-count
-    constant).
-    """
+    """Read every topic in a topic group for a user, ordered by position within the group."""
     rows = (
         session.query(OutlineTopic)
         .filter(
@@ -130,21 +85,7 @@ def get_topics_in_group(
 def mark_topic_completed(
     session: Session, topic_id: str, status: str = COMPLETED_STATUS
 ) -> None:
-    """Mark a topic completed and stamp `completed_at` — called once all
-    5 verification question slots have resolved (PRD §7.7), whether via
-    regular day-by-day coaching or test-out (PRD's day-by-day coaching
-    section's "verification-first" exception).
-
-    `status` defaults to `COMPLETED_STATUS` ("completed"); the test-out
-    task added `COMPLETED_TEST_OUT_STATUS` ("completed_test_out") as an
-    explicit alternative — Architecture §5's schema lists it as a
-    distinct value from `completed`, not a synonym, so
-    `agents/coaching_pace_agent.py`'s test-out completion path passes it
-    explicitly rather than this function silently collapsing the two.
-
-    Raises `ValueError` if `topic_id` does not exist, or if `status` is
-    not one of the two recognized completion values.
-    """
+    """Mark a topic completed (via regular coaching or test-out) and stamp its completion time."""
     if status not in _VALID_COMPLETION_STATUSES:
         raise ValueError(
             f"status must be one of {sorted(_VALID_COMPLETION_STATUSES)}, "
@@ -165,25 +106,7 @@ def augment_outline_topic(
     source_type: str,
     confidence: ConfidenceTier,
 ) -> dict[str, Any]:
-    """Refresh an existing topic's provenance fields in place (PRD §7.4's
-    "Augmentation" update type: "an existing topic's content refreshed in
-    place") via `outline/hierarchy.py`'s existing `augment_existing_topic`
-    (not reimplemented here) — the augmentation counterpart to
-    `insert_new_outline_topic`'s addition path.
-
-    Never touches `status`/`completed_at`/`hierarchy_position`/
-    `topic_name` — CLAUDE.md guardrail #5 ("never let a patch-note reopen
-    or alter the completion/verification status of its origin topic")
-    applies here even though this function's caller
-    (`agents/coaching_pace_agent.py`'s `maybe_deliver_patch`) is delivering
-    a market update to an *already-completed* topic: only the market-
-    grounding provenance (`source_url`/`source_type`/`confidence`) is
-    refreshed, exactly what `augment_existing_topic`'s `refreshed_content`
-    parameter is scoped to. Commits the transaction.
-
-    Raises `ValueError` (via `augment_existing_topic`) if `topic_id` does
-    not exist.
-    """
+    """Refresh an existing topic's source URL, source type, and confidence in place without touching its status or position."""
     row = session.get(OutlineTopic, topic_id)
     if row is None:
         raise ValueError(f"outline topic {topic_id!r} not found")
@@ -208,36 +131,7 @@ def insert_outline_topics(
     user_id: str,
     topics: Sequence[SequencedOutlineTopic],
 ) -> list[dict[str, Any]]:
-    """Persist a freshly-created or regenerated outline
-    (`agents/research_outline_agent.py`'s `create_initial_outline`/
-    `regenerate_outline_with_addition` output) as real `outline_topics`
-    rows, and return the persisted rows (with generated `id`s).
-
-    **Regeneration-replaces-prior-unstarted-rows:** `topics` is always the
-    *entire* outline (Outline Confirmation's accepted-addition path
-    regenerates the full hierarchy from scratch, per PRD §7.5 — it is
-    never a partial delta). So this function deletes every existing
-    `outline_topics` row for `user_id` and inserts the new set in the same
-    transaction. A first-time call (no prior rows) degenerates to a plain
-    insert.
-
-    This is safe specifically because Outline Confirmation is a
-    provably pre-Day-1 window (PRD §7.5: "no user-initiated outline
-    editing once Day 1 begins") — no row for this user can have
-    progressed past `not_started` while regeneration is still possible.
-    This function does not merely assume that invariant: it raises
-    `ValueError` if it ever finds an existing row already
-    `in_progress`/`completed`/`completed_test_out`, rather than silently
-    deleting it — replacing already-progressed content would violate
-    CLAUDE.md guardrail #2 ("never delete or reduce outline content").
-
-    Raises `ValueError` if `topics` is empty, or if an existing row for
-    `user_id` has already progressed past `not_started`. Raises
-    `TypeError` if any entry in `topics` is not a `SequencedOutlineTopic`
-    (structurally checked — see that Protocol's docstring for why this is
-    a runtime check rather than an `isinstance` against an imported
-    agent-owned dataclass). Commits the transaction.
-    """
+    """Replace a user's entire outline_topics rows with a freshly generated or regenerated set, refusing to overwrite progressed rows."""
     if not topics:
         raise ValueError("insert_outline_topics requires at least one topic")
     for topic in topics:
@@ -257,19 +151,12 @@ def insert_outline_topics(
         raise ValueError(
             f"cannot persist a regenerated outline for user {user_id!r}: "
             f"{len(already_progressed)} existing row(s) have already "
-            "progressed past 'not_started' — regenerating over "
-            "started/completed content would violate CLAUDE.md guardrail #2"
+            "progressed past 'not_started' — outline content is never "
+            "overwritten once started or completed"
         )
     for row in existing_rows:
         session.delete(row)
 
-    # IDs are generated explicitly here (not left to OutlineTopic.id's
-    # `default=uuid.uuid4` mapped-column default), so a persisted row's
-    # id is available immediately on the returned dict without requiring
-    # a real flush against a live engine — this module's tests use a
-    # mocked Session (matching data/roles_cache.py's established
-    # no-SQLite-substitute convention), which cannot execute SQLAlchemy's
-    # own default-generation machinery.
     new_rows = [
         OutlineTopic(
             id=uuid.uuid4(),
@@ -295,30 +182,7 @@ def insert_outline_topics(
 def get_completed_topics_matching_skill(
     session: Session, skill_name: str
 ) -> list[dict[str, Any]]:
-    """Find every completed (`completed` or `completed_test_out`)
-    `outline_topics` row, across all users, whose `topic_name` matches
-    `skill_name` — used by `src/cron/refresh_roles.py` to find which
-    users' already-completed topics are affected by a significant
-    `roles_cache` crossing for that skill (Architecture §9's "generates a
-    patch-note candidate for every user with a completed topic matching
-    that skill").
-
-    Matching is case-insensitive (`func.lower()` on the SQL side, `.lower()`
-    on the Python side — not `.casefold()`, unlike this codebase's usual
-    skill-matching convention elsewhere: this comparison must execute
-    inside the DB query, and Postgres's `lower()` only approximates ASCII
-    lowercasing, so pairing it with Python's more aggressive Unicode
-    `.casefold()` on the other side of the comparison risks a silent
-    mismatch for non-ASCII input. Skill names here are expected to be
-    plain ASCII tech terms, so this is a narrow, flagged judgment call,
-    not a correctness concern in practice) — outline topic names and
-    roles_cache skill names are populated by two different pipelines
-    (Gemini-sequenced topic hierarchy vs. Himalayas/Tavily-extracted skill
-    strings) with no guaranteed identical casing convention.
-
-    Not scoped to a single user — deliberately global, per Architecture
-    §9's "every user" wording.
-    """
+    """Find every completed outline_topics row, across all users, whose topic name case-insensitively matches a given skill name."""
     rows = (
         session.query(OutlineTopic)
         .filter(
@@ -331,26 +195,13 @@ def get_completed_topics_matching_skill(
 
 
 def get_all_topics_for_user(session: Session, user_id: str) -> list[dict[str, Any]]:
-    """Read every `outline_topics` row for `user_id`, regardless of status
-    or `topic_group` — used as the `existing_topics` input to
-    `outline/hierarchy.py`'s `insert_new_topic` (not reimplemented here),
-    which needs the user's whole existing hierarchy to renumber against,
-    and by enrichment selection to check which skill names are already in
-    use.
-    """
+    """Read every outline_topics row for a user, regardless of status or topic group."""
     rows = session.query(OutlineTopic).filter(OutlineTopic.user_id == user_id).all()
     return [_to_dict(row) for row in rows]
 
 
 def has_pending_enrichment_topic(session: Session, user_id: str) -> bool:
-    """True if `user_id` already has an `is_enrichment=True` topic that
-    has not yet resolved (`status` not in `{completed, completed_test_out}`).
-
-    Used to prevent a second sustained-ahead trigger from inserting a
-    second enrichment topic while one is still pending (PRD §7.10) —
-    `agents/coaching_pace_agent.py`'s `maybe_trigger_enrichment` checks
-    this before selecting a candidate skill.
-    """
+    """True if the user already has an unresolved enrichment topic pending."""
     row = (
         session.query(OutlineTopic)
         .filter(
@@ -375,24 +226,7 @@ def insert_new_outline_topic(
     is_enrichment: bool,
     prerequisite_topic_ids: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
-    """Insert one new topic into `user_id`'s existing hierarchy via
-    `outline/hierarchy.py`'s `insert_new_topic` (not reimplemented here) —
-    the single insertion mechanism intended for any additive, hierarchy-
-    positioned update (market-driven patch content, PRD §7.9; enrichment,
-    PRD §7.10), not a second insertion path. Renumbers `hierarchy_position`
-    on every existing row that shifts as a result, then persists the new
-    row. Commits the transaction.
-
-    `prerequisite_topic_ids` is passed straight through to
-    `insert_new_topic` — e.g. the single just-completed topic that
-    triggered an enrichment insertion, so the new topic lands immediately
-    after the user's current position rather than at the very start of
-    the whole hierarchy (`insert_new_topic`'s behavior with no
-    prerequisites at all).
-
-    Raises `ValueError` (via `insert_new_topic`) if any id in
-    `prerequisite_topic_ids` is not found in `user_id`'s existing topics.
-    """
+    """Insert one new topic into a user's existing hierarchy, renumbering affected positions and persisting the new row."""
     existing_rows = (
         session.query(OutlineTopic).filter(OutlineTopic.user_id == user_id).all()
     )

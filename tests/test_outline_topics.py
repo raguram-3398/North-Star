@@ -1,20 +1,4 @@
-"""Tests for data/outline_topics.py's `insert_outline_topics` — the
-persistence-layer gap closed by this task (PRD §11 item 8 / Architecture
-§10, now resolved).
-
-Uses a mocked SQLAlchemy Session rather than a real database, matching
-`data/roles_cache.py`'s established convention (see test_roles_cache.py's
-module docstring): CLAUDE.md's Stack section forbids a SQLite substitute
-for Neon Postgres, and `OutlineTopic.id` uses a Postgres-specific
-`sqlalchemy.dialects.postgresql.UUID` column type a SQLite engine
-couldn't run anyway.
-
-`get_topic`/`get_topics_in_group` are pre-existing and out of scope here.
-`mark_topic_completed` gained an optional `status` parameter as part of
-the test-out (verification-first) task — see the dedicated tests below —
-but its pre-existing default-`"completed"` behavior is otherwise
-unchanged.
-"""
+"""Tests for data/outline_topics.py: outline topic insertion, augmentation, and completion, using a mocked Session."""
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -48,11 +32,7 @@ def _topic(
     is_enrichment: bool = False,
     status: str = NOT_STARTED_STATUS,
 ) -> InitialOutlineTopic:
-    """Build a real `InitialOutlineTopic` — the exact type
-    `create_initial_outline`/`regenerate_outline_with_addition` produce —
-    rather than a hand-rolled stand-in, so these tests exercise the real
-    output shape.
-    """
+    """Build a real InitialOutlineTopic matching the shape agent-produced outlines actually use."""
     return InitialOutlineTopic(
         topic_name=topic_name,
         hierarchy_position=hierarchy_position,
@@ -73,8 +53,7 @@ def _session_with_existing_rows(rows: list[SimpleNamespace]) -> MagicMock:
 
 
 def test_insert_outline_topics_persists_a_fresh_outline() -> None:
-    """The normal path: `create_initial_outline`'s shape, no prior rows
-    for this user (a plain insert, not a replacement)."""
+    """The normal path: no prior rows for this user, so it is a plain insert, not a replacement."""
     session = _session_with_existing_rows([])
     topics = [
         _topic("Git basics", 1, "Git", 1),
@@ -93,7 +72,7 @@ def test_insert_outline_topics_persists_a_fresh_outline() -> None:
     assert all(row["id"] is not None for row in result)
     assert all(row["user_id"] == "user-1" for row in result)
     assert all(row["status"] == NOT_STARTED_STATUS for row in result)
-    assert result[2]["confidence"] == "high"  # stored as the .value, not the enum
+    assert result[2]["confidence"] == "high"
 
     session.delete.assert_not_called()
     session.add_all.assert_called_once()
@@ -101,12 +80,7 @@ def test_insert_outline_topics_persists_a_fresh_outline() -> None:
 
 
 def test_insert_outline_topics_regeneration_replaces_prior_unstarted_rows() -> None:
-    """The regeneration path: `regenerate_outline_with_addition` produces
-    a brand-new full topic set (PRD §7.5's "regenerates the full outline
-    from scratch") that must replace, not append to, whatever this user
-    already had — every prior row is still `not_started` since
-    regeneration only ever happens pre-Day-1.
-    """
+    """A regenerated full topic set must replace, not append to, whatever this user already had."""
     prior_row_1 = SimpleNamespace(id="old-1", status=NOT_STARTED_STATUS)
     prior_row_2 = SimpleNamespace(id="old-2", status=NOT_STARTED_STATUS)
     session = _session_with_existing_rows([prior_row_1, prior_row_2])
@@ -132,12 +106,7 @@ def test_insert_outline_topics_regeneration_replaces_prior_unstarted_rows() -> N
 
 
 def test_insert_outline_topics_raises_if_an_existing_row_has_progressed() -> None:
-    """Guardrail #2 ('never delete or reduce outline content') must block
-    regeneration from silently discarding a row the user has already
-    started or completed — this should never happen given Outline
-    Confirmation's pre-Day-1 scope, but the function does not trust that
-    invariant blindly.
-    """
+    """Regeneration must never silently discard a row the user has already started or completed."""
     in_progress_row = SimpleNamespace(id="old-1", status="in_progress")
     session = _session_with_existing_rows([in_progress_row])
 
@@ -157,11 +126,7 @@ def test_insert_outline_topics_rejects_empty_topic_list() -> None:
 
 
 def test_insert_outline_topics_rejects_a_raw_dict_in_place_of_a_topic_object() -> None:
-    """CLAUDE.md guardrail #12: a raw dict must not be silently accepted
-    in place of an already-sequenced topic object — this is a
-    `TypeError`, not a `ValueError`, since it's a caller/type contract
-    violation, not a data-integrity problem with otherwise-valid input.
-    """
+    """A raw dict must not be silently accepted in place of an already-sequenced topic object, raising TypeError not ValueError."""
     session = _session_with_existing_rows([])
     raw_dict_topic = {
         "topic_name": "Git basics",
@@ -195,10 +160,7 @@ def test_mark_topic_completed_defaults_to_completed_status() -> None:
 
 
 def test_mark_topic_completed_accepts_completed_test_out_status() -> None:
-    """The test-out task's reason for adding this parameter: Architecture
-    §5 lists `completed_test_out` as a schema value distinct from
-    `completed`, not a synonym — a test-out full/partial pass must write
-    that specific value, not the regular one."""
+    """completed_test_out is a distinct schema value, not a synonym for completed, and must be written as-is."""
     session = MagicMock()
     row = SimpleNamespace(status=NOT_STARTED_STATUS, completed_at=None)
     session.get.return_value = row
@@ -239,11 +201,7 @@ def _completed_row(**overrides: object) -> SimpleNamespace:
 
 
 def test_augment_outline_topic_refreshes_provenance_fields_only() -> None:
-    """PRD §7.4's "Augmentation" update type + CLAUDE.md guardrail #5:
-    only source_url/source_type/confidence change — status, completed_at,
-    hierarchy_position, and topic_name (an already-completed topic) must
-    never be touched by an augmentation.
-    """
+    """An augmentation may only change source_url, source_type, and confidence — never status, timestamps, position, or name."""
     session = MagicMock()
     row = _completed_row()
     session.get.return_value = row
@@ -289,10 +247,7 @@ def test_augment_outline_topic_raises_if_topic_not_found() -> None:
 
 
 def test_get_completed_topics_matching_skill_matches_case_insensitively() -> None:
-    """Used by src/cron/refresh_roles.py's significant-event wiring —
-    outline topic names and roles_cache skill names come from two
-    different pipelines with no guaranteed identical casing.
-    """
+    """Matching must be case-insensitive since outline topic names and roles_cache skill names come from different pipelines."""
     row = SimpleNamespace(
         id="topic-1",
         user_id="user-1",
@@ -378,10 +333,7 @@ def test_has_pending_enrichment_topic_false_when_none_exists() -> None:
 
 
 def test_insert_new_outline_topic_inserts_after_prerequisite_and_renumbers() -> None:
-    """old-1 (position 1) is the sole prerequisite, old-2 (position 2) is
-    not — the new topic must land immediately after old-1 (position 2),
-    pushing old-2 to position 3. old-1 itself is untouched.
-    """
+    """A new topic must land immediately after its sole prerequisite, pushing later topics down and leaving earlier ones untouched."""
     old1 = _topic_row("old-1", 1)
     old2 = _topic_row("old-2", 2)
     session = MagicMock()

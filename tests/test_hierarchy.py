@@ -1,6 +1,4 @@
-"""Tests for outline/hierarchy.py — insertion/positioning into an existing
-dependency hierarchy.
-"""
+"""Tests for outline/hierarchy.py: insertion and positioning into an existing dependency hierarchy."""
 
 import pytest
 
@@ -29,7 +27,6 @@ def test_insert_new_topic_in_the_middle_renumbers_everything_after() -> None:
 
     assert [t["id"] for t in result] == ["t1", "t2", "new", "t3", "t4"]
     assert [t["hierarchy_position"] for t in result] == [1, 2, 3, 4, 5]
-    # existing topics' relative order among themselves is unchanged
     assert [t["topic_name"] for t in result] == [
         "Python Basics",
         "Control Flow",
@@ -92,13 +89,11 @@ def test_augment_existing_topic_leaves_ordering_completely_untouched() -> None:
     assert [t["hierarchy_position"] for t in result] == original_positions
     augmented = next(t for t in result if t["id"] == "t2")
     assert augmented["source_url"] == "https://example.com/refreshed"
-    assert augmented["topic_name"] == "Control Flow"  # untouched fields survive
+    assert augmented["topic_name"] == "Control Flow"
 
 
 def test_augment_existing_topic_ignores_attempted_id_and_position_override() -> None:
-    """Even if refreshed_content tries to smuggle in a new id or position,
-    augmentation must never reposition anything.
-    """
+    """Augmentation must never reposition anything, even if refreshed_content tries to smuggle in a new id or position."""
     existing = _topics("Python Basics", "Control Flow")
 
     result = augment_existing_topic(

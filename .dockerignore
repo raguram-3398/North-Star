@@ -1,5 +1,3 @@
-# Virtual env / Python cache — never needed in the image; installed fresh
-# from requirements.txt instead.
 .venv/
 venv/
 env/
@@ -10,29 +8,22 @@ __pycache__/
 .ruff_cache/
 .pytest_cache/
 
-# Build / packaging
 dist/
 build/
 *.egg-info/
 *.egg
 
-# Tests / evaluation — not needed at runtime.
 tests/
 evaluation/
 
-# Specs / docs — not needed at runtime.
 specs/
 .claude/
 
-# Version control
 .git/
 .gitignore
 
-# Logs
 *.log
 
-# Environment secrets — never baked into the image; injected at container
-# run time instead (see Dockerfile's own comment).
 .env
 .env.*
 !.env.example

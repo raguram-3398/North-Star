@@ -1,8 +1,4 @@
-"""Tests for data/patch_notes.py — patch_notes I/O.
-
-Uses a mocked SQLAlchemy Session, matching data/roles_cache.py's
-established convention (see test_roles_cache.py's module docstring).
-"""
+"""Tests for data/patch_notes.py: patch_notes I/O, using a mocked SQLAlchemy Session."""
 
 from datetime import datetime
 from unittest.mock import MagicMock
@@ -52,10 +48,7 @@ def test_create_patch_note_writes_a_pending_row_and_commits() -> None:
 
 
 def test_create_patch_note_rejects_a_raw_dict_in_place_of_grounded_content() -> None:
-    """CLAUDE.md guardrail #12: a raw dict must not be silently accepted
-    as a patch-note's grounding source, mirroring
-    data/roles_cache.py's _to_skill_entry isinstance check.
-    """
+    """A raw dict must not be silently accepted as a patch-note's grounding source."""
     session = MagicMock()
     unvalidated = {"source_url": "https://x", "confidence": "high", "skill": "SQL"}
 
@@ -96,10 +89,7 @@ def test_get_pending_patch_notes_filters_by_user_and_pending_status() -> None:
 
 
 def test_get_deferred_patch_notes_is_queryable_after_a_note_is_deferred() -> None:
-    """Deferred patch-notes are parked permanently (PRD §7.9) — this
-    confirms a real query function exists for a future caller (e.g. a
-    goal-completion closing note) to find them again.
-    """
+    """Deferred patch-notes are parked permanently and must remain queryable by a future caller."""
     session = MagicMock()
     deferred_row = MagicMock(
         id="patch-2",

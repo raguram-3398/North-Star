@@ -10,34 +10,16 @@ readme = "README.md"
 requires-python = ">=3.12"
 
 dependencies = [
-    # Agent framework
     "google-adk>=2.3.0",
-
-    # MCP client SDK — google-adk's MCP toolset (google.adk.tools.mcp_tool)
-    # imports this directly (ClientSession, streamablehttp_client, etc.) but
-    # does not declare it as its own dependency; required explicitly for the
-    # Himalayas MCP connection (Architecture_North_Star.md §1/§6).
     "mcp>=1.28.1",
-
-    # LLM (Updated to Google's official unified GenAI SDK)
     "google-genai>=1.0.0",
-
-    # Search
     "tavily-python>=0.5.0",
-
-    # UI
     "streamlit>=1.38.0",
     "requests>=2.32.0",
-
-    # Persistence
     "sqlalchemy>=2.0.0",
     "psycopg[binary]>=3.2.0",
-
-    # Validation / Settings
     "pydantic>=2.8.0",
     "pydantic-settings>=2.5.0",
-
-    # Config
     "python-dotenv>=1.0.1",
 ]
 
@@ -47,7 +29,6 @@ dev = [
     "pytest-asyncio>=0.24.0",
     "pytest-cov>=5.0.0",
     "pytest-mock>=3.14.0",
-
     "ruff>=0.6.0",
     "black>=24.0.0",
     "mypy>=1.10.0",
@@ -72,6 +53,7 @@ src = ["src"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
+ignore = ["E501"]
 
 [tool.black]
 line-length = 88

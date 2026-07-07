@@ -1,18 +1,4 @@
-"""patch_notes I/O.
-
-Per Architecture_North_Star.md §5/§9. `create_patch_note` is the write
-path significant-event detection needs (`src/cron/refresh_roles.py`);
-`get_pending_patch_notes`/`get_deferred_patch_notes`/
-`update_patch_note_status` exist so a future caller (the not-yet-built
-delivery/decision UI layer) has real query/write functions to act on
-`patches/patch_manager.py`'s `decide_patch_delivery`/
-`resolve_patch_decision` decisions — neither of those pure functions does
-any DB I/O itself (CLAUDE.md: pure functions stay pure), so applying their
-output to a real row is always this module's job.
-
-Sessions are passed in by the caller (dependency injection), matching
-`data/roles_cache.py`'s established pattern.
-"""
+"""Read and write patch_notes rows, including the creation path significant-event detection needs."""
 
 import uuid
 from datetime import datetime
@@ -48,18 +34,7 @@ def create_patch_note(
     grounded_content: ValidatedGroundedContent,
     created_at: datetime,
 ) -> dict[str, Any]:
-    """Insert a new patch-note row at `PENDING` status and return it.
-
-    `grounded_content` must already be a `ValidatedGroundedContent`
-    (CLAUDE.md guardrail #12) — its `source_url`/`confidence` are what get
-    written to the row. A raw dict is structurally rejected via an
-    explicit `isinstance` check, mirroring `data/roles_cache.py`'s
-    `_to_skill_entry` — the same structural gate applied at this write
-    boundary, not just outline items and roles_cache.
-
-    Raises `ConfidenceValidationError` if `grounded_content` is not a
-    `ValidatedGroundedContent` instance. Commits the transaction.
-    """
+    """Insert a new pending patch-note row from an already-validated grounded content object and return it."""
     if not isinstance(grounded_content, ValidatedGroundedContent):
         raise ConfidenceValidationError(
             "patch_notes source content must be a ValidatedGroundedContent, "
@@ -83,12 +58,7 @@ def create_patch_note(
 
 
 def get_pending_patch_notes(session: Session, user_id: str) -> list[dict[str, Any]]:
-    """Read every `PENDING` patch-note for `user_id` — the input a future
-    caller assembles (joining in each row's origin topic's
-    `hierarchy_position` via `data/outline_topics.py`'s `get_topic`) before
-    calling `patches/patch_manager.py`'s `decide_patch_delivery`, which
-    does no DB reads of its own.
-    """
+    """Read every pending patch-note for a user."""
     rows = (
         session.query(PatchNote)
         .filter(
@@ -101,11 +71,7 @@ def get_pending_patch_notes(session: Session, user_id: str) -> list[dict[str, An
 
 
 def get_deferred_patch_notes(session: Session, user_id: str) -> list[dict[str, Any]]:
-    """Read every `DEFERRED` patch-note for `user_id`. Deferred patch-notes
-    are parked permanently, no expiry (PRD §7.9) — this is the query
-    function a future goal-completion closing note or on-demand surfacing
-    feature (both out of scope for this task) would call to find them.
-    """
+    """Read every permanently deferred patch-note for a user."""
     rows = (
         session.query(PatchNote)
         .filter(
@@ -123,13 +89,7 @@ def update_patch_note_status(
     status: PatchStatus,
     resolved_at: datetime | None,
 ) -> None:
-    """Apply a patch-note status change — the DB-write counterpart to
-    `patches/patch_manager.py`'s pure `resolve_patch_decision` (which only
-    computes the new status/`resolved_at`, never writes to the DB itself).
-
-    Raises `ValueError` if `patch_note_id` does not exist. Commits the
-    transaction.
-    """
+    """Apply a status change and resolution timestamp to an existing patch-note row."""
     row = session.get(PatchNote, patch_note_id)
     if row is None:
         raise ValueError(f"patch_note {patch_note_id!r} not found")

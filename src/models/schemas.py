@@ -1,27 +1,4 @@
-"""SQLAlchemy models mirroring Architecture_North_Star.md §5's data model
-exactly. If a field needs to change, the architecture doc is updated in the
-same commit (CLAUDE.md coding conventions).
-
-Field-level definitions are fleshed out incrementally, as each table's I/O
-module is implemented — a class with no columns below is still a
-docstring-only placeholder awaiting its own I/O module; `RolesCache` was
-the first to be fully mapped, alongside `src/data/roles_cache.py`.
-`OutlineTopic`/`ProgressLog`/`VerificationAttempt`/`PaceSnapshot`/`PatchNote`/
-`User` are fleshed out here alongside `src/data/outline_topics.py`,
-`src/data/progress_log.py`, `src/data/verification_log.py`,
-`src/data/pace_snapshots.py`, `src/data/patch_notes.py`, and
-`src/data/users.py`. `user_id`/`topic_id`/`origin_topic_id` columns below
-remain plain UUID columns, not `ForeignKey`-constrained, even now that
-every referenced table is mapped — no migration/schema-push mechanism
-exists yet at all (see §5's "Known limitation"), so adding FK constraints
-now would be premature relative to the tables actually being creatable in
-a real database; revisit once that gap closes.
-
-`User.pace_extension_days` (the sustained-behind pacing-extension task)
-is a schema addition beyond Architecture §5's original `users` SQL block
-at the time `User` was still an unmapped placeholder — see that section's
-"Resolved" block for the judgment call.
-"""
+"""SQLAlchemy ORM models for the application's Postgres schema."""
 
 import uuid
 from datetime import datetime
@@ -36,10 +13,7 @@ class Base(DeclarativeBase):
 
 
 class User(Base):
-    """`users` — user profile: background, current job, years of
-    experience, prior self-study, resolved role, role confidence, pacing
-    profile, plus `pace_extension_days` (see module docstring).
-    """
+    """User profile, background, resolved role, and pacing state."""
 
     __tablename__ = "users"
 
@@ -55,18 +29,11 @@ class User(Base):
     role_confidence: Mapped[str | None] = mapped_column(default=None)
     pacing_profile: Mapped[str | None] = mapped_column(default=None)
     created_at: Mapped[datetime | None] = mapped_column(default=None)
-    # New column, this task (sustained-behind pacing-extension mechanism,
-    # see Architecture §5's "Resolved" block): the accumulated number of
-    # extra days added to this user's effective pacing baseline by
-    # sustained-behind drift. 0 for a user who has never drifted behind.
     pace_extension_days: Mapped[int] = mapped_column(default=0)
 
 
 class RolesCache(Base):
-    """`roles_cache` — cron-refreshed market data cache: core_skills /
-    emerging_skills per role, each carrying a confidence tier, plus
-    last_updated.
-    """
+    """Cron-refreshed market data cache of core/emerging skills per role."""
 
     __tablename__ = "roles_cache"
 
@@ -77,10 +44,7 @@ class RolesCache(Base):
 
 
 class OutlineTopic(Base):
-    """`outline_topics` — dependency hierarchy per user: topic, hierarchy
-    position, topic group / position-in-group (hands-on ramping), source
-    metadata, enrichment flag, status.
-    """
+    """A single topic in a user's dependency hierarchy, with source metadata and status."""
 
     __tablename__ = "outline_topics"
 
@@ -101,10 +65,7 @@ class OutlineTopic(Base):
 
 
 class ProgressLog(Base):
-    """`progress_log` — canonical record of everything that feeds pace:
-    per-day, per-step entries (summary/theory/hands_on/review/reflection/
-    verification/preview).
-    """
+    """A per-day, per-step progress entry that feeds pace tracking."""
 
     __tablename__ = "progress_log"
 
@@ -120,10 +81,7 @@ class ProgressLog(Base):
 
 
 class VerificationAttempt(Base):
-    """`verification_attempts` — per-question, per-attempt verification
-    records that feed topic_score: question/grading criteria, answer,
-    passed, credit (1.0 full / 0.5 half), test-out flag.
-    """
+    """A single verification question attempt, with grading result and credit, feeding topic_score."""
 
     __tablename__ = "verification_attempts"
 
@@ -143,10 +101,7 @@ class VerificationAttempt(Base):
 
 
 class PatchNote(Base):
-    """`patch_notes` — market-driven updates to already-completed topics:
-    origin topic, new content, source/confidence, status (pending /
-    delivered / deferred).
-    """
+    """A market-driven content update to an already-completed topic."""
 
     __tablename__ = "patch_notes"
 
@@ -164,9 +119,7 @@ class PatchNote(Base):
 
 
 class PaceSnapshot(Base):
-    """`pace_snapshots` — rolling-window inputs to pace tracking:
-    topic_score, timing_ratio, days_taken, days_expected per topic.
-    """
+    """A single topic's pace inputs: topic_score, timing_ratio, days_taken, days_expected."""
 
     __tablename__ = "pace_snapshots"
 

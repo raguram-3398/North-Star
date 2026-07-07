@@ -1,39 +1,13 @@
-"""Tests for the Verification Question Generator Skill
-(.agent/skills/verification_question_generator/) — source material in,
-fresh source-anchored questions + grading rubric out, plus strict
-pass/fail grading of a user's answer.
-
-`.agent/skills/` sits outside the `src/` package (required for Antigravity
-workspace-manager recognition, per CLAUDE.md), so it isn't importable via
-the normal editable-install path the way `src/` is — this file adds
-`.agent/skills/` to `sys.path` explicitly before importing the Skill as
-`verification_question_generator.generator` (an implicit namespace
-package; no `__init__.py` needed, Python 3.3+).
-
-Gemini is mocked by reusing tests/test_gemini_client.py's existing
-`_patch_gemini`/`_FakeGeminiClient` fakes rather than duplicating them —
-the Skill's `generate_questions`/`grade_answer` call
-`utils.gemini_client._call_gemini_json` directly (imported by name), so
-patching `utils.gemini_client._get_gemini_client` (the module where that
-call actually resolves the client from) is the correct target, exactly as
-`_patch_gemini` already does — not `generator._get_gemini_client`, which
-doesn't exist as a name in this module's own namespace at all.
-"""
+"""Tests for the Verification Question Generator: fresh source-anchored questions and rubric-based answer grading."""
 
 import json
-import sys
 from pathlib import Path
 
 import pytest
 
-_SKILLS_DIR = Path(__file__).resolve().parent.parent / ".agent" / "skills"
-if str(_SKILLS_DIR) not in sys.path:
-    sys.path.insert(0, str(_SKILLS_DIR))
-
-from verification_question_generator import generator  # noqa: E402
-
-from tests.test_gemini_client import _patch_gemini  # noqa: E402
-from utils.exceptions import GeminiCallError  # noqa: E402
+from skills import verification_question_generator as generator
+from tests.test_adk_runtime import _patch_adk_runtime
+from utils.exceptions import GeminiCallError
 
 EVALUATION_DIR = Path(__file__).resolve().parent.parent / "evaluation"
 
@@ -47,10 +21,7 @@ GIT_SOURCE_URL = "https://git-scm.com/book/en/v2/Getting-Started-About-Version-C
 
 
 def _questions_response(count: int, prefix: str = "Question") -> str:
-    """A synthetic, valid Gemini question-generation response with
-    `count` distinct questions — used wherever the exact question text
-    doesn't matter, only the shape/count/processing.
-    """
+    """Build a synthetic, valid Gemini question-generation response with `count` distinct questions."""
     return json.dumps(
         {
             "questions": [
@@ -64,13 +35,10 @@ def _questions_response(count: int, prefix: str = "Question") -> str:
     )
 
 
-# --- generate_questions: count per mode -----------------------------------
-
-
 async def test_generate_questions_returns_five_for_initial_set(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _patch_gemini(monkeypatch, responses=[_questions_response(5)])
+    _patch_adk_runtime(monkeypatch, responses=[_questions_response(5)])
 
     questions = await generator.generate_questions(
         GIT_SOURCE_MATERIAL, GIT_SOURCE_URL, num_questions=5
@@ -87,7 +55,7 @@ async def test_generate_questions_returns_five_for_initial_set(
 async def test_generate_questions_returns_one_for_targeted_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _patch_gemini(monkeypatch, responses=[_questions_response(1)])
+    _patch_adk_runtime(monkeypatch, responses=[_questions_response(1)])
 
     questions = await generator.generate_questions(
         GIT_SOURCE_MATERIAL,
@@ -103,7 +71,7 @@ async def test_generate_questions_returns_one_for_targeted_retry(
 async def test_generate_questions_raises_when_response_count_mismatches(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _patch_gemini(monkeypatch, responses=[_questions_response(3)])
+    _patch_adk_runtime(monkeypatch, responses=[_questions_response(3)])
 
     with pytest.raises(GeminiCallError):
         await generator.generate_questions(
@@ -111,14 +79,11 @@ async def test_generate_questions_raises_when_response_count_mismatches(
         )
 
 
-# --- freshness: never repeat a previous question, never dupe in-batch -----
-
-
 async def test_regenerated_question_is_genuinely_different_from_previous(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     previous = "What makes Git 'distributed' rather than centralized?"
-    _patch_gemini(
+    _patch_adk_runtime(
         monkeypatch,
         responses=[
             json.dumps(
@@ -149,7 +114,7 @@ async def test_generate_questions_raises_on_verbatim_repeat_of_previous(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     previous = "What makes Git 'distributed' rather than centralized?"
-    _patch_gemini(
+    _patch_adk_runtime(
         monkeypatch,
         responses=[
             json.dumps(
@@ -177,10 +142,9 @@ async def test_generate_questions_raises_on_verbatim_repeat_of_previous(
 async def test_generate_questions_raises_on_repeat_case_insensitive(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The freshness check is case-insensitive — a trivially re-cased
-    repeat still counts as identical, not 'genuinely different'."""
+    """The freshness check is case-insensitive — a re-cased repeat still counts as identical."""
     previous = "What makes Git 'distributed' rather than centralized?"
-    _patch_gemini(
+    _patch_adk_runtime(
         monkeypatch,
         responses=[
             json.dumps(
@@ -209,7 +173,7 @@ async def test_generate_questions_raises_on_duplicate_within_same_batch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     duplicate_text = "What is a commit in Git?"
-    _patch_gemini(
+    _patch_adk_runtime(
         monkeypatch,
         responses=[
             json.dumps(
@@ -233,9 +197,6 @@ async def test_generate_questions_raises_on_duplicate_within_same_batch(
         await generator.generate_questions(
             GIT_SOURCE_MATERIAL, GIT_SOURCE_URL, num_questions=2
         )
-
-
-# --- schema validation: malformed/incomplete questions must raise --------
 
 
 def test_validate_question_object_rejects_missing_source_url() -> None:
@@ -266,11 +227,8 @@ def test_validate_question_object_rejects_empty_grading_criteria() -> None:
 async def test_generate_questions_raises_on_malformed_entry_from_gemini(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A malformed entry from Gemini (missing grading_criteria) must
-    raise rather than silently reach the caller — the schema-validation
-    failure is wrapped as GeminiCallError since it originates from the
-    LLM's own response, not caller-supplied input."""
-    _patch_gemini(
+    """A malformed entry from Gemini (missing grading_criteria) must raise rather than silently reach the caller."""
+    _patch_adk_runtime(
         monkeypatch,
         responses=[
             json.dumps({"questions": [{"question_text": "A question with no rubric?"}]})
@@ -281,9 +239,6 @@ async def test_generate_questions_raises_on_malformed_entry_from_gemini(
         await generator.generate_questions(
             GIT_SOURCE_MATERIAL, GIT_SOURCE_URL, num_questions=1
         )
-
-
-# --- negative input: refuse to fire on empty/invalid input ---------------
 
 
 async def test_generate_questions_raises_on_empty_source_material() -> None:
@@ -303,11 +258,8 @@ async def test_generate_questions_raises_on_non_positive_num_questions() -> None
         )
 
 
-# --- grading: strict pass/fail, no ambiguous middle state -----------------
-
-
 async def test_grade_answer_strict_pass(monkeypatch: pytest.MonkeyPatch) -> None:
-    _patch_gemini(monkeypatch, responses=[json.dumps({"passed": True})])
+    _patch_adk_runtime(monkeypatch, responses=[json.dumps({"passed": True})])
     question = generator.VerificationQuestion(
         question_text="What is a commit?",
         grading_criteria="Must mention it's a snapshot of changes.",
@@ -321,7 +273,7 @@ async def test_grade_answer_strict_pass(monkeypatch: pytest.MonkeyPatch) -> None
 
 
 async def test_grade_answer_strict_fail(monkeypatch: pytest.MonkeyPatch) -> None:
-    _patch_gemini(monkeypatch, responses=[json.dumps({"passed": False})])
+    _patch_adk_runtime(monkeypatch, responses=[json.dumps({"passed": False})])
     question = generator.VerificationQuestion(
         question_text="What is a commit?",
         grading_criteria="Must mention it's a snapshot of changes.",
@@ -337,10 +289,8 @@ async def test_grade_answer_strict_fail(monkeypatch: pytest.MonkeyPatch) -> None
 async def test_grade_answer_raises_on_non_boolean_passed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """No ambiguous middle state: if Gemini's 'passed' isn't a genuine
-    boolean (e.g. a string like 'maybe'), this must raise, not coerce it
-    into some third state."""
-    _patch_gemini(monkeypatch, responses=[json.dumps({"passed": "maybe"})])
+    """No ambiguous middle state: a non-boolean 'passed' value from Gemini must raise, not be coerced."""
+    _patch_adk_runtime(monkeypatch, responses=[json.dumps({"passed": "maybe"})])
     question = generator.VerificationQuestion(
         question_text="What is a commit?",
         grading_criteria="Must mention it's a snapshot of changes.",
@@ -349,10 +299,6 @@ async def test_grade_answer_raises_on_non_boolean_passed(
 
     with pytest.raises(GeminiCallError):
         await generator.grade_answer(question, "Some answer.")
-
-
-# --- PROMPT_REGISTRY: baseline regression asserts on the prompt string ----
-# --- itself, not the LLM's output (CLAUDE.md's explicit instruction) -----
 
 
 def test_verification_question_generation_prompt_v1_is_frozen() -> None:
@@ -385,9 +331,6 @@ def test_verification_answer_grading_prompt_v1_is_frozen() -> None:
     )
 
 
-# --- EDD: evaluation/eval_cases.json exercised as real tests --------------
-
-
 def _load_eval_cases() -> list[dict]:
     with open(EVALUATION_DIR / "eval_cases.json") as f:
         return json.load(f)
@@ -411,7 +354,9 @@ async def test_eval_case_positive_initial_five_question_set(
     )
     inputs = case["input"]
     expected = case["expected"]
-    _patch_gemini(monkeypatch, responses=[_questions_response(inputs["num_questions"])])
+    _patch_adk_runtime(
+        monkeypatch, responses=[_questions_response(inputs["num_questions"])]
+    )
 
     questions = await generator.generate_questions(
         inputs["topic_source_material"],
@@ -441,7 +386,7 @@ async def test_eval_case_positive_targeted_retry(
     )
     inputs = case["input"]
     expected = case["expected"]
-    _patch_gemini(
+    _patch_adk_runtime(
         monkeypatch,
         responses=[
             json.dumps(
@@ -494,9 +439,6 @@ async def test_eval_case_negative_empty_source_material_does_not_fire() -> None:
         )
 
 
-# --- Golden dataset: representative (source -> expected shape) pairs -----
-
-
 def _load_golden_dataset() -> list[dict]:
     with open(EVALUATION_DIR / "golden_dataset.json") as f:
         return json.load(f)
@@ -514,7 +456,7 @@ async def test_golden_dataset_entry_matches_expected_shape(
     entry: dict, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     shape = entry["expected_question_shape"]
-    _patch_gemini(
+    _patch_adk_runtime(
         monkeypatch,
         responses=[_questions_response(entry["num_questions"], prefix=entry["id"])],
     )

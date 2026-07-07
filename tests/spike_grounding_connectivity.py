@@ -1,19 +1,4 @@
-"""Connectivity spike — Himalayas MCP + Tavily, real response shapes.
-
-NOT production code, not a pytest test (excluded from testpaths by name —
-run directly: `python tests/spike_grounding_connectivity.py`). Confirms,
-before any cross-validation logic is designed:
-
-  1. Himalayas MCP is reachable via ADK's McpToolset and returns something
-     usable for a job-market query.
-  2. Tavily is reachable with the existing .env key for the same query.
-  3. How each source fails/times out/empties, independently, so the real
-     cross-validation function (research_outline_agent.py) can be designed
-     around actual behavior instead of assumed behavior.
-
-No cross-validation, no output_guard, no Postgres writes here — just raw
-shapes and failure modes, printed in full.
-"""
+"""Standalone script (not a pytest test) that checks Himalayas MCP and Tavily connectivity and prints their raw response shapes."""
 
 import asyncio
 import json
@@ -26,12 +11,12 @@ from google.adk.tools.mcp_tool.mcp_toolset import McpToolset
 
 load_dotenv()
 
-import os  # noqa: E402  (after load_dotenv, so TAVILY_API_KEY is populated)
+import os  # noqa: E402
 
 from tavily import TavilyClient  # noqa: E402
 
-TIMEOUT_SECONDS = 10  # existing repo convention (CLAUDE.md guardrail #14)
-SEED_ROLE = "Backend Engineer"  # from PRD §7.3's seed-list example roles
+TIMEOUT_SECONDS = 10
+SEED_ROLE = "Backend Engineer"
 HIMALAYAS_MCP_URL = "https://mcp.himalayas.app/mcp"
 
 
@@ -68,7 +53,7 @@ async def spike_himalayas() -> None:
         print(text[:1500])
     except TimeoutError:
         print(f"FAILURE: Himalayas MCP call exceeded {TIMEOUT_SECONDS}s timeout")
-    except Exception as exc:  # spike: report every failure mode, don't narrow
+    except Exception as exc:
         print(f"FAILURE: Himalayas MCP call raised {type(exc).__name__}: {exc}")
     finally:
         await toolset.close()
@@ -98,7 +83,7 @@ def spike_tavily() -> None:
             print(list(result["results"][0].keys()))
             print("--- full first result item ---")
             print(json.dumps(result["results"][0], indent=2, default=str)[:1500])
-    except Exception as exc:  # spike: report every failure mode, don't narrow
+    except Exception as exc:
         print(f"FAILURE: Tavily call raised {type(exc).__name__}: {exc}")
 
 

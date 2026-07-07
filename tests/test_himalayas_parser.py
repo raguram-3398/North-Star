@@ -1,25 +1,4 @@
-"""Tests for data/himalayas_parser.py — deterministic parsing of
-Himalayas MCP's search_jobs text-blob responses.
-
-Real fixtures (tests/fixtures/himalayas_search_jobs_*.txt) were captured
-live via the same McpToolset + StreamableHTTPConnectionParams path
-confirmed in tests/spike_grounding_connectivity.py, for 4 of PRD §7.3's
-seed roles: Backend Engineer, Frontend Engineer, Data Analyst, DevOps
-Engineer. Per this project's multi-item testing discipline (see
-context-transfer.md's interleaving-order and drift-detection lessons), a
-single real sample isn't enough — these fixtures are used together to
-make sure the parser generalizes rather than happening to work on one
-lucky example.
-
-A true zero-result search_jobs response was never observed live, despite
-several attempts (nonsense keywords, extreme salary_min, obscure country
-+ exclude_worldwide filters) — Himalayas's search appears to always
-return *something* rather than truly filtering to zero. The zero-result
-and missing-skills-line cases below are therefore constructed from the
-real header/block format actually observed (not invented from scratch),
-clearly labeled as such, since the parser must still handle them
-correctly per the task that authored this module.
-"""
+"""Tests for data/himalayas_parser.py: deterministic parsing of Himalayas MCP's search_jobs text-blob responses, using real captured fixtures."""
 
 from pathlib import Path
 
@@ -36,11 +15,7 @@ def _load_fixture(name: str) -> str:
 
 
 def test_parses_expected_listing_count_across_multiple_real_roles() -> None:
-    """Exact listing counts, cross-checked against `grep -c '^🚀'` on the
-    raw fixture files, across three different real roles — not just one
-    — so a subtly-wrong block splitter (e.g. off-by-one, or swallowing
-    the last block) would be caught rather than coincidentally passing.
-    """
+    """Checks exact listing counts across three different real roles so a subtly-wrong block splitter would be caught."""
     cases = [
         ("himalayas_search_jobs_frontend_engineer.txt", 20),
         ("himalayas_search_jobs_data_analyst.txt", 19),
@@ -52,12 +27,7 @@ def test_parses_expected_listing_count_across_multiple_real_roles() -> None:
 
 
 def test_every_real_listing_has_title_company_and_source_url() -> None:
-    """Across all 58 real listings in the three fixtures, title, company,
-    and source_url are always non-empty — confirmed by direct inspection
-    of the raw text (every listing has an "Apply on Himalayas" line).
-    Skills are checked separately below since that's the one field that
-    does legitimately vary.
-    """
+    """Across all real listings in the three fixtures, title, company, and source_url are always non-empty."""
     for filename in [
         "himalayas_search_jobs_frontend_engineer.txt",
         "himalayas_search_jobs_data_analyst.txt",
@@ -92,11 +62,7 @@ def test_parses_multi_skill_listing_from_real_fixture() -> None:
 
 
 def test_strips_plus_n_more_suffix_from_final_skill() -> None:
-    """Most real listings show only the first ~8 skills inline, with the
-    last one carrying a "+N more" suffix (e.g. "AWS +6 more") that is
-    Himalayas's own display truncation marker, not part of the skill
-    name — it must never leak into a skill string.
-    """
+    """Himalayas's own "+N more" display-truncation marker must never leak into a skill string."""
     listings = parse_search_jobs_response(
         _load_fixture("himalayas_search_jobs_devops_engineer.txt")
     )
@@ -109,10 +75,7 @@ def test_strips_plus_n_more_suffix_from_final_skill() -> None:
 
 
 def test_parses_real_single_skill_listing() -> None:
-    """A real listing (Nagarro's "Engineer, Frontend") has a Key Skills
-    line with exactly one skill and no bullet separator at all —
-    confirmed present in tests/fixtures/himalayas_search_jobs_frontend_engineer.txt.
-    """
+    """A real listing can have a Key Skills line with exactly one skill and no bullet separator."""
     listings = parse_search_jobs_response(
         _load_fixture("himalayas_search_jobs_frontend_engineer.txt")
     )
@@ -124,11 +87,7 @@ def test_parses_real_single_skill_listing() -> None:
 
 
 def test_strips_verified_company_checkmark() -> None:
-    """Some companies render as "🏢 Company ✅" (Himalayas's verified-
-    company badge) — the checkmark must not leak into `company`.
-    Constructed from a real block observed in the connectivity spike
-    (Wellhub's listing), reduced to only the fields this test needs.
-    """
+    """Himalayas's verified-company checkmark badge must not leak into the parsed company name."""
     block = (
         "🚀 **Senior Backend Software Engineer | BASE**\n"
         "🏢 Wellhub ✅ \n\n"
@@ -143,11 +102,7 @@ def test_strips_verified_company_checkmark() -> None:
 
 
 def test_handles_missing_skills_line_without_crashing() -> None:
-    """No real listing sampled (58 across 3 fixtures) omits the "Key
-    Skills" line, so this is constructed by removing that one line from
-    a real block (Cision's Data Analyst listing) — the parser must not
-    crash or fabricate skills, just report an empty list for this field.
-    """
+    """A listing block missing the Key Skills line must not crash or fabricate skills, just report an empty list."""
     block = (
         "🚀 **Data Analyst- German Language**\n"
         "🏢 Cision \n\n"
@@ -165,31 +120,19 @@ def test_handles_missing_skills_line_without_crashing() -> None:
 
 
 def test_returns_empty_list_for_genuine_zero_result_header() -> None:
-    """A true zero-match response was never observed live (see module
-    docstring), but the real header format ("Found N jobs matching") is
-    known, so a "Found 0 jobs matching" header with no listing blocks is
-    constructed to confirm this is treated as a valid empty result, not
-    an error.
-    """
+    """A "Found 0 jobs matching" header with no listing blocks must be treated as a valid empty result, not an error."""
     raw_text = "Found 0 jobs matching 'zzz_no_such_role' (showing page 1)\n"
     assert parse_search_jobs_response(raw_text) == []
 
 
 def test_raises_when_no_recognizable_header_is_present() -> None:
-    """Completely unrecognized input (not a search_jobs response at all,
-    e.g. an HTML error page or a different tool's output) must raise
-    rather than silently returning an empty list indistinguishable from
-    a genuine zero-result response.
-    """
+    """Completely unrecognized input must raise rather than silently returning an empty list."""
     with pytest.raises(HimalayasParseError):
         parse_search_jobs_response("<html><body>502 Bad Gateway</body></html>")
 
 
 def test_raises_when_header_claims_jobs_but_no_blocks_found() -> None:
-    """A header reporting a non-zero total with zero parsable listing
-    blocks indicates the known text format has changed, not a legitimate
-    empty result — must raise, not silently return [].
-    """
+    """A header reporting a non-zero total with zero parsable listing blocks must raise, not silently return an empty list."""
     raw_text = "Found 5 jobs matching 'backend engineer' (showing page 1)\n"
     with pytest.raises(HimalayasParseError):
         parse_search_jobs_response(raw_text)

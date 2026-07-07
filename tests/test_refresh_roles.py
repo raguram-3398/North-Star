@@ -1,19 +1,4 @@
-"""Tests for src/cron/refresh_roles.py — the shared roles_cache refresh
-function (`refresh_roles_cache`) and the startup staleness check
-(`get_stale_or_missing_roles` / `check_and_refresh_stale_roles`).
-
-`ground_role` and `upsert_role` are both mocked — this module orchestrates
-them but does not reimplement any grounding or write logic, so these tests
-only verify the orchestration (which role got which outcome, batch
-continuation past a failure, which roles get refreshed) rather than
-re-exercising `ground_role`'s own confidence-ladder branches (already
-covered by tests/test_research_outline_agent.py) or `upsert_role`'s own
-write mechanics (already covered by tests/test_roles_cache.py).
-
-Patches target `cron.refresh_roles.<name>` (where each name is *used*),
-not where it's defined — CLAUDE.md's flagged wrong-patch-target
-anti-pattern.
-"""
+"""Tests for src/cron/refresh_roles.py: the shared roles_cache refresh function and the startup staleness check."""
 
 from datetime import datetime
 from typing import cast
@@ -64,9 +49,6 @@ def _floor_result(role_name: str) -> GeneralKnowledgeFloorResult:
     )
 
 
-# --- refresh_roles_cache ---------------------------------------------------
-
-
 @pytest.mark.asyncio
 async def test_refresh_roles_cache_upserts_each_successfully_grounded_role(
     monkeypatch: pytest.MonkeyPatch,
@@ -81,9 +63,6 @@ async def test_refresh_roles_cache_upserts_each_successfully_grounded_role(
     upsert_role_mock = MagicMock()
     monkeypatch.setattr(rr, "ground_role", _fake_ground_role)
     monkeypatch.setattr(rr, "upsert_role", upsert_role_mock)
-    # No prior roles_cache row for any role — this test is about the
-    # upsert-per-role orchestration, not significant-event diffing (see
-    # the dedicated create_patch_notes_for_significant_events tests below).
     monkeypatch.setattr(rr, "get_role", lambda session, role_name: None)
 
     session = MagicMock()
@@ -110,10 +89,7 @@ async def test_refresh_roles_cache_uses_the_exact_four_role_seed_list() -> None:
 async def test_refresh_roles_cache_continues_past_a_single_role_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """One role's `ground_role` call raising must not abort the batch —
-    every other role in the list is still attempted and, if successful,
-    upserted.
-    """
+    """One role's `ground_role` call raising must not abort the batch for the other roles."""
 
     async def _fake_ground_role(
         role_name: str, session: object, reference_time: datetime
@@ -147,10 +123,7 @@ async def test_refresh_roles_cache_continues_past_a_single_role_failure(
 async def test_refresh_roles_cache_does_not_upsert_a_cached_fallback_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A CachedFallbackResult (ground_role fell through to the cache) must
-    not be written back via upsert_role — see refresh_roles_cache's
-    docstring for why re-stamping last_updated here would be dishonest.
-    """
+    """A CachedFallbackResult (ground_role fell through to the cache) must not be written back via upsert_role."""
 
     async def _fake_ground_role(
         role_name: str, session: object, reference_time: datetime
@@ -218,9 +191,6 @@ async def test_refresh_roles_cache_times_out_a_hanging_ground_role_call(
     assert summary.had_errors
 
 
-# --- create_patch_notes_for_significant_events (via refresh_roles_cache) --
-
-
 def _previous_row(
     core_skills: list[dict[str, str]], emerging_skills: list[dict[str, str]]
 ) -> dict[str, object]:
@@ -236,10 +206,7 @@ def _previous_row(
 async def test_refresh_roles_cache_creates_patch_notes_for_an_upward_crossing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """SQL strengthens medium -> high within the same (core_skills) bucket
-    — a significant event per outline/significant_event.py — so every user
-    with a completed "SQL" topic should get a pending patch-note.
-    """
+    """SQL strengthening medium to high within the same bucket is a significant event, so completed-topic users get a patch-note."""
     previous_row = _previous_row(
         core_skills=[
             {"skill": "SQL", "source_url": "https://old", "confidence": "medium"}
@@ -250,7 +217,7 @@ async def test_refresh_roles_cache_creates_patch_notes_for_an_upward_crossing(
     async def _fake_ground_role(
         role_name: str, session: object, reference_time: datetime
     ) -> rr.LiveGroundingResult:
-        return _live_result(role_name)  # SQL @ HIGH confidence
+        return _live_result(role_name)
 
     matching_topics = [
         {"id": "topic-1", "user_id": "user-1"},
@@ -292,10 +259,7 @@ async def test_refresh_roles_cache_creates_patch_notes_for_an_upward_crossing(
 async def test_refresh_roles_cache_generates_nothing_for_a_downward_crossing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """SQL weakens high -> medium within the same bucket — a downward
-    crossing, discarded by outline/significant_event.py — this test only
-    confirms the wiring respects that existing behavior.
-    """
+    """SQL weakening high to medium within the same bucket is a downward crossing and generates no patch-notes."""
     previous_row = _previous_row(
         core_skills=[
             {"skill": "SQL", "source_url": "https://old", "confidence": "high"}
@@ -347,9 +311,7 @@ async def test_refresh_roles_cache_generates_nothing_for_a_downward_crossing(
 async def test_refresh_roles_cache_first_ever_refresh_generates_nothing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """No pre-existing roles_cache row for this role — nothing to diff
-    against, so diffing is skipped entirely, not treated as an error.
-    """
+    """No pre-existing roles_cache row for this role means diffing is skipped entirely, not treated as an error."""
 
     async def _fake_ground_role(
         role_name: str, session: object, reference_time: datetime
@@ -376,9 +338,7 @@ async def test_refresh_roles_cache_first_ever_refresh_generates_nothing(
 async def test_refresh_roles_cache_generates_nothing_with_no_matching_completed_users(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """SQL is brand-new (absent -> core_skills, significant), but nobody
-    has a completed topic named "SQL" — no patch-notes should be created.
-    """
+    """SQL is brand-new and significant, but nobody has a completed "SQL" topic, so no patch-notes are created."""
     previous_row = _previous_row(core_skills=[], emerging_skills=[])
 
     async def _fake_ground_role(
@@ -404,18 +364,15 @@ async def test_refresh_roles_cache_generates_nothing_with_no_matching_completed_
     create_patch_note_mock.assert_not_called()
 
 
-# --- get_stale_or_missing_roles / check_and_refresh_stale_roles -----------
-
-
 def test_get_stale_or_missing_roles_identifies_stale_fresh_and_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def _fake_get_role(session: object, role_name: str) -> dict | None:
         if role_name == "Backend Engineer":
-            return {"last_updated": datetime(2026, 6, 1)}  # stale (>30d before 7/5)
+            return {"last_updated": datetime(2026, 6, 1)}
         if role_name == "Frontend Engineer":
-            return {"last_updated": datetime(2026, 7, 1)}  # fresh
-        return None  # "Data Analyst" missing entirely
+            return {"last_updated": datetime(2026, 7, 1)}
+        return None
 
     monkeypatch.setattr(rr, "get_role", _fake_get_role)
 
@@ -434,8 +391,8 @@ async def test_check_and_refresh_stale_roles_refreshes_only_stale_or_missing(
 ) -> None:
     def _fake_get_role(session: object, role_name: str) -> dict | None:
         if role_name == "Frontend Engineer":
-            return {"last_updated": datetime(2026, 7, 1)}  # fresh
-        return None  # everything else missing
+            return {"last_updated": datetime(2026, 7, 1)}
+        return None
 
     ground_role_mock = MagicMock(side_effect=lambda role_name: _live_result(role_name))
 
@@ -464,7 +421,7 @@ async def test_check_and_refresh_stale_roles_does_not_refresh_when_all_fresh(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def _fake_get_role(session: object, role_name: str) -> dict | None:
-        return {"last_updated": datetime(2026, 7, 1)}  # fresh for every role
+        return {"last_updated": datetime(2026, 7, 1)}
 
     ground_role_mock = MagicMock()
 

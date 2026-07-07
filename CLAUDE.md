@@ -40,12 +40,6 @@ north-star/
 ├── requirements.txt      # mirrors pyproject.toml's [project.dependencies]; that file remains the real dependency source
 ├── streamlit_app.py      # thin `from main import main` wrapper — the real `streamlit run` target now, closing Architecture §3's Enum/session_state "Known limitation" structurally
 │
-├── .agent/
-│   └── skills/
-│       └── verification_question_generator/
-│           ├── SKILL.md
-│           └── generator.py
-│
 ├── .github/workflows/
 │   ├── ci.yml            # ruff/black/mypy/pytest on push+PR — verified via an equivalent fresh-venv simulation of each step
 │   └── refresh_roles.yml
@@ -86,8 +80,10 @@ north-star/
 │   ├── db/
 │   │   ├── connection.py
 │   │   └── create_schema.py            # one-time Base.metadata.create_all() script — `python -m src.db.create_schema`, no Alembic
+│   ├── skills/
+│   │   └── verification_question_generator.py   # moved from `.agent/skills/` (see "Skill location" note below) — imported directly as `skills.verification_question_generator`, no sys.path hack
 │   └── utils/
-│       ├── gemini_client.py            # shared Gemini call/timeout/retry/JSON-parsing infra — imported as a peer by both Agents and the Verification Skill
+│       ├── adk_runtime.py              # shared ADK LLM-call infrastructure (LlmAgent/Runner/RetryConfig, timeout/pacing/JSON-parse-retry) — imported as a peer by both Agents and the Verification Skill
 │       └── exceptions.py               # logger.py was built, then deleted outright as a real scope cut — never re-add it for this submission, see Cost & Usage Tracking below
 │
 ├── evaluation/
@@ -97,7 +93,7 @@ north-star/
 └── tests/
 ```
 
-**Skills live in `.agent/skills/`, not `src/`** — required for recognition by the Antigravity workspace manager, per course convention.
+**Skill location, revised:** the Verification Question Generator previously lived in `.agent/skills/` — required for recognition by the Antigravity workspace manager, per course convention. Per explicit instruction, it now lives at `src/skills/verification_question_generator.py`, and `.agent/` is removed entirely. This drops the Antigravity-workspace-manager-recognized "Agent Skill artifact" framing for the hackathon rubric's "Agent Skills" course concept — see `specs/Architecture_North_Star.md` §4/§12 for the reconciled note and `course/` compliance check for the resulting rubric impact (the submission still evidences ≥3 other course concepts independently of this one).
 
 **Specs live in `specs/`, not `docs/`** — the version-controlled source of truth per Spec-Driven Development convention, indexed by the agent to build and verify code.
 
@@ -127,14 +123,14 @@ Never do these, even if a task seems to call for it — ask first:
 ## Coding conventions
 
 - Type hints on **every** function argument and return value, including `-> None` on constructors (`__init__`) — a function without type hints is not finished
-- Docstrings on every public function/class stating what it does and why (not just what)
+- **Docstrings are exactly one line, stating only what a function/class does — no "why," no rationale, no spec citations, no Args/Returns/Raises elaboration.** The code and its tests are the source of truth for behavior detail; a docstring longer than one line is a sign it's duplicating that detail instead of just naming it. Also applies to comments: default to none, and never leave a `#` comment carrying design rationale that belongs in a commit message or the specs instead.
 - SQLAlchemy models mirror `Architecture_North_Star.md`'s schema exactly — if a field needs to change, update the architecture doc in the same commit
 - **Timeout on every external call, no exceptions** — Himalayas, Tavily, Gemini, and Neon all get explicit timeouts (`asyncio.wait_for` for coroutines, `asyncio.timeout()` as a context manager for streaming). Every timeout is tested, not assumed.
 - **Raise exceptions, never return error strings or `None`-as-error.** Mixed return types destroy the caller's ability to reason about what it received. Use specific, typed exceptions (see `utils/exceptions.py`) — e.g. `GeminiCallError`, `GroundingSourceCallError`, `ConfidenceValidationError` — never a bare `Exception` and never a string that looks like data.
 - **Pure functions stay pure.** `pace/calculator.py`, `outline/significant_event.py`, `security/output_guard.py`, `security/input_gate.py`'s bound-check logic — all side-effect-free, independently testable, no `print()`, no DB calls, no external API calls inside them. If a function needs to do I/O, it is not one of these modules.
 - No bare `except:` — catch specific exceptions, especially around external calls (Himalayas, Tavily, Gemini) where failure is expected and must degrade gracefully per the confidence ladder, not crash
 - **One client per module, instantiated at module level — never inside a function or per-request.** Applies to the Gemini client, Tavily client, and any Himalayas MCP client. Re-instantiating a client per call is an anti-pattern to avoid from the start, not fix later.
-- ruff + black clean before every commit — zero errors, zero formatting changes. Fix before writing the commit message, not after.
+- ruff + black clean before every commit — zero errors, zero formatting changes. Fix before writing the commit message, not after. `E501` (line-too-long) is disabled in `pyproject.toml`'s ruff config: one-line docstrings can legitimately run past 88 characters, and black itself never wraps docstring text, so enforcing E501 against them would fight the one-line-docstring rule above rather than support it.
 
 ## LLM Call Discipline
 
@@ -165,7 +161,7 @@ Caught and corrected in prior projects — avoid on first pass here, don't wait 
 
 ## Testing expectations
 
-- Every function in `.agent/skills/` and `src/cron/` needs at least one test before being considered done
+- Every function in `src/skills/` and `src/cron/` needs at least one test before being considered done
 - Confidence ladder branches (high/medium/low/cached/floor/reject) each need at least one test case exercising that branch
 - Every external-call timeout has an explicit test forcing the timeout path, not just the happy path
 - Never mark a task complete with a failing or skipped test — fix or flag, don't hide

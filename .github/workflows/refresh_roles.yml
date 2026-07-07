@@ -1,18 +1,9 @@
 name: Refresh roles_cache
 
-# Deterministic wall-clock trigger for roles_cache refresh, per Architecture_North_Star.md §3.
-# Runs the shared refresh function (src/cron/refresh_roles.py) against the seed role list.
-# This is the primary trigger; the Streamlit app's startup staleness check is the resilience
-# layer alongside it — see Architecture_North_Star.md §3 for the full two-layer design.
-
 on:
   schedule:
-    # Runs monthly (day 1, 03:00 UTC) — satisfies the "minimum every 30 days" floor.
-    # The significant-event trigger (immediate, not wall-clock) is handled separately,
-    # inline, by the app itself when a live research call surfaces a bucket/confidence
-    # crossing — not by this workflow.
     - cron: "0 3 1 * *"
-  workflow_dispatch: {}  # allow manual trigger for testing/demo purposes
+  workflow_dispatch: {}
 
 jobs:
   refresh-roles-cache:

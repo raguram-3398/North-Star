@@ -1,30 +1,4 @@
-"""Tests for main.py — the Streamlit orchestration skeleton.
-
-Uses `streamlit.testing.v1.AppTest`, which runs the real script (widgets,
-`st.session_state`, reruns) rather than calling the render functions
-directly — those functions are not callable outside a live Streamlit
-script-run context (they call `st.write`/`st.button`/etc.), so this is the
-only real way to exercise them, matching Streamlit's own recommended
-testing approach.
-
-Every underlying agent/data function is mocked at the module that
-*defines* it (`agents.research_outline_agent.ground_role`, etc.) — this
-still counts as "patch where it's used" for this specific harness: `AppTest`
-re-executes main.py's entire top-level code (including every
-`from x import y` statement) from scratch on every single `.run()` call,
-exactly like a real Streamlit rerun, so main.py's own name binding is
-re-resolved from the (now-patched) source module on every run. Confirmed
-directly against the real harness before writing this suite, not assumed.
-
-`db.connection.get_session` is mocked everywhere (a `MagicMock` session) —
-consistent with this codebase's no-SQLite-substitute, mocked-Session
-convention; no test here touches a real database.
-
-Rather than replaying the whole pipeline from Intake for every test,
-most tests seed `at.session_state` directly before the first `.run()` —
-confirmed this works (session_state set before the first run survives
-`_init_session_state`'s "only set defaults for missing keys" guard).
-"""
+"""Tests for main.py's Streamlit orchestration, driven via AppTest with all agent, data, and DB session calls mocked."""
 
 from unittest.mock import AsyncMock, MagicMock
 
@@ -68,81 +42,33 @@ def _mock_db_session(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
 
 
 def _make_at() -> AppTest:
-    """Every test gets a fresh `AppTest` with the startup staleness check
-    (`_maybe_check_stale_roles`) pre-disabled — that check calls real
-    `cron.refresh_roles` machinery which, against this file's bare
-    `MagicMock` session (`_mock_db_session`), doesn't raise but instead
-    treats every `SEED_ROLES` entry as stale (a `MagicMock` compares
-    truthy against `is_stale`'s `datetime` arithmetic) and would attempt
-    real `ground_role` grounding calls once per test — violating this
-    suite's fast/offline/deterministic convention by accident, not
-    design. Dedicated tests below explicitly re-enable it (`at.session_
-    state["startup_staleness_checked"] = False`) to exercise the wiring
-    itself, with `check_and_refresh_stale_roles` mocked.
-    """
+    """Return a fresh AppTest with the startup staleness check pre-disabled so tests stay fast and offline."""
     at = AppTest.from_file(MAIN_PATH, default_timeout=20)
     at.session_state["startup_staleness_checked"] = True
     return at
 
 
-def test_run_async_resets_gemini_client_after_success(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Wiring regression test for the real, live-reproduced 'Outline
-    Confirmation failed: Gemini call failed: Event loop is closed'
-    incident: `_run_async` must reset the memoized Gemini client after
-    every `asyncio.run(...)` completes, since that client's cached async
-    transport is bound to the loop this call just closed — reused as-is
-    by the next call's own fresh loop, it raises exactly that error (see
-    `reset_gemini_client_for_new_event_loop`'s own docstring for the live
-    repro). This test only proves the reset is *called* every time, not
-    the underlying transport/event-loop behavior itself, which isn't
-    reachable through a mock.
-    """
-    calls: list[bool] = []
-    monkeypatch.setattr(
-        "main.reset_gemini_client_for_new_event_loop", lambda: calls.append(True)
-    )
+def test_run_async_returns_coroutine_result() -> None:
+    """Confirm that running an async call to completion returns its result."""
 
     async def _ok() -> str:
         return "result"
 
     assert _run_async(_ok()) == "result"
-    assert calls == [True]
 
 
-def test_run_async_resets_gemini_client_even_on_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The reset must fire in a `finally`, not only on the happy path — a
-    failed Gemini call still closes its loop, so the next call would hit
-    the same stale-transport bug if the reset were skipped on error."""
-    calls: list[bool] = []
-    monkeypatch.setattr(
-        "main.reset_gemini_client_for_new_event_loop", lambda: calls.append(True)
-    )
-
+def test_run_async_propagates_exceptions() -> None:
     async def _boom() -> str:
         raise GeminiCallError("boom")
 
     with pytest.raises(GeminiCallError):
         _run_async(_boom())
-    assert calls == [True]
 
 
 def test_maybe_check_stale_roles_runs_once_per_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Architecture §3's startup staleness check must run exactly once per
-    browser session (`startup_staleness_checked`), not on every rerun.
-
-    Patched at `cron.refresh_roles.check_and_refresh_stale_roles` (the
-    defining module), not a `"main.X"` string target: `AppTest` re-executes
-    main.py's `from cron.refresh_roles import ... check_and_refresh_stale_
-    roles` on every `.run()`, which would silently re-bind main's own name
-    back to the real function and clobber a patch made at that string
-    target before the first run.
-    """
+    """Confirm the startup staleness check runs exactly once per browser session, not on every rerun."""
     fake_check = AsyncMock(return_value=None)
     monkeypatch.setattr(
         refresh_roles_module, "check_and_refresh_stale_roles", fake_check
@@ -157,16 +83,14 @@ def test_maybe_check_stale_roles_runs_once_per_session(
     assert fake_check.call_args[0][1] == SEED_ROLES
     assert at.session_state["startup_staleness_checked"] is True
 
-    at.run()  # a second rerun must not call it again
+    at.run()
     fake_check.assert_called_once()
 
 
 def test_maybe_check_stale_roles_failure_shows_warning_not_crash(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A resilience layer must never become a hard dependency — a live-call
-    failure here must degrade to a dismissable warning, never crash the
-    rest of the app."""
+    """Confirm a failure in the staleness check degrades to a dismissable warning instead of crashing the app."""
     monkeypatch.setattr(
         refresh_roles_module,
         "check_and_refresh_stale_roles",
@@ -187,11 +111,21 @@ def test_intake_creates_user_and_advances_to_clarify_gate(
 ) -> None:
     fake_create_user = MagicMock(return_value={"id": "user-123"})
     monkeypatch.setattr(users_module, "create_user", fake_create_user)
+    narrowing_turn = ClarifyGateTurn(
+        gate_state=ClarifyGateState(
+            stage=ClarifyGateStage.NARROWING, narrowing_rounds_used=0
+        ),
+        context=ClarifyGateContext(original_stated_goal="Backend Engineer"),
+        message="What kind of backend work interests you most?",
+    )
+    monkeypatch.setattr(
+        roa, "begin_clarify_gate", AsyncMock(return_value=narrowing_turn)
+    )
 
     at = _make_at()
     at.run()
     assert at.session_state["current_stage"] == "landing"
-    at.button[0].click()  # "Begin" on the new Landing stage
+    at.button[0].click()
     at.run()
 
     at.text_input[1].input("Backend Engineer")
@@ -210,10 +144,7 @@ def test_intake_creates_user_and_advances_to_clarify_gate(
 def test_clarify_gate_real_answer_resolves_and_advances(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A REAL-classified stated goal resolves immediately (no narrowing
-    round needed) — the resulting `Continue` button uses the gate's real
-    `resolved_role`, not a placeholder pass-through of the raw stated goal.
-    """
+    """Confirm a real-classified stated goal resolves immediately and auto-advances to Research and Market Grounding."""
     fake_turn = ClarifyGateTurn(
         gate_state=ClarifyGateState(stage=ClarifyGateStage.RESOLVED),
         context=ClarifyGateContext(original_stated_goal="Backend Engineer"),
@@ -222,6 +153,14 @@ def test_clarify_gate_real_answer_resolves_and_advances(
     )
     fake_begin_clarify_gate = AsyncMock(return_value=fake_turn)
     monkeypatch.setattr(roa, "begin_clarify_gate", fake_begin_clarify_gate)
+    fake_ground_role = AsyncMock(
+        return_value=GeneralKnowledgeFloorResult(
+            role_name="Backend Engineer",
+            confidence=ConfidenceTier.GENERAL_KNOWLEDGE_ONLY,
+            label="No cached or live market data is available.",
+        )
+    )
+    monkeypatch.setattr(roa, "ground_role", fake_ground_role)
 
     at = _make_at()
     at.session_state["current_stage"] = "clarify_gate"
@@ -230,13 +169,8 @@ def test_clarify_gate_real_answer_resolves_and_advances(
     at.run()
 
     fake_begin_clarify_gate.assert_called_once_with("Backend Engineer")
-    # No chat_input is offered once RESOLVED — the round bound must never
-    # be bypassable, and there's nothing left to advance.
-    assert len(at.chat_input) == 0
-
-    at.button[0].click()
-    at.run()
-
+    fake_ground_role.assert_called_once()
+    assert fake_ground_role.call_args[0][0] == "Backend Engineer"
     assert not at.exception
     assert at.session_state["resolved_role"] == "Backend Engineer"
     assert at.session_state["current_stage"] == "research_grounding"
@@ -245,11 +179,7 @@ def test_clarify_gate_real_answer_resolves_and_advances(
 def test_clarify_gate_narrowing_round_calls_advance_clarify_gate(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A VAGUE stated goal enters NARROWING; a chat reply calls
-    `advance_clarify_gate` with the real gate_state/context/conversation,
-    and a second narrowing round (bound not yet reached) keeps
-    `st.chat_input` available rather than exposing a bypass.
-    """
+    """Confirm a vague stated goal enters narrowing and a chat reply advances the gate while keeping chat input available."""
     first_turn = ClarifyGateTurn(
         gate_state=ClarifyGateState(
             stage=ClarifyGateStage.NARROWING, narrowing_rounds_used=0
@@ -292,8 +222,6 @@ def test_clarify_gate_narrowing_round_calls_advance_clarify_gate(
         {"role": "user", "content": "Backend stuff"},
         {"role": "agent", "content": second_turn.message},
     ]
-    # Bound not yet reached — still offers a way to reply, still no way to
-    # skip past the gate.
     assert len(at.chat_input) == 1
     assert len(at.button) == 0
 
@@ -301,11 +229,7 @@ def test_clarify_gate_narrowing_round_calls_advance_clarify_gate(
 def test_clarify_gate_exited_uses_original_stated_goal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The zero-market-signal exit (PRD §7.2) routes to Research & Market
-    Grounding using the gate's `context.original_stated_goal` — the real
-    resolved goal for this path, since `resolved_role` stays None on an
-    EXITED turn by contract.
-    """
+    """Confirm a zero-market-signal exit auto-advances to Research and Market Grounding using the original stated goal."""
     exited_turn = ClarifyGateTurn(
         gate_state=ClarifyGateState(stage=ClarifyGateStage.EXITED),
         context=ClarifyGateContext(original_stated_goal="Dragon Whisperer II"),
@@ -313,6 +237,14 @@ def test_clarify_gate_exited_uses_original_stated_goal(
         exited=True,
     )
     monkeypatch.setattr(roa, "begin_clarify_gate", AsyncMock(return_value=exited_turn))
+    fake_ground_role = AsyncMock(
+        return_value=GeneralKnowledgeFloorResult(
+            role_name="Dragon Whisperer II",
+            confidence=ConfidenceTier.GENERAL_KNOWLEDGE_ONLY,
+            label="No cached or live market data is available.",
+        )
+    )
+    monkeypatch.setattr(roa, "ground_role", fake_ground_role)
 
     at = _make_at()
     at.session_state["current_stage"] = "clarify_gate"
@@ -320,10 +252,8 @@ def test_clarify_gate_exited_uses_original_stated_goal(
     at.session_state["user_id"] = "user-1"
     at.run()
 
-    assert len(at.chat_input) == 0
-    at.button[0].click()
-    at.run()
-
+    fake_ground_role.assert_called_once()
+    assert fake_ground_role.call_args[0][0] == "Dragon Whisperer II"
     assert not at.exception
     assert at.session_state["resolved_role"] == "Dragon Whisperer II"
     assert at.session_state["current_stage"] == "research_grounding"
@@ -332,6 +262,7 @@ def test_clarify_gate_exited_uses_original_stated_goal(
 def test_research_grounding_live_result_persists_role_and_advances(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Confirm a live grounding result persists the resolved role and cascades into Outline Creation."""
     fake_result = LiveGroundingResult(
         role_name="Backend Engineer",
         skills=[
@@ -351,6 +282,36 @@ def test_research_grounding_live_result_persists_role_and_advances(
     monkeypatch.setattr(roa, "ground_role", fake_ground_role)
     fake_set_resolved_role = MagicMock()
     monkeypatch.setattr(users_module, "set_resolved_role", fake_set_resolved_role)
+    fake_topics = [
+        InitialOutlineTopic(
+            topic_name="Docker basics",
+            hierarchy_position=1,
+            topic_group="Docker",
+            position_in_group=1,
+            source_url="https://example.com/a",
+            source_type="job_listing",
+            confidence=ConfidenceTier.HIGH,
+            is_enrichment=False,
+            status="not_started",
+        )
+    ]
+    monkeypatch.setattr(
+        roa, "create_initial_outline", AsyncMock(return_value=fake_topics)
+    )
+    monkeypatch.setattr(
+        outline_topics_module,
+        "insert_outline_topics",
+        MagicMock(
+            return_value=[
+                {
+                    "id": "topic-1",
+                    "hierarchy_position": 1,
+                    "topic_name": "Docker basics",
+                    "topic_group": "Docker",
+                }
+            ]
+        ),
+    )
 
     at = _make_at()
     at.session_state["current_stage"] = "research_grounding"
@@ -361,14 +322,13 @@ def test_research_grounding_live_result_persists_role_and_advances(
     fake_ground_role.assert_called_once()
     assert fake_ground_role.call_args[0][0] == "Backend Engineer"
 
-    at.button[0].click()
-    at.run()
-
     assert not at.exception
     fake_set_resolved_role.assert_called_once_with(
         fake_ground_role.call_args[0][1], "user-1", "Backend Engineer", "high"
     )
     assert at.session_state["current_stage"] == "outline_creation"
+    assert len(at.button) == 1
+    assert at.button[0].label == "Continue to Outline Confirmation"
 
 
 def test_research_grounding_general_knowledge_floor_is_a_dead_end(
@@ -388,7 +348,6 @@ def test_research_grounding_general_knowledge_floor_is_a_dead_end(
     at.run()
 
     assert not at.exception
-    # No outline can be built — no "continue" button is ever rendered.
     assert len(at.button) == 0
     assert at.session_state["current_stage"] == "research_grounding"
 
@@ -451,8 +410,6 @@ def test_outline_creation_calls_insert_outline_topics_with_its_output(
     fake_insert_outline_topics.assert_called_once()
     call_args = fake_insert_outline_topics.call_args[0]
     assert call_args[1] == "user-1"
-    # The actual point of this test: the exact object create_initial_outline
-    # returned is what gets passed to insert_outline_topics, unmodified.
     assert call_args[2] is fake_topics
 
     at.button[0].click()
@@ -500,7 +457,6 @@ def test_outline_confirmation_initial_render_shows_outline_and_message(
     assert at.session_state["outline_confirmation_conversation"] == [
         {"role": "agent", "content": "Here's your learning plan."}
     ]
-    # REVIEWING is not concluded — a chat_input is offered, not a button.
     assert len(at.chat_input) == 1
     assert len(at.button) == 0
 
@@ -508,10 +464,7 @@ def test_outline_confirmation_initial_render_shows_outline_and_message(
 def test_outline_confirmation_review_turn_calls_handle_review_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A concern consumes a round (per `advance_after_review_turn`, not
-    yet concluded) — the reply is rendered in-chat and the outline stays
-    on screen, still awaiting further review.
-    """
+    """Confirm a review concern consumes a round, rendering the reply in-chat while the outline stays awaiting further review."""
     fake_topics = _fake_outline_topics()
     first_turn = OutlineConfirmationTurn(
         state=OutlineConfirmationState(stage=OutlineConfirmationStage.REVIEWING),
@@ -560,11 +513,7 @@ def test_outline_confirmation_review_turn_calls_handle_review_turn(
 def test_outline_confirmation_addition_request_grounds_and_regenerates_outline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Regression test for the real, user-reported gap: an addition
-    request on Outline Confirmation previously always said grounding a
-    raw addition wasn't wired up (Architecture §10/PRD §11 item 6). Now
-    it grounds the request and regenerates the outline for real.
-    """
+    """Confirm an addition request during Outline Confirmation grounds the request and regenerates the outline."""
     fake_topics = _fake_outline_topics()
     first_turn = OutlineConfirmationTurn(
         state=OutlineConfirmationState(stage=OutlineConfirmationStage.REVIEWING),
@@ -681,10 +630,7 @@ def test_outline_confirmation_addition_request_grounds_and_regenerates_outline(
 def test_outline_confirmation_addition_request_ungroundable_leaves_outline_unchanged(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Never a fabricated source_url — if Tavily has nothing for the
-    extracted skill name, the outline must stay exactly as it was, with a
-    plain explanation appended to the conversation, not a crash or a
-    silently invented topic."""
+    """Confirm an ungroundable addition request leaves the outline unchanged and appends a plain explanation."""
     fake_topics = _fake_outline_topics()
     first_turn = OutlineConfirmationTurn(
         state=OutlineConfirmationState(stage=OutlineConfirmationStage.REVIEWING),
@@ -766,7 +712,6 @@ def test_outline_confirmation_concluded_advances_to_lowest_hierarchy_not_started
     at.session_state["user_id"] = "user-1"
     at.run()
 
-    # Concluded — no chat_input offered, only the continue button.
     assert len(at.chat_input) == 0
     at.button[0].click()
     at.run()
@@ -830,8 +775,6 @@ def test_day_by_day_coaching_start_verification_builds_source_and_advances(
     at.session_state["user_id"] = "user-1"
     at.session_state["test_out_prompt_dismissed"] = True
     at.run()
-    # Stepped reveal: Summary, Theory, Hands-on, Review, Reflection,
-    # Preview — 5 "Next" clicks before the final "Start Quiz" button.
     for _ in range(5):
         assert at.button[0].label == "Next"
         at.button[0].click()
@@ -878,25 +821,17 @@ def test_day_by_day_coaching_spillover_stays_and_increments_day(
     at.session_state["user_id"] = "user-1"
     at.session_state["test_out_prompt_dismissed"] = True
     at.run()
-    # Stepped reveal: no hands-on/review this time (both None), so only
-    # Summary, Theory, Reflection, Preview — 3 "Next" clicks before the
-    # spillover button.
     for _ in range(3):
         assert at.button[0].label == "Next"
         at.button[0].click()
         at.run()
-    at.button[0].click()  # "Continue to next day (same topic)"
+    at.button[0].click()
     at.run()
 
     assert not at.exception
     assert at.session_state["current_stage"] == "day_by_day_coaching"
     assert at.session_state["day_number_for_topic"] == 2
     assert at.session_state["carried_over_content"] == "leftover material"
-    # AppTest's .run() follows through the internal st.rerun() automatically,
-    # so content is genuinely regenerated for the new day (correct behavior,
-    # not a bug) — the real point of this test is that the *second* call
-    # actually threads yesterday's remaining_content forward as today's
-    # carried_over_content.
     assert fake_generate_day_content.call_count == 2
     _, second_call_kwargs = fake_generate_day_content.call_args_list[1]
     assert second_call_kwargs["carried_over_content"] == "leftover material"
@@ -905,9 +840,7 @@ def test_day_by_day_coaching_spillover_stays_and_increments_day(
 def test_day_by_day_coaching_steps_reveal_progressively_via_next_button(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Real, requested UX change: each Day-by-Day Coaching section must
-    appear one at a time as "Next" is clicked, not all at once on a
-    single page load."""
+    """Confirm each Day-by-Day Coaching section appears one at a time as "Next" is clicked."""
     topic = _fake_topic()
     monkeypatch.setattr(outline_topics_module, "get_topic", lambda *a, **k: topic)
     monkeypatch.setattr(
@@ -975,14 +908,7 @@ def test_day_by_day_coaching_steps_reveal_progressively_via_next_button(
 def test_day_by_day_coaching_citation_links_to_the_real_full_url(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Regression test for a real, reported bug: citations previously
-    rendered only the bare domain as plain text, so whatever became
-    clickable (inconsistently, depending on the markdown renderer's own
-    autolink heuristics) pointed at that site's homepage, not the actual
-    article/video — e.g. a YouTube citation went to a broken YouTube
-    landing page instead of the real video. The caption must now be an
-    explicit markdown link to the citation's real, full URL.
-    """
+    """Confirm a citation renders as an explicit markdown link to its real, full URL rather than the bare domain."""
     topic = _fake_topic()
     monkeypatch.setattr(outline_topics_module, "get_topic", lambda *a, **k: topic)
     monkeypatch.setattr(
@@ -1019,7 +945,7 @@ def test_day_by_day_coaching_citation_links_to_the_real_full_url(
     at.session_state["user_id"] = "user-1"
     at.session_state["test_out_prompt_dismissed"] = True
     at.run()
-    at.button[0].click()  # reveal the Theory step
+    at.button[0].click()
     at.run()
 
     assert not at.exception
@@ -1034,10 +960,7 @@ def test_day_by_day_coaching_citation_links_to_the_real_full_url(
 def test_day_by_day_coaching_shows_test_out_choice_before_generating_content(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """PRD §7.6's test-out exception: "the user may trigger verification
-    first, before study content is generated" — the choice screen must
-    appear, and `generate_day_content` must NOT be called, until the user
-    has explicitly declined it."""
+    """Confirm the test-out choice screen appears and day content is not generated until the user declines it."""
     topic = _fake_topic()
     monkeypatch.setattr(outline_topics_module, "get_topic", lambda *a, **k: topic)
     fake_generate_day_content = AsyncMock()
@@ -1102,10 +1025,7 @@ def test_day_by_day_coaching_test_out_declined_falls_through_to_generation(
 def test_day_by_day_coaching_test_out_fetches_theory_links_and_advances(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Choosing "Test out" must fetch real teaching material directly
-    (never call `generate_day_content` — that's the whole point of "before
-    study content is generated") and jump straight to Verification with
-    `is_test_out=True`."""
+    """Confirm choosing test-out fetches teaching material directly and jumps straight to Verification."""
     topic = _fake_topic()
     monkeypatch.setattr(outline_topics_module, "get_topic", lambda *a, **k: topic)
     fake_generate_day_content = AsyncMock()
@@ -1142,10 +1062,7 @@ def test_day_by_day_coaching_test_out_fetches_theory_links_and_advances(
 def test_day_by_day_coaching_test_out_refused_without_theory_material(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """CLAUDE.md guardrail #6: never silently fabricate a source. If
-    Tavily's theory search comes back empty, test-out must be refused
-    (an error, staying on Day-by-Day Coaching) rather than generating
-    verification questions with no real grounding material."""
+    """Test-out is refused, not silently fabricated, when Tavily's theory search comes back empty."""
     topic = _fake_topic()
     monkeypatch.setattr(outline_topics_module, "get_topic", lambda *a, **k: topic)
     monkeypatch.setattr(cpa, "fetch_theory_material_links", AsyncMock(return_value=[]))
@@ -1211,7 +1128,7 @@ def test_verification_single_slot_wiring_begin_and_submit(
     monkeypatch.setattr(cpa, "submit_verification_answer", fake_submit)
 
     at.text_input[0].input("namespaces and cgroups")
-    at.button[0].click()  # "Submit answer"
+    at.button[0].click()
     at.run()
 
     assert not at.exception
@@ -1220,7 +1137,7 @@ def test_verification_single_slot_wiring_begin_and_submit(
     assert args[1] == "namespaces and cgroups"
     assert at.session_state["verification_slot_state"].resolved is True
 
-    at.button[0].click()  # "Next question"
+    at.button[0].click()
     at.run()
     assert at.session_state["current_question_number"] == 2
 
@@ -1274,7 +1191,7 @@ def test_verification_completion_calls_complete_topic_verification(
     }
     assert at.session_state["last_completion_result"] is fake_result
 
-    at.button[0].click()  # "Continue to next topic"
+    at.button[0].click()
     at.run()
     assert at.session_state["current_topic_id"] == "topic-2"
     assert at.session_state["day_number_for_topic"] == 1
@@ -1284,9 +1201,7 @@ def test_verification_completion_calls_complete_topic_verification(
 def test_verification_completion_shows_non_blocking_patch_decision_banner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """PRD §7.9's "ask_user" branch: a low/uncertain-confidence patch-note
-    must render a banner, but "Continue to next topic" must remain
-    clickable alongside it — ignoring the banner is always safe."""
+    """A low-confidence patch-note renders a banner without blocking the "Continue to next topic" button."""
     topic = _fake_topic(is_enrichment=False)
     monkeypatch.setattr(outline_topics_module, "get_topic", lambda *a, **k: topic)
     monkeypatch.setattr(
@@ -1433,10 +1348,7 @@ def test_patch_decision_banner_defer_resolves_and_clears(
 def test_verification_completion_test_out_full_pass_calls_complete_topic_test_out(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """`is_test_out=True` (set by the Day-by-Day Coaching test-out choice)
-    must route completion through `complete_topic_test_out`, not
-    `complete_topic_verification` directly — and a full pass shows the
-    "no study content needed" message (PRD §7.6)."""
+    """A test-out completion routes through complete_topic_test_out and a full pass shows the no-study-needed message."""
     topic = _fake_topic(is_enrichment=False)
     monkeypatch.setattr(outline_topics_module, "get_topic", lambda *a, **k: topic)
     monkeypatch.setattr(
@@ -1547,7 +1459,7 @@ def test_verification_completion_goal_complete_advances_to_goal_completion(
     at.session_state["current_question_number"] = 6
     at.session_state["day_number_for_topic"] = 1
     at.run()
-    at.button[0].click()  # "View closing note"
+    at.button[0].click()
     at.run()
 
     assert not at.exception
@@ -1576,9 +1488,6 @@ def test_goal_completion_composes_generate_closing_note(
     fake_generate_closing_note.assert_called_once()
     assert fake_generate_closing_note.call_args[0][1] == "user-1"
     assert at.session_state["closing_note"] is fake_note
-
-
-# --- _build_verification_source (pure function, no Streamlit needed) ----
 
 
 def test_build_verification_source_uses_first_theory_link() -> None:

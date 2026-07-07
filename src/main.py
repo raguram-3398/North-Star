@@ -1,135 +1,4 @@
-"""Application entry point — Streamlit orchestration skeleton wiring
-Project North Star's full pipeline (PRD §7.1) end to end.
-
-This module wires already-built, already-tested functions from `agents/`,
-`security/`, `pace/`, `outline/`, `patches/`, and `data/` together in
-sequence. It owns no decision logic of its own — every confidence
-branch, bound-count, drift check, and patch/enrichment trigger already
-lives in those modules; this file only calls them in the right order and
-holds `st.session_state` between Streamlit reruns.
-
-**PipelineStage** (PRD §7.1's 8 numbered stages the user actually
-navigates through). Pace tracking, patch-notes, and enrichment are
-deliberately NOT separate stages here — they fire as side effects inside
-`complete_topic_verification` and are only read back for display during
-the Day-by-Day Coaching / Verification stages, never triggered directly by
-this module (CLAUDE.md guardrail #10: never reimplement a decision
-already made elsewhere).
-
-**st.session_state shape** (initialized by `_init_session_state`, the only
-place these keys are declared):
-
-- `db_session`: the one SQLAlchemy `Session` for this browser session,
-  created lazily via `db.connection.get_session()` and cached here rather
-  than recreated every rerun (Streamlit reruns the whole script on every
-  interaction) — every `data/*` function still commits its own
-  transaction, so a single long-lived `Session` object is safe to reuse
-  across reruns the same way a real request-scoped session would be.
-- `startup_staleness_checked`: whether `_maybe_check_stale_roles` has
-  already run for this browser session (Architecture §3's startup
-  staleness check) — this codebase's practical reading of "on Streamlit
-  app startup (or first session of the day)": Streamlit has no
-  cross-session calendar-day state without a new persistence mechanism,
-  so "once per browser session" is the honest, achievable version of
-  that requirement. Set `True` the first time it runs, success or
-  failure, so a live-call failure doesn't retry on every single rerun.
-- `current_stage`: the *string* `.value` of the `PipelineStage` currently
-  being rendered — the single source of truth for which stage function
-  `main()` dispatches to. Stored as a plain string, never the `Enum`
-  member object itself: Streamlit re-executes this entire script's
-  top-level code (including the `class PipelineStage(Enum)` statement)
-  from scratch on every single rerun when `main.py` is the literal
-  `streamlit run` target, which mints a brand-new, distinct `PipelineStage`
-  class object each time — an enum member persisted in `session_state`
-  from a *previous* rerun's class would then fail every equality/dict-key
-  check against the *current* rerun's freshly-defined class, a real
-  `KeyError` crash confirmed live via `streamlit.testing.v1.AppTest`
-  during this task (see this task's report). Plain strings have no such
-  identity problem, so every stage transition below assigns
-  `PipelineStage.X.value`, never `PipelineStage.X` itself.
-- `user_id`: the persisted `users.id` (str), set once Intake completes.
-- `stated_goal`: the raw Intake goal text, threaded into the Clarify Gate.
-- `clarify_turn`: the most recent `ClarifyGateTurn` returned by
-  `begin_clarify_gate`/`advance_clarify_gate` — carries the loop state
-  (`gate_state`/`context`) needed to advance the next real user reply.
-- `clarify_conversation`: the Clarify Gate's displayed chat history, a
-  `list[{"role": "agent" | "user", "content": str}]` — also the exact
-  shape `advance_clarify_gate`'s `conversation` parameter expects
-  (`role="agent"` is load-bearing: `_last_agent_message` in
-  `agents/research_outline_agent.py` looks for that literal string).
-- `resolved_role`: the role name Research/Grounding and everything
-  downstream operates on.
-- `grounding_result`: `ground_role`'s return value (`LiveGroundingResult`
-  / `CachedFallbackResult` / `GeneralKnowledgeFloorResult`).
-- `outline_topics`: the pre-persistence `list[InitialOutlineTopic]` from
-  `create_initial_outline` — kept only because `begin_outline_confirmation`
-  needs that exact dataclass shape, not the persisted dict rows.
-  `persisted_topics`: the same outline after `insert_outline_topics`
-  (real `id`s/`hierarchy_position`s).
-- `outline_confirmation_turn`: the most recent `OutlineConfirmationTurn`
-  from `begin_outline_confirmation`/`handle_review_turn` — carries
-  `state`/`topics` needed to advance the next real review turn; `topics`
-  is also the single source of truth for the outline list rendered
-  alongside the chat.
-- `outline_confirmation_conversation`: the Outline Confirmation chat
-  history, same shape as `clarify_conversation`.
-- `current_topic_id`: the outline topic currently being taught/verified —
-  looked up fresh from the DB each time (never a stale index), since
-  `maybe_trigger_enrichment`/`maybe_deliver_patch` can insert new topics
-  mid-flow and shift `hierarchy_position`s.
-- `day_number_for_topic`: how many days of content have been generated for
-  the *current* topic so far (starts at 1, increments once per spillover
-  day — see `DayContent.remaining_content`) — this is also `days_taken`
-  passed to `complete_topic_verification` once verification starts.
-- `carried_over_content`: `generate_day_content`'s spillover input for the
-  next day of the same topic, or `None`.
-- `day_content`: the current day's generated `DayContent`, or `None`
-  before it's been generated for this day.
-- `day_coaching_step_index`: which Day-by-Day Coaching section (Summary,
-  Theory, ...) is the furthest one revealed so far for the current day —
-  a stepped, "Next"-button reveal rather than showing every section at
-  once. Reset to 0 whenever `day_content` is reset to `None` (a new day
-  or a new topic).
-- `test_out_prompt_dismissed`: whether the user has already been offered
-  (and declined) test-out for the *current topic* — gates the one-time
-  choice screen shown whenever `day_content is None` (PRD §7.6's
-  "verification first, before study content is generated"). Reset to
-  `False` only when a genuinely new topic starts (`_advance_to_day_one`/
-  the "Continue to next topic" action), never on a same-topic spillover
-  day, so a user who already declined mid-topic isn't re-prompted after
-  they've already seen day 1's material.
-- `is_test_out`: whether the verification currently in progress is a
-  test-out attempt (PRD §7.6) rather than regular post-content
-  verification — threaded into `submit_verification_answer`'s
-  `is_test_out` flag and used to decide whether topic completion calls
-  `complete_topic_test_out` or `complete_topic_verification`.
-- `verification_source_material` / `verification_source_url`: the single
-  source pair (computed once per topic — from the generated `DayContent`
-  via `_build_verification_source` for regular verification, or directly
-  from a fresh `fetch_theory_material_links` call for test-out, since no
-  `DayContent` exists yet in that case) that all 5 verification question
-  slots for this topic are anchored to.
-- `current_question_number`: which of the 5 verification slots (1-5) is
-  active; `6` signals all slots resolved.
-- `verification_slot_state`: the current slot's `VerificationSlotState`,
-  or `None` before its first question has been generated.
-- `last_completion_result`: the `TopicCompletionResult` from the most
-  recent `complete_topic_verification`/`complete_topic_test_out` call,
-  read back for display only.
-- `last_test_out_full_pass`: `TestOutResult.full_pass` from the most
-  recent `complete_topic_test_out` call, or `None` when the current
-  topic wasn't completed via test-out — read back for display only.
-- `pending_patch_decision`: the `PendingPatchDecision` from the most
-  recent completion call, or `None` if no low/uncertain-confidence
-  patch-note is currently awaiting the user's "learn now or defer"
-  choice (PRD §7.9). Rendered as a non-blocking, dismissible banner
-  (`_render_patch_decision_banner`) alongside — never instead of — the
-  normal "Continue to next topic"/"View closing note" actions: ignoring
-  it is always safe, since an unresolved patch simply stays `PENDING`
-  and is reconsidered the next time `maybe_deliver_patch` runs.
-- `closing_note`: the `ClosingNote` from the one `generate_closing_note`
-  call, once Goal Completion is reached.
-"""
+"""Streamlit entry point that wires the intake-through-goal-completion pipeline stages together using session state, calling out to already-tested agent and data modules for all decision logic."""
 
 import asyncio
 from collections.abc import Callable
@@ -194,24 +63,14 @@ from utils.exceptions import (
     HimalayasParseError,
     TavilyParseError,
 )
-from utils.gemini_client import reset_gemini_client_for_new_event_loop
 
-# Loaded here (not left to the operator to `source .env` manually, unlike
-# src/cron/refresh_roles.py's __main__ block, which relies on GH Actions
-# already injecting secrets as real env vars) — this is the first real
-# end-user-facing entry point in this codebase, not a CI/cron context.
 load_dotenv()
 
 NOT_STARTED_STATUS = "not_started"
 
 
 class PipelineStage(Enum):
-    """The 8 pipeline stages a user navigates through (PRD §7.1), plus
-    `LANDING` — a new, purely presentational entry point ahead of Intake
-    (the visual-pass task), not a PRD-numbered pipeline stage of its own.
-    Pace tracking / patch-notes / enrichment are intentionally absent —
-    see module docstring.
-    """
+    """The pipeline stages a user navigates through, from the landing page to goal completion."""
 
     LANDING = "landing"
     INTAKE = "intake"
@@ -224,10 +83,6 @@ class PipelineStage(Enum):
     GOAL_COMPLETION = "goal_completion"
 
 
-# Broad but named (not bare `except:`) — every exception a stage's real
-# calls can raise, per each function's own documented contract. Caught at
-# the orchestration boundary only, exactly the way a UI must degrade
-# gracefully on a live-call failure without crashing the whole app.
 _STAGE_EXCEPTIONS = (
     GeminiCallError,
     GroundingSourceCallError,
@@ -240,29 +95,12 @@ _STAGE_EXCEPTIONS = (
 
 
 def _run_async(coro: Any) -> Any:
-    """Run one async call to completion from Streamlit's synchronous
-    script execution. Each Streamlit rerun is its own fresh top-to-bottom
-    script run, so a fresh event loop per call is correct here, not a
-    workaround.
-
-    Always resets the memoized Gemini client afterward (success or
-    failure) — see `reset_gemini_client_for_new_event_loop`'s own
-    docstring for the live-reproduced "Event loop is closed" bug this
-    closes: the client's cached async transport is bound to *this* call's
-    loop, which is about to close, so it must not be reused by the next
-    `_run_async` call's own fresh loop.
-    """
-    try:
-        return asyncio.run(coro)
-    finally:
-        reset_gemini_client_for_new_event_loop()
+    """Run one async call to completion using a fresh event loop for this Streamlit rerun."""
+    return asyncio.run(coro)
 
 
 def _init_session_state() -> None:
-    """Populate every `st.session_state` key this module uses, if not
-    already present — see module docstring for the full shape. Runs at
-    the top of every rerun; a no-op for keys already set.
-    """
+    """Populate every session-state key this module uses with its default value, if not already set."""
     defaults: dict[str, Any] = {
         "db_session": None,
         "startup_staleness_checked": False,
@@ -306,22 +144,7 @@ def _get_db_session() -> Session:
 
 
 def _maybe_check_stale_roles() -> None:
-    """Architecture §3's startup staleness resilience layer: once per
-    browser session (see `startup_staleness_checked`'s own docstring
-    entry above), refresh any `SEED_ROLES` entry whose `roles_cache` row
-    is stale or missing (`check_and_refresh_stale_roles`) before the
-    user's own pipeline run can reach it. `SEED_ROLES`, not the as-yet-
-    unresolved `resolved_role`, since this runs before Intake/Clarify Gate
-    have resolved anything — the same seed-role bootstrap list the cron
-    job and initial seed run already use (CLAUDE.md guardrail #9: this
-    reuses `check_and_refresh_stale_roles`/`refresh_roles_cache` as-is,
-    never a reimplementation).
-
-    A resilience layer must never become a hard dependency: failure here
-    is caught and surfaced as a dismissable warning (the same
-    `_STAGE_EXCEPTIONS` every other live-call stage already degrades on),
-    never a crash that blocks the rest of the app from loading.
-    """
+    """Refresh any stale or missing seed-role cache entries once per browser session, warning rather than crashing on failure."""
     if st.session_state.startup_staleness_checked:
         return
     st.session_state.startup_staleness_checked = True
@@ -333,74 +156,23 @@ def _maybe_check_stale_roles() -> None:
         st.warning(f"Startup roles_cache staleness check failed: {exc}")
 
 
-# --- Shared presentation helpers (visual-pass task, native-Streamlit) ---
-#
-# Pure presentation, no session-state, no business logic. A prior version
-# of this module injected a custom CSS color-token system (a from-scratch
-# palette as raw `<style>`). That caused a real contrast bug: it forced
-# every page's *background* to a fixed light color without also forcing
-# every element's *text* color, so plain text left on Streamlit's own
-# theme-dependent default color could render near-white-on-near-white
-# whenever the active Streamlit theme was dark. Per product decision,
-# this reverts to Streamlit's default theme entirely rather than patching
-# the custom palette in place — every helper below renders through a
-# native Streamlit component (`st.caption`/`st.info`/`st.success`/
-# `st.warning`), each of which Streamlit itself keeps legible against
-# whatever theme is active, not a fixed hex value this module owns.
-
-
 def _domain_from_url(url: str) -> str:
-    """Presentation-only: the host portion of `url`, for a compact
-    citation display. Falls back to the full URL if it can't be parsed —
-    never raises, since a citation must always be shown, not dropped.
-    """
+    """Return the host portion of a URL for compact citation display, falling back to the full URL if parsing fails."""
     return urlparse(url).netloc or url
 
 
 def _render_kicker(label: str) -> None:
-    """A small section label (e.g. "Summary", "Theory") — native
-    `st.caption`, Streamlit's own muted small-text component.
-    """
+    """Render a small muted section label such as "Summary" or "Theory"."""
     st.caption(f"**{label.upper()}**")
 
 
-def _render_stamp(confidence: str, source_url: str, *, sample: bool = False) -> None:
-    """Render the Confidence Stamp — this product's signature element —
-    via native `st.info`, so it always matches Streamlit's own theme
-    rather than a fixed custom color. Pure presentation over an
-    already-computed/fetched confidence tier and source_url — never
-    computes or validates either itself (that's `security/output_guard.py`
-    and the confidence ladder, upstream of this function).
-
-    `sample=True` prefixes the message with an explicit "SAMPLE" label on
-    the same line as the stamp itself, so a demo viewer can never mistake
-    the Landing page's illustrative mockup for a real grounded result —
-    this product's whole pitch is honesty about real confidence, so the
-    one place this stamp isn't real data must say so unambiguously, not
-    just be implied by page context.
-    """
-    domain = _domain_from_url(source_url)
-    prefix = "SAMPLE — " if sample else ""
-    st.info(f"{prefix}CONFIDENCE: {confidence.upper()} · source: {domain}")
+def _render_stage_header(label: str) -> None:
+    """Render a center-aligned heading for a stage that auto-advances without a Continue button."""
+    st.markdown(f"<h2 style='text-align: center;'>{label}</h2>", unsafe_allow_html=True)
 
 
 def _render_citations(links: list[dict[str, str]]) -> None:
-    """One caption line per citation — title (or domain, if untitled) as
-    an explicit markdown link to the citation's real, full `url`, plus
-    the bare domain for a quick trust glance — native `st.caption`, no
-    custom color.
-
-    A real, reported bug: this previously rendered only the bare domain
-    as plain text (`_domain_from_url(url)` discards the real path/query),
-    relying on whichever text happened to look link-shaped to Streamlit's
-    markdown renderer to become clickable at all — inconsistent (some
-    domains autolink, some don't) and, even when it did autolink, always
-    pointed at that site's homepage rather than the actual article/video,
-    since the real path was already thrown away before rendering. An
-    explicit `[label](url)` link to the real `url` fixes both: always
-    clickable, always the correct page (e.g. the actual YouTube video,
-    not youtube.com's homepage).
-    """
+    """Render one caption per citation as a clickable markdown link to its full URL, alongside the bare domain."""
     for link in links:
         url = link["url"]
         domain = _domain_from_url(url)
@@ -410,10 +182,7 @@ def _render_citations(links: list[dict[str, str]]) -> None:
 
 
 def _render_progress_dots(current_question_number: int, total: int = 5) -> None:
-    """The Verification screen's step tracker — plain markdown text (done
-    questions struck through, the current one bolded) via `st.caption`,
-    no custom color needed to distinguish state.
-    """
+    """Render the verification step tracker, striking through completed questions and bolding the current one."""
     parts = []
     for n in range(1, total + 1):
         if n < current_question_number:
@@ -425,34 +194,12 @@ def _render_progress_dots(current_question_number: int, total: int = 5) -> None:
     st.caption("Question " + "  ·  ".join(parts) + f" of {total}")
 
 
-def _render_attempt_chips(attempt_number: int, max_attempts: int = 3) -> None:
-    """Attempt-number markers (1/2/3) for the current verification
-    question — same plain-markdown treatment as `_render_progress_dots`.
-    """
-    parts = []
-    for n in range(1, max_attempts + 1):
-        if n < attempt_number:
-            parts.append(f"~~attempt {n}~~")
-        elif n == attempt_number:
-            parts.append(f"**attempt {n}**")
-        else:
-            parts.append(f"attempt {n}")
-    st.caption("  ·  ".join(parts))
-
-
-# --- Landing (visual-pass task — new entry point ahead of Intake) -------
-
-
 def _render_landing() -> None:
-    st.subheader(
-        "Grounded, verified, adaptive career learning coaching — for "
-        "people without a bootcamp or a mentor."
-    )
-    st.write(
-        "No bootcamp. No mentor. Just a cited, adaptive study plan built "
-        "from what companies are actually hiring for right now — every "
-        "topic and every check-in traces back to a real source, "
-        "labeled with how confident we actually are in it."
+    st.markdown(
+        "<h3 style='text-align: center;'>Adaptive career learning with "
+        "every topic grounded in real hiring data and verified "
+        "sources.</h3>",
+        unsafe_allow_html=True,
     )
 
     col1, col2, col3 = st.columns(3)
@@ -475,25 +222,13 @@ def _render_landing() -> None:
             st.write(body)
 
     st.write("")
-    _render_kicker("What a real citation looks like")
-    _render_stamp("high", "https://www.example-job-board.com/listing", sample=True)
-
-    st.write("")
     if st.button("Begin", type="primary"):
         st.session_state.current_stage = PipelineStage.INTAKE.value
         st.rerun()
 
 
-# --- Intake (PRD §7.1 stage 1 / §7.2) ------------------------------------
-
-
 def _render_intake() -> None:
-    """Restyled per the approved visual-pass design plan — same fields,
-    same validation, same `create_user` call below, only their layout
-    changed (columns for the paired fields, a bordered "Destination" card
-    around the goal/time fields since everything downstream depends on
-    them). No widget was added, removed, or changed in type.
-    """
+    """Render the Intake form and create the user record once submitted."""
     st.header("Intake")
     _render_kicker("Step 1 — tell us where you're starting from")
     with st.form("intake_form"):
@@ -535,29 +270,9 @@ def _render_intake() -> None:
     st.rerun()
 
 
-# --- Clarify Gate (PRD §7.1 stage 2 / §7.2) ------------------------------
-
-
 def _render_clarify_gate() -> None:
-    """The real bounded Clarify Gate loop (PRD §7.2): a `st.chat_message`
-    history plus `st.chat_input` for the next reply, with every turn
-    computed by `begin_clarify_gate`/`advance_clarify_gate` — this
-    function owns no narrowing/proposal/acceptance logic of its own, only
-    rendering and round-tripping `st.session_state`.
-
-    Dispatches on `turn.gate_state.stage` exactly as
-    `security/input_gate.py`'s `ClarifyGateState` defines it:
-    NARROWING/PROPOSE_BEST_GUESS/EXPLAIN_ROLE all collect the next free-text
-    reply (they differ only in what `advance_clarify_gate` does with it
-    internally, not in what this UI needs to do); RESOLVED and EXITED are
-    both terminal and stop offering `st.chat_input` (CLAUDE.md guardrail
-    #8 — the round bound must never be bypassable from the UI, so once a
-    terminal stage is reached, `advance_clarify_gate` is never called
-    again). ACCEPT_OWN_WORDS is asserted unreachable here: `advance_clarify_gate`
-    always resolves it (to RESOLVED or EXITED) within the same call that
-    entered it, so a turn's returned stage can never actually be it.
-    """
-    st.header("Clarify Gate")
+    """Render the bounded Clarify Gate chat loop, dispatching on its current stage until resolved or exited."""
+    _render_stage_header("Clarify Gate")
 
     if st.session_state.clarify_turn is None:
         try:
@@ -578,30 +293,16 @@ def _render_clarify_gate() -> None:
     stage = turn.gate_state.stage
 
     if stage is ClarifyGateStage.RESOLVED:
-        if st.button("Continue to Research & Market Grounding"):
-            assert turn.resolved_role is not None  # guaranteed by RESOLVED
-            st.session_state.resolved_role = turn.resolved_role
-            st.session_state.current_stage = PipelineStage.RESEARCH_GROUNDING.value
-            st.rerun()
+        assert turn.resolved_role is not None
+        st.session_state.resolved_role = turn.resolved_role
+        st.session_state.current_stage = PipelineStage.RESEARCH_GROUNDING.value
+        st.rerun()
         return
 
     if stage is ClarifyGateStage.EXITED:
-        if st.button("Continue to Research & Market Grounding"):
-            # PRD §7.2's zero-market-signal exit: resolved_role stays None
-            # on `turn` (no role was accepted), but the gate already
-            # confirmed there's no live signal for the user's own original
-            # words specifically (that's how EXITED was reached). Routing
-            # to Research & Market Grounding on that same goal is
-            # deliberate, not a bug: `_render_research_grounding` already
-            # renders the "no outline can be built" floor-rung outcome and
-            # offers no way past it, so every confidence-ladder result
-            # still surfaces through the one stage built to display it,
-            # rather than this function duplicating that rendering. The
-            # cost is one redundant live grounding call for an outcome
-            # already known.
-            st.session_state.resolved_role = turn.context.original_stated_goal
-            st.session_state.current_stage = PipelineStage.RESEARCH_GROUNDING.value
-            st.rerun()
+        st.session_state.resolved_role = turn.context.original_stated_goal
+        st.session_state.current_stage = PipelineStage.RESEARCH_GROUNDING.value
+        st.rerun()
         return
 
     if stage not in (
@@ -643,11 +344,9 @@ def _render_clarify_gate() -> None:
     st.rerun()
 
 
-# --- Research & Market Grounding (PRD §7.1 stage 3 / §7.3) --------------
-
-
 def _render_research_grounding() -> None:
-    st.header("Research & Market Grounding")
+    """Run role grounding and auto-advance to Outline Creation once it resolves to a usable result."""
+    _render_stage_header("Research & Market Grounding")
     session = _get_db_session()
 
     if st.session_state.grounding_result is None:
@@ -666,7 +365,6 @@ def _render_research_grounding() -> None:
 
     if isinstance(result, GeneralKnowledgeFloorResult):
         st.warning(result.label)
-        st.write(f"Confidence: {result.confidence.value}")
         st.info(
             "No outline can be built from this floor rung — per PRD §7.3 "
             "and specs/scenarios/high_risk_flows.feature's \"No source "
@@ -677,44 +375,29 @@ def _render_research_grounding() -> None:
 
     if isinstance(result, CachedFallbackResult):
         role_confidence = ConfidenceTier.CACHED_LOW
-        st.write(
-            f"Confidence: {role_confidence.value} (cached fallback, "
-            f"last updated {result.last_updated}, stale={result.is_stale})"
+        st.caption(
+            f"(cached fallback, last updated {result.last_updated}, "
+            f"stale={result.is_stale})"
         )
     else:
         assert isinstance(result, LiveGroundingResult)
         role_confidence = result.confidence
-        st.write(f"Confidence: {role_confidence.value}")
 
-    if st.button("Continue to Outline Creation"):
-        set_resolved_role(
-            session,
-            st.session_state.user_id,
-            st.session_state.resolved_role,
-            role_confidence.value,
-        )
-        st.session_state.current_stage = PipelineStage.OUTLINE_CREATION.value
-        st.rerun()
-
-
-# --- Outline Creation (PRD §7.1 stage 4 / §7.4) -------------------------
+    set_resolved_role(
+        session,
+        st.session_state.user_id,
+        st.session_state.resolved_role,
+        role_confidence.value,
+    )
+    st.session_state.current_stage = PipelineStage.OUTLINE_CREATION.value
+    st.rerun()
 
 
 def _core_and_emerging_skills(
     result: object,
 ) -> tuple[list[ValidatedGroundedContent], list[ValidatedGroundedContent]] | None:
-    """The core/emerging skill split `create_initial_outline`/
-    `regenerate_outline_with_addition` both need, from whichever grounding
-    rung `st.session_state.grounding_result` actually landed on. Returns
-    `None` if `result` carries no grounded skill list at all (the
-    general-knowledge-only floor) — shared by Outline Creation and the
-    Outline Confirmation addition-regeneration path, so the isinstance
-    split lives in exactly one place, not duplicated between them.
-    """
+    """Split a grounding result into core and emerging skill lists, or return None if it carries no grounded skills."""
     if isinstance(result, LiveGroundingResult):
-        # Degenerate core/emerging split — matches the established
-        # workaround already used at src/cron/refresh_roles.py's
-        # upsert_role call: LiveGroundingResult has no real split.
         return result.skills, []
     if isinstance(result, CachedFallbackResult):
         return result.core_skills, result.emerging_skills
@@ -722,7 +405,8 @@ def _core_and_emerging_skills(
 
 
 def _render_outline_creation() -> None:
-    st.header("Outline Creation")
+    """Generate and persist the initial outline, then render it with a Continue button to Outline Confirmation."""
+    _render_stage_header("Outline Creation")
     session = _get_db_session()
     result = st.session_state.grounding_result
 
@@ -759,15 +443,8 @@ def _render_outline_creation() -> None:
         st.rerun()
 
 
-# --- Outline Confirmation (PRD §7.1 stage 5 / §7.5) ---------------------
-
-
 def _advance_to_day_one() -> None:
-    """Shared terminal action for Outline Confirmation (PRD §7.5): pick
-    the lowest-`hierarchy_position` not-started persisted topic and move
-    to Day-by-Day Coaching — identical target/lookup this stage's stub
-    always used, now reached from either `CONFIRM` or bound exhaustion.
-    """
+    """Pick the lowest-position not-started topic and move to Day-by-Day Coaching."""
     session = _get_db_session()
     all_topics = get_all_topics_for_user(session, st.session_state.user_id)
     not_started = [t for t in all_topics if t["status"] == NOT_STARTED_STATUS]
@@ -783,20 +460,7 @@ def _advance_to_day_one() -> None:
 def _regenerate_outline_for_addition(
     session: Session, turn: OutlineConfirmationTurn, user_message: str
 ) -> OutlineConfirmationTurn:
-    """Ground the raw addition request in `user_message`
-    (`ground_addition_request`) and fold it into the outline
-    (`regenerate_outline_with_addition`), persisting the regenerated
-    hierarchy exactly as Outline Creation does (`insert_outline_topics`
-    already supports replacing a not-yet-started outline wholesale — see
-    that function's own docstring). Closes the gap `handle_review_turn`
-    used to flag as unaddressed (Architecture §10/PRD §11 item 6).
-
-    Never raises past this function — a grounding failure (Tavily has
-    nothing usable for the extracted skill name, or any `_STAGE_
-    EXCEPTIONS`) degrades to `turn` unchanged plus a message explaining
-    the addition could not be grounded, rather than crashing the whole
-    review turn or silently dropping the request.
-    """
+    """Ground the requested addition, fold it into the outline, and persist the regenerated hierarchy, degrading gracefully to an unchanged turn if grounding fails."""
     try:
         new_addition = _run_async(ground_addition_request(user_message))
     except _STAGE_EXCEPTIONS as exc:
@@ -855,17 +519,7 @@ def _regenerate_outline_for_addition(
 
 
 def _render_outline_confirmation() -> None:
-    """The real bounded Outline Confirmation loop (PRD §7.5): the current
-    outline shown alongside a `st.chat_message`/`st.chat_input` review
-    conversation, every turn computed by `begin_outline_confirmation`/
-    `handle_review_turn` — this function renders what those return, plus
-    one addition-specific follow-up: an `ADDITION_REQUEST` turn is passed
-    to `_regenerate_outline_for_addition`, which grounds the raw request
-    and regenerates the outline (see that function's own docstring). This
-    function still owns no classification/round-bound logic of its own —
-    that follow-up is a mechanical consequence of a round already
-    consumed by `handle_review_turn`, not a second review round.
-    """
+    """Render the outline alongside the bounded Outline Confirmation review chat, regenerating the outline on addition requests."""
     st.header("Outline Confirmation")
     session = _get_db_session()
 
@@ -944,30 +598,10 @@ def _render_outline_confirmation() -> None:
         st.rerun()
 
 
-# --- Day-by-Day Coaching (PRD §7.1 stage 6 / §7.6) ----------------------
-
-
 def _build_verification_source(
     content: DayContent, topic: dict[str, Any]
 ) -> tuple[str, str]:
-    """Judgment call, flagged — no real caller of `begin_verification_question`
-    existed before this task to establish this convention: verification
-    questions must be anchored to the actual teaching material shown
-    today (`content.theory_framing` + each real `theory_links` entry's
-    content), never the topic's own `source_url` (market-grounding
-    provenance, per `generate_day_content`'s own docstring — "a fresh,
-    distinct search for genuine teaching material", not a learning
-    resource).
-
-    `source_url` is the first (highest-relevance) theory link's URL,
-    since `generate_questions` accepts exactly one `source_url` per call.
-    Falls back to the topic's own market-grounding `source_url` only if
-    Tavily's theory search returned nothing at all (a real, documented
-    possibility — data/tavily_parser.py's own finding that Tavily can
-    legitimately return zero usable results) — still a real, valid URL
-    for this topic, just a different provenance layer, rather than
-    hard-blocking the demo.
-    """
+    """Build the verification source material and URL from the day's teaching content, falling back to the topic's own source URL if no theory links exist."""
     material_parts = [content.theory_framing]
     material_parts.extend(
         link["content"] for link in content.theory_links if link.get("content")
@@ -982,22 +616,7 @@ def _build_verification_source(
 def _build_test_out_verification_source(
     theory_links: list[dict[str, str]],
 ) -> tuple[str, str] | None:
-    """Test-out's twin of `_build_verification_source` above — same
-    anchoring rule (real teaching material, never the topic's own
-    market-grounding `source_url` alone), but built directly from a fresh
-    `fetch_theory_material_links` call rather than a `DayContent`, since
-    test-out (PRD §7.6: "verification first, before study content is
-    generated") never generates one.
-
-    Returns `None` if Tavily's theory search returned nothing at all —
-    unlike regular verification (which always has at least `content.
-    theory_framing` to fall back to), test-out has no Gemini-written
-    framing text to anchor questions to, so there's no honest source
-    material to hand `generate_questions` here (CLAUDE.md guardrail #6:
-    never silently fabricate a source). The caller must treat this as
-    "test-out isn't available for this topic right now," not force it
-    through with an empty string.
-    """
+    """Build the test-out verification source material and URL from fetched theory links, or return None if none were found."""
     if not theory_links:
         return None
     material_parts = [link["content"] for link in theory_links if link.get("content")]
@@ -1011,14 +630,7 @@ def _build_test_out_verification_source(
 def _day_coaching_steps(
     content: DayContent,
 ) -> list[tuple[str, str, Callable[[], None]]]:
-    """The Day-by-Day Coaching sections to reveal, in order, as
-    (container key, kicker label, render fn) — `_render_day_by_day_
-    coaching` shows one more of these each time "Next" is clicked
-    (`day_coaching_step_index`), rather than all at once. Hands-on/Review
-    are conditionally present, exactly as the old all-at-once rendering
-    already conditioned them on `content.hands_on_exercise`/
-    `content.review_prompt`.
-    """
+    """Return the ordered list of Day-by-Day Coaching sections to reveal one at a time as (container key, label, render function)."""
 
     def _render_theory() -> None:
         st.write(content.theory_framing)
@@ -1047,20 +659,7 @@ def _day_coaching_steps(
 
 
 def _render_test_out_choice(topic: dict[str, Any]) -> None:
-    """The test-out choice screen (PRD §7.6: "for any topic, the user may
-    trigger verification first, before study content is generated") —
-    shown once per topic, exactly when `day_content is None` and the user
-    hasn't already declined it for this topic
-    (`test_out_prompt_dismissed`).
-
-    "Test out" fetches real teaching-material links directly
-    (`fetch_theory_material_links`) rather than calling
-    `generate_day_content` — the whole point is skipping that generation
-    step entirely, not just skipping its display. If Tavily's theory
-    search comes back empty, `_build_test_out_verification_source`
-    returns `None` and test-out is refused for this topic right now
-    (never a fabricated source) rather than silently falling through.
-    """
+    """Render the once-per-topic test-out choice screen, letting the user skip straight to verification or decline it."""
     st.write(
         "You can test out of this topic by answering 5 verification "
         "questions first — a full pass skips today's study content "
@@ -1147,11 +746,7 @@ def _render_day_by_day_coaching() -> None:
 
     content: DayContent = st.session_state.day_content
 
-    badge_col, stamp_col = st.columns([1, 2])
-    with badge_col:
-        _render_kicker(f"Day {st.session_state.day_number_for_topic} of this topic")
-    with stamp_col:
-        _render_stamp(topic["confidence"], topic["source_url"])
+    _render_kicker(f"Day {st.session_state.day_number_for_topic} of this topic")
 
     steps = _day_coaching_steps(content)
     step_index = min(st.session_state.day_coaching_step_index, len(steps) - 1)
@@ -1189,18 +784,8 @@ def _render_day_by_day_coaching() -> None:
         st.rerun()
 
 
-# --- Verification (PRD §7.1 stage 7 / §7.7) -----------------------------
-
-
 def _render_patch_decision_banner(session: Session) -> None:
-    """Non-blocking, dismissible banner for a low/uncertain-confidence
-    patch-note awaiting the user's "learn now or defer" choice (PRD
-    §7.9) — rendered alongside, never instead of, the normal "Continue to
-    next topic"/"View closing note" actions below, so ignoring it never
-    blocks progression: an unresolved decision simply stays `PENDING` in
-    the DB and is reconsidered the next time `maybe_deliver_patch` runs
-    (its own already-established behavior).
-    """
+    """Render a non-blocking banner letting the user learn now or defer a pending low-confidence patch-note."""
     decision: PendingPatchDecision = st.session_state.pending_patch_decision
     with st.container(border=True, key="ns-card-patch-decision"):
         _render_kicker("Market update awaiting your decision")
@@ -1353,11 +938,6 @@ def _render_verification() -> None:
     with st.container(border=True, key="ns-card-verification-question"):
         _render_kicker(f"Question {question_number} of 5")
         st.write(state.current_question.question_text)
-        # Deliberately a plain citation, not `_render_stamp` — a
-        # verification question carries a `source_url` but no confidence
-        # tier of its own (that lives on the topic, not the question), so
-        # labeling it "CONFIDENCE: ..." here would fabricate a value this
-        # product's whole premise is to never fabricate.
         _render_citations(
             [{"title": "Source material", "url": state.current_question.source_url}]
         )
@@ -1375,9 +955,8 @@ def _render_verification() -> None:
             st.rerun()
         return
 
-    _render_attempt_chips(state.attempt_number)
     answer = st.text_input(
-        f"Your answer (attempt {state.attempt_number} of 3)",
+        "Your answer",
         key=f"verification_answer_{question_number}_{state.attempt_number}",
     )
     if st.button("Submit answer", type="primary"):
@@ -1397,9 +976,6 @@ def _render_verification() -> None:
             return
         st.session_state.verification_slot_state = new_state
         st.rerun()
-
-
-# --- Goal Completion (PRD §7.1 stage 8 / §7.11) -------------------------
 
 
 def _render_goal_completion() -> None:
@@ -1444,7 +1020,9 @@ def main() -> None:
     """Start Project North Star's Streamlit application."""
     _init_session_state()
     _maybe_check_stale_roles()
-    st.title("North Star")
+    st.markdown(
+        "<h1 style='text-align: center;'>North Star</h1>", unsafe_allow_html=True
+    )
     _STAGE_RENDERERS[st.session_state.current_stage]()
 
 

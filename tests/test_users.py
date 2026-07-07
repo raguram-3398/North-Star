@@ -1,8 +1,4 @@
-"""Tests for data/users.py — users I/O.
-
-Uses a mocked SQLAlchemy Session, matching data/roles_cache.py's
-established convention (see test_roles_cache.py's module docstring).
-"""
+"""Tests for data/users.py: users I/O, using a mocked SQLAlchemy Session."""
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock

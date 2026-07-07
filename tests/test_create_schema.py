@@ -1,15 +1,4 @@
-"""Tests for db/create_schema.py — one-time schema creation script.
-
-This hits a real database in production use, so per CLAUDE.md's testing
-expectations and this codebase's established mocked-Session/mocked-engine
-convention (see test_roles_cache.py, test_connection.py), these tests never
-touch a real Neon instance. Two things are verified instead: (1) a
-structural check that all 7 expected tables are actually registered on
-`Base.metadata` by the time `create_schema` is imported, and (2) that
-`create_all_tables()` calls `Base.metadata.create_all()` with the engine
-returned by `db.connection.get_engine()` — the engine itself is mocked, so
-no network call is made.
-"""
+"""Tests for db/create_schema.py: verifies all expected tables are registered and create_all_tables calls create_all with a mocked engine."""
 
 from unittest.mock import MagicMock
 

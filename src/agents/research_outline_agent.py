@@ -1,48 +1,11 @@
-"""Research & Outline Agent — reasoning/generation only.
-
-Owns (Architecture_North_Star.md §3): the *content* of clarify-gate
-narrowing questions and best-guess role proposals/explanations,
-cross-validation normalization judgment (anchored to roles_cache), and
-initial full-outline hierarchy creation (sequencing sourced skills into
-dependency order).
-
-Calls as tools (deterministic, not owned — never reimplemented inline):
-security/input_gate.py, security/output_guard.py, data/roles_cache.py,
-data/himalayas_parser.py, data/himalayas_relevance.py, data/tavily_parser.py,
-data/cross_validation.py, data/grounding_fallback.py,
-outline/significant_event.py, outline/hierarchy.py, patches/patch_manager.py.
-
-Tools: Himalayas MCP, Tavily search, Postgres (via gated write paths only
-— never a raw insert).
-
-`ground_role` below is `cross_validate_market_data`'s real implementation
-(Architecture §3's "cross-validation normalization judgment"): PRD §7.3
-frames this judgment as rule application "anchored to roles.json... not
-open-ended LLM judgment," so the actual tier decision is delegated to
-`data/cross_validation.py`'s pure function — this async function is the
-orchestrator that calls the two live sources, runs Himalayas's response
-through `data/himalayas_parser.py` + `data/himalayas_relevance.py` and
-Tavily's through `data/tavily_parser.py`, reads the roles_cache anchor,
-asks `data/cross_validation.py` for a tier (including a possible
-Tavily-only medium result — see that module's docstring), and falls
-through to `data/grounding_fallback.py` when live grounding produces no
-usable signal, per PRD §7.3's confidence ladder.
-
-`begin_clarify_gate`/`advance_clarify_gate` below are the Clarify Gate's
-conversational half (PRD §7.2): they own the LLM-driven content (the
-actual narrowing questions, best-guess proposals, and role explanations)
-while `security/input_gate.py` owns the deterministic first-pass
-real/vague/nonsense classification and all bounded-loop state/round
-counting — never reimplemented inline here (CLAUDE.md guardrail #10).
-Every prompt these functions use is versioned in `PROMPT_REGISTRY` per
-CLAUDE.md's LLM Call Discipline.
-"""
+"""Research & Outline Agent: owns clarify-gate conversational content, role grounding/cross-validation orchestration, and initial outline hierarchy generation, calling deterministic modules for everything else."""
 
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal
 
+from google.adk.agents import LlmAgent
 from google.adk.tools.mcp_tool.mcp_session_manager import (
     StreamableHTTPConnectionParams,
 )
@@ -90,47 +53,36 @@ from security.output_guard import (
     ValidatedGroundedContent,
     validate_output_object,
 )
+from utils.adk_runtime import (
+    EXTERNAL_CALL_TIMEOUT_SECONDS,
+    HEAVY_GENERATION_TIMEOUT_SECONDS,
+    SHORT_TURN_GEMINI_MODEL,
+    build_retry_config,
+    call_agent_json,
+    call_agent_text,
+    json_response_config,
+)
 from utils.exceptions import (
     GeminiCallError,
     GroundingSourceCallError,
     HimalayasParseError,
     TavilyParseError,
 )
-from utils.gemini_client import (
-    EXTERNAL_CALL_TIMEOUT_SECONDS,
-    HEAVY_GENERATION_TIMEOUT_SECONDS,
-    _call_gemini_json,
-    _call_gemini_text,
-)
 
 HIMALAYAS_MCP_URL = "https://mcp.himalayas.app/mcp"
 
-# "job_listing" matches the source_type convention already used for
-# Himalayas-origin ValidatedGroundedContent elsewhere in this codebase
-# (tests/test_roles_cache.py, tests/test_output_guard.py).
 HIMALAYAS_SOURCE_TYPE = "job_listing"
 
-# source_type for skills built from data/cross_validation.py's
-# TavilyCitation (the Tavily-only medium-confidence path) — distinct from
-# Himalayas's, since it names a genuinely different kind of source.
 TAVILY_SOURCE_TYPE = "web_search"
 
 _SourceStatus = Literal["signal", "no_signal", "call_failed"]
 
-# One client per module (CLAUDE.md coding conventions), lazy-but-memoized
-# rather than instantiated at raw import time — mirrors db/connection.py's
-# Engine singleton, avoiding a hard import-time requirement on
-# TAVILY_API_KEY for modules that only transitively import this one (e.g.
-# in CI/test contexts with no Tavily key configured).
 _himalayas_toolset: McpToolset | None = None
 _tavily_client: TavilyClient | None = None
 
 
 def _get_himalayas_toolset() -> McpToolset:
-    """Return the module-level Himalayas MCP toolset, creating it on
-    first use. No auth is configured — Himalayas's public tools need
-    none (confirmed in tests/spike_grounding_connectivity.py).
-    """
+    """Return the module-level Himalayas MCP toolset, creating it on first use."""
     global _himalayas_toolset
     if _himalayas_toolset is None:
         _himalayas_toolset = McpToolset(
@@ -143,12 +95,7 @@ def _get_himalayas_toolset() -> McpToolset:
 
 
 def _get_tavily_client() -> TavilyClient:
-    """Return the module-level Tavily client, creating it on first use.
-
-    Raises RuntimeError if TAVILY_API_KEY is not set — mirrors
-    db/connection.py's `_normalized_connection_string`'s treatment of a
-    missing required credential.
-    """
+    """Return the module-level Tavily client, creating it on first use, raising if the API key is missing."""
     global _tavily_client
     if _tavily_client is None:
         import os
@@ -160,28 +107,9 @@ def _get_tavily_client() -> TavilyClient:
     return _tavily_client
 
 
-# Shared Gemini-call infrastructure (pacing, timeout, retry/backoff,
-# JSON parsing) now lives in utils/gemini_client.py, imported above --
-# this module keeps only its own domain-specific model-tier constant.
-
-# Originally "gemini-2.5-pro" (a stronger tier than the clarify gate's,
-# deliberately: initial outline creation is a one-time call per user, and
-# correctness of prerequisite ordering across potentially dozens of
-# skills mattered more here than low latency). Superseded: this
-# project's Gemini API key has zero free-tier quota for gemini-2.5-pro
-# (confirmed via a live 429 with limit: 0, reproduced on a second,
-# freshly-issued key -- a project/tier-wide constraint, not a per-call-site
-# quality tradeoff anymore). Every Gemini call in this codebase now uses
-# "gemini-2.5-flash" for that external reason, not because flash was
-# judged sufficient on the merits here.
 OUTLINE_HIERARCHY_GEMINI_MODEL = "gemini-2.5-flash"
 
 
-# CLAUDE.md's LLM Call Discipline: every prompt used for grounded or
-# safety-critical generation is versioned here, never deleted once its
-# baseline regression test (tests/test_research_outline_agent.py) locks
-# it in — a version is frozen prose, not something later tasks may edit
-# in place; a changed prompt gets a new "_v2" key instead.
 PROMPT_REGISTRY: dict[str, str] = {
     "clarify_gate_narrowing_question_v1": (
         "A user is describing what tech role or skill they want to learn, "
@@ -323,25 +251,166 @@ PROMPT_REGISTRY: dict[str, str] = {
     ),
 }
 
-# Fixed, non-LLM re-prompt for a nonsense-classified stated goal (PRD
-# §7.2: "reject, ask to clarify" — a loop-back, not an exit). No LLM call
-# is needed here: the classification is already fully deterministic
-# (security/input_gate.py's classify_stated_goal), so a canned, friendly
-# re-prompt is honest and avoids an unnecessary Gemini call/cost for
-# content that doesn't need personalizing.
+
+_narrowing_question_agent = LlmAgent(
+    name="clarify_gate_narrowing_question_agent",
+    model=SHORT_TURN_GEMINI_MODEL,
+    instruction=(
+        "Generate a single short, friendly narrowing question to help pin "
+        "down a user's vague tech career goal into one specific, concrete "
+        "role."
+    ),
+    retry_config=build_retry_config(),
+    disallow_transfer_to_parent=True,
+    disallow_transfer_to_peers=True,
+)
+
+_narrowing_answer_evaluation_agent = LlmAgent(
+    name="clarify_gate_narrowing_answer_evaluation_agent",
+    model=SHORT_TURN_GEMINI_MODEL,
+    instruction=(
+        "Decide whether a user's latest answer during clarify-gate "
+        "narrowing resolves their goal into one concrete, specific tech "
+        "role."
+    ),
+    generate_content_config=json_response_config(),
+    retry_config=build_retry_config(),
+    disallow_transfer_to_parent=True,
+    disallow_transfer_to_peers=True,
+)
+
+_best_guess_proposal_agent = LlmAgent(
+    name="clarify_gate_best_guess_proposal_agent",
+    model=SHORT_TURN_GEMINI_MODEL,
+    instruction=(
+        "Propose a single best-guess specific tech role interpretation of "
+        "a user's stated career goal, with a short friendly confirmation "
+        "message."
+    ),
+    generate_content_config=json_response_config(),
+    retry_config=build_retry_config(),
+    disallow_transfer_to_parent=True,
+    disallow_transfer_to_peers=True,
+)
+
+_role_explanation_agent = LlmAgent(
+    name="clarify_gate_role_explanation_agent",
+    model=SHORT_TURN_GEMINI_MODEL,
+    instruction=(
+        "Explain what a proposed tech role actually involves day to day, "
+        "then ask the user to confirm it fits."
+    ),
+    retry_config=build_retry_config(),
+    disallow_transfer_to_parent=True,
+    disallow_transfer_to_peers=True,
+)
+
+_acceptance_evaluation_agent = LlmAgent(
+    name="clarify_gate_acceptance_evaluation_agent",
+    model=SHORT_TURN_GEMINI_MODEL,
+    instruction=(
+        "Decide whether a user's reply affirmatively accepts a proposed or "
+        "explained tech role."
+    ),
+    generate_content_config=json_response_config(),
+    retry_config=build_retry_config(),
+    disallow_transfer_to_parent=True,
+    disallow_transfer_to_peers=True,
+)
+
+_outline_hierarchy_agent = LlmAgent(
+    name="outline_hierarchy_sequencing_agent",
+    model=OUTLINE_HIERARCHY_GEMINI_MODEL,
+    instruction=(
+        "Sequence a grounded list of skills for a tech role into a "
+        "dependency-ordered, grouped learning curriculum."
+    ),
+    generate_content_config=json_response_config(),
+    retry_config=build_retry_config(),
+    disallow_transfer_to_parent=True,
+    disallow_transfer_to_peers=True,
+)
+
+_topic_explanations_agent = LlmAgent(
+    name="outline_topic_explanations_agent",
+    model=OUTLINE_HIERARCHY_GEMINI_MODEL,
+    instruction=(
+        "Write a short why-explanation for each topic in a learning "
+        "outline, grounded strictly in its given source/confidence."
+    ),
+    generate_content_config=json_response_config(),
+    retry_config=build_retry_config(),
+    disallow_transfer_to_parent=True,
+    disallow_transfer_to_peers=True,
+)
+
+_review_turn_classification_agent = LlmAgent(
+    name="outline_review_turn_classification_agent",
+    model=SHORT_TURN_GEMINI_MODEL,
+    instruction=(
+        "Classify a user's outline-review message into exactly one of: "
+        "question, concern, addition_request, confirm."
+    ),
+    generate_content_config=json_response_config(),
+    retry_config=build_retry_config(),
+    disallow_transfer_to_parent=True,
+    disallow_transfer_to_peers=True,
+)
+
+_review_response_agent = LlmAgent(
+    name="outline_review_response_agent",
+    model=SHORT_TURN_GEMINI_MODEL,
+    instruction=(
+        "Respond to a user's question or concern about their learning "
+        "outline, grounded strictly in the given topics."
+    ),
+    retry_config=build_retry_config(),
+    disallow_transfer_to_parent=True,
+    disallow_transfer_to_peers=True,
+)
+
+_addition_skill_name_extraction_agent = LlmAgent(
+    name="outline_addition_skill_name_extraction_agent",
+    model=SHORT_TURN_GEMINI_MODEL,
+    instruction=(
+        "Extract a short, search-ready skill/technology name from a "
+        "user's addition request."
+    ),
+    generate_content_config=json_response_config(),
+    retry_config=build_retry_config(),
+    disallow_transfer_to_parent=True,
+    disallow_transfer_to_peers=True,
+)
+
+RESEARCH_OUTLINE_AGENT = LlmAgent(
+    name="research_outline_agent",
+    model=SHORT_TURN_GEMINI_MODEL,
+    instruction=(
+        "Composite agent grouping this module's task agents for "
+        "documentation/introspection. Never run via its own Runner — "
+        "dispatch between sub-agents is deterministic Python, not "
+        "auto-routing."
+    ),
+    sub_agents=[
+        _narrowing_question_agent,
+        _narrowing_answer_evaluation_agent,
+        _best_guess_proposal_agent,
+        _role_explanation_agent,
+        _acceptance_evaluation_agent,
+        _outline_hierarchy_agent,
+        _topic_explanations_agent,
+        _review_turn_classification_agent,
+        _review_response_agent,
+        _addition_skill_name_extraction_agent,
+    ],
+)
+
 CLARIFY_GATE_NONSENSE_REPROMPT = (
     "I didn't quite catch a tech role or skill in that — could you tell "
     "me a bit about what kind of tech work you're interested in, or a "
     "role you might want to pursue?"
 )
 
-# Fixed, non-LLM exit message for the zero-market-signal path (PRD §7.2:
-# "State plainly that no current hiring activity exists for this; no "
-# outline is built"). Not LLM-generated for the same reason as the
-# nonsense re-prompt above: the outcome is already fully decided by
-# `ground_role`'s confidence-ladder result, so a canned, unambiguous
-# message is more honest than an LLM paraphrase of a purely factual
-# outcome.
 CLARIFY_GATE_ZERO_SIGNAL_EXIT_MESSAGE_TEMPLATE = (
     "I couldn't find any current hiring activity for {role!r} — no "
     "learning plan will be built for this. Feel free to describe a "
@@ -351,20 +420,7 @@ CLARIFY_GATE_ZERO_SIGNAL_EXIT_MESSAGE_TEMPLATE = (
 
 @dataclass(frozen=True)
 class ClarifyGateContext:
-    """Agent-owned conversational context threaded alongside
-    `security.input_gate.ClarifyGateState` — the loop-state module
-    deliberately doesn't track this since it's *content*, not bounded-loop
-    mechanics (Architecture §3's ownership split).
-
-    `original_stated_goal` is captured once, at the very first turn, and
-    never overwritten by anything that happens later in the loop (CLAUDE.md's
-    "capture the original input before a retry loop overwrites it" —
-    the ACCEPT_OWN_WORDS rung must ground the user's *original* words, not
-    whatever text happened to be exchanged most recently).
-    `proposed_role` holds the most recently proposed best-guess role, needed
-    at EXPLAIN_ROLE/ACCEPT_OWN_WORDS to know what was actually proposed and
-    rejected.
-    """
+    """Agent-owned conversational context threaded alongside the clarify-gate loop state, holding the original stated goal and any proposed role."""
 
     original_stated_goal: str
     proposed_role: str | None = None
@@ -372,15 +428,7 @@ class ClarifyGateContext:
 
 @dataclass(frozen=True)
 class ClarifyGateTurn:
-    """One turn of clarify-gate output: the caller (e.g. the Streamlit UI)
-    renders `message`, persists `gate_state`/`context` to carry into the
-    next turn, and — once `resolved_role` is populated — proceeds to
-    Research (PRD §7.2's "a resolved role — not an outline yet").
-
-    `exited` is True only for the zero-market-signal exit (PRD §7.2): no
-    outline is ever built for that turn, regardless of `resolved_role`
-    (which stays None in that case).
-    """
+    """One turn of clarify-gate output: the message to show, updated state/context to persist, and the resolved role or exit flag once the gate concludes."""
 
     gate_state: ClarifyGateState
     context: ClarifyGateContext
@@ -393,22 +441,14 @@ ConversationHistory = list[dict[str, str]]
 
 
 def _format_conversation(conversation: ConversationHistory) -> str:
-    """Render a `{"role": ..., "content": ...}` conversation history as
-    plain text for embedding in a prompt. Empty history renders as an
-    explicit marker rather than a blank line, so the prompt template
-    never silently loses this section.
-    """
+    """Render a conversation history as plain text for embedding in a prompt."""
     if not conversation:
         return "(no prior turns)"
     return "\n".join(f"{turn['role']}: {turn['content']}" for turn in conversation)
 
 
 def _last_agent_message(conversation: ConversationHistory) -> str:
-    """Return the most recent `role == "agent"` message in `conversation`
-    — the actual proposal/explanation text a user's reply is responding
-    to. Raises `ValueError` if none exists: `advance_clarify_gate` must
-    never guess what the user is replying to.
-    """
+    """Return the most recent agent message in the conversation, raising if none exists."""
     for turn in reversed(conversation):
         if turn.get("role") == "agent":
             return turn["content"]
@@ -419,33 +459,29 @@ def _last_agent_message(conversation: ConversationHistory) -> str:
     )
 
 
-# --- Clarify Gate (PRD §7.2) conversational content ---------------------
-
-
 async def _generate_narrowing_question(
     original_goal: str, conversation: ConversationHistory
 ) -> str:
-    """Generate the next narrowing question (PRD §7.2's "one narrowing
-    question at a time")."""
+    """Generate the next narrowing question for the clarify gate."""
     prompt = PROMPT_REGISTRY["clarify_gate_narrowing_question_v1"].format(
         original_goal=original_goal,
         conversation=_format_conversation(conversation),
     )
-    return await _call_gemini_text(prompt)
+    return await call_agent_text(_narrowing_question_agent, prompt)
 
 
 async def _evaluate_narrowing_answer(
     original_goal: str, conversation: ConversationHistory, answer: str
 ) -> tuple[bool, str | None]:
-    """Decide whether `answer` resolved a concrete role. Returns
-    `(resolved, role)`; `role` is None whenever `resolved` is False.
-    """
+    """Decide whether the answer resolved a concrete role, returning the role if so."""
     prompt = PROMPT_REGISTRY["clarify_gate_narrowing_answer_evaluation_v1"].format(
         original_goal=original_goal,
         conversation=_format_conversation(conversation),
         answer=answer,
     )
-    parsed = await _call_gemini_json(prompt, required_keys={"resolved", "role"})
+    parsed = await call_agent_json(
+        _narrowing_answer_evaluation_agent, prompt, required_keys={"resolved", "role"}
+    )
     resolved = bool(parsed["resolved"])
     role = parsed["role"] if resolved else None
     if resolved and not isinstance(role, str):
@@ -458,14 +494,14 @@ async def _evaluate_narrowing_answer(
 async def _propose_best_guess_role(
     original_goal: str, conversation: ConversationHistory
 ) -> tuple[str, str]:
-    """Propose a single best-guess role once the narrowing bound is
-    reached (PRD §7.2). Returns `(role, user_facing_message)`.
-    """
+    """Propose a single best-guess role once the narrowing bound is reached, returning the role and a confirmation message."""
     prompt = PROMPT_REGISTRY["clarify_gate_best_guess_proposal_v1"].format(
         original_goal=original_goal,
         conversation=_format_conversation(conversation),
     )
-    parsed = await _call_gemini_json(prompt, required_keys={"role", "message"})
+    parsed = await call_agent_json(
+        _best_guess_proposal_agent, prompt, required_keys={"role", "message"}
+    )
     role, message = parsed["role"], parsed["message"]
     if not isinstance(role, str) or not role.strip():
         raise GeminiCallError(f"Gemini proposal had no usable 'role': {parsed!r}")
@@ -475,41 +511,25 @@ async def _propose_best_guess_role(
 
 
 async def _explain_role(role: str) -> str:
-    """Explain what `role` actually involves (PRD §7.2's second rung,
-    after a rejected best-guess proposal)."""
+    """Explain what a proposed role actually involves day to day."""
     prompt = PROMPT_REGISTRY["clarify_gate_role_explanation_v1"].format(role=role)
-    return await _call_gemini_text(prompt)
+    return await call_agent_text(_role_explanation_agent, prompt)
 
 
 async def _evaluate_acceptance(agent_message: str, user_reply: str) -> bool:
-    """Interpret whether `user_reply` affirmatively accepts `agent_message`
-    (a proposal or explanation) — shared by both the proposal-response and
-    explanation-response stages, since it's the same underlying judgment
-    (PRD §7.2).
-    """
+    """Interpret whether the user's reply affirmatively accepts a proposed or explained role."""
     prompt = PROMPT_REGISTRY["clarify_gate_acceptance_evaluation_v1"].format(
         agent_message=agent_message,
         user_reply=user_reply,
     )
-    parsed = await _call_gemini_json(prompt, required_keys={"accepted"})
+    parsed = await call_agent_json(
+        _acceptance_evaluation_agent, prompt, required_keys={"accepted"}
+    )
     return bool(parsed["accepted"])
 
 
 async def begin_clarify_gate(stated_goal: str) -> ClarifyGateTurn:
-    """Handle the very first clarify-gate turn for a freshly stated goal.
-
-    Runs `security/input_gate.py`'s `classify_stated_goal` on the raw
-    input FIRST, before any LLM call touches it (CLAUDE.md's LLM Call
-    Discipline: input validation always runs on raw input before any
-    content-processing step).
-
-    - `REAL` -> resolves immediately, no LLM call needed (PRD §7.2:
-      "Clearly real role -> accept, proceed to Research").
-    - `NONSENSE` -> loops back with a fixed re-prompt, not an exit (PRD
-      §7.2: "reject, ask to clarify"); does not consume a narrowing round.
-    - `VAGUE` -> enters the bounded narrowing loop with the first
-      narrowing question.
-    """
+    """Handle the very first clarify-gate turn for a freshly stated goal, classifying it as real, nonsense, or vague before any LLM call."""
     classification = classify_stated_goal(stated_goal)
     context = ClarifyGateContext(original_stated_goal=stated_goal)
 
@@ -531,7 +551,6 @@ async def begin_clarify_gate(stated_goal: str) -> ClarifyGateTurn:
             message=CLARIFY_GATE_NONSENSE_REPROMPT,
         )
 
-    # VAGUE
     question = await _generate_narrowing_question(stated_goal, [])
     return ClarifyGateTurn(
         gate_state=start_clarify_gate(),
@@ -548,12 +567,7 @@ async def advance_clarify_gate(
     session: Session,
     reference_time: datetime,
 ) -> ClarifyGateTurn:
-    """Advance the clarify gate by one turn given the user's latest
-    response, dispatching on `gate_state.stage`.
-
-    Raises `ValueError` if `gate_state.stage` is `RESOLVED`/`EXITED` — the
-    caller must not advance a gate that has already terminated.
-    """
+    """Advance the clarify gate by one turn given the user's latest response, dispatching on the current stage."""
     if gate_state.stage is ClarifyGateStage.NARROWING:
         resolved, role_guess = await _evaluate_narrowing_answer(
             context.original_stated_goal, conversation, user_response
@@ -561,7 +575,7 @@ async def advance_clarify_gate(
         next_state = advance_after_narrowing_round(gate_state, resolved=resolved)
 
         if next_state.stage is ClarifyGateStage.RESOLVED:
-            assert role_guess is not None  # guaranteed by resolved=True above
+            assert role_guess is not None
             return ClarifyGateTurn(
                 gate_state=next_state,
                 context=context,
@@ -577,7 +591,6 @@ async def advance_clarify_gate(
                 gate_state=next_state, context=context, message=question
             )
 
-        # PROPOSE_BEST_GUESS: the narrowing bound was just reached.
         proposed_role, proposal_message = await _propose_best_guess_role(
             context.original_stated_goal, conversation
         )
@@ -622,9 +635,6 @@ async def advance_clarify_gate(
                 resolved_role=context.proposed_role,
             )
 
-        # ACCEPT_OWN_WORDS: ground the user's ORIGINAL words (never the
-        # most recent message — CLAUDE.md's retry-loop-overwrite trap)
-        # before committing, per PRD §7.2.
         grounding_result = await ground_role(
             context.original_stated_goal, session, reference_time
         )
@@ -661,17 +671,7 @@ async def advance_clarify_gate(
 
 @dataclass(frozen=True)
 class LiveGroundingResult:
-    """A successful live-grounding outcome (PRD §7.3's `high`/`medium`/
-    `low` rungs) — see `ground_role`. `skills` are already
-    `ValidatedGroundedContent` (CLAUDE.md guardrail #12); every one is
-    Himalayas-sourced (see module docstring's scope-driven
-    simplification). `himalayas_status`/`tavily_status` are kept on the
-    result (rather than discarded once the tier is decided) so a caller
-    or test can distinguish "this source had no relevant results" from
-    "this source's call itself failed" — the two are handled the same
-    way for tier purposes, but that collapsing is intentional, not an
-    accident of the code losing track of which happened.
-    """
+    """A successful live-grounding outcome carrying validated skills, the decided confidence tier, and each source's status."""
 
     role_name: str
     skills: list[ValidatedGroundedContent]
@@ -682,17 +682,7 @@ class LiveGroundingResult:
 
 
 async def _fetch_himalayas_listings(role_name: str) -> list[ParsedJobListing]:
-    """Call Himalayas MCP's `search_jobs` tool for `role_name` and parse
-    the response via `data/himalayas_parser.py`.
-
-    Raises `GroundingSourceCallError` if the MCP call itself fails or
-    exceeds `EXTERNAL_CALL_TIMEOUT_SECONDS`, the toolset has no
-    `search_jobs` tool, the response reports `isError`, or the response
-    can't be parsed at all (`HimalayasParseError`) — all of these mean
-    "Himalayas is unusable this round," distinct from a successful call
-    that simply returns no relevant listings (see
-    `data/himalayas_relevance.py`).
-    """
+    """Call Himalayas MCP's search_jobs tool for a role and parse the response, raising if the call or parse fails."""
     toolset = _get_himalayas_toolset()
     try:
         tools = await asyncio.wait_for(
@@ -728,24 +718,7 @@ async def _fetch_himalayas_listings(role_name: str) -> list[ParsedJobListing]:
 
 
 async def _fetch_tavily_results(query: str) -> list[ParsedSearchResult]:
-    """Call Tavily's search for `query`, in a worker thread (tavily-python's
-    client is synchronous) with an explicit timeout — both on the call
-    itself (`timeout=` kwarg) and defensively via the outer
-    `asyncio.wait_for` — then parse the response via `data/tavily_parser.py`.
-
-    `query` is a raw, ready-to-search string, not a role name — callers
-    build whatever query shape fits their case (`_safe_fetch_tavily`'s
-    `f"{role_name} job requirements and key skills"`, the same shape used
-    in tests/spike_grounding_connectivity.py, for role-grounding;
-    `ground_addition_request`'s own for a single ad hoc skill), so this
-    stays the one shared low-level Tavily-call/timeout/error-handling
-    primitive rather than being duplicated per caller.
-
-    Raises `GroundingSourceCallError` on any Tavily-specific API failure
-    or timeout, or if the response can't be parsed at all
-    (`TavilyParseError`) — mirrors `_fetch_himalayas_listings`'s
-    contract. Never returns silently empty/wrong data.
-    """
+    """Call Tavily search for a query in a worker thread with an explicit timeout, then parse the response."""
     client = _get_tavily_client()
     try:
         response = await asyncio.wait_for(
@@ -780,14 +753,7 @@ async def _fetch_tavily_results(query: str) -> list[ParsedSearchResult]:
 async def _safe_fetch_himalayas(
     role_name: str,
 ) -> tuple[list[ParsedJobListing], _SourceStatus]:
-    """Fetch + relevance-check Himalayas, collapsing any
-    `GroundingSourceCallError` into the `"call_failed"` status rather than
-    letting it propagate — `ground_role` treats `"call_failed"` and
-    `"no_signal"` identically (both mean "no usable signal from
-    Himalayas"), but keeping them distinct here means that collapsing is
-    a deliberate choice made once, in one place, not an accident of
-    losing the information.
-    """
+    """Fetch and relevance-check Himalayas, collapsing any call failure into a no-signal status instead of raising."""
     try:
         listings = await _fetch_himalayas_listings(role_name)
     except GroundingSourceCallError:
@@ -800,13 +766,7 @@ async def _safe_fetch_himalayas(
 async def _safe_fetch_tavily(
     role_name: str,
 ) -> tuple[list[ParsedSearchResult], _SourceStatus]:
-    """Fetch + trust-check Tavily, collapsing any `GroundingSourceCallError`
-    into `"call_failed"` — see `_safe_fetch_himalayas`'s docstring for why
-    this collapsing is deliberate rather than accidental. Trust is
-    `data/cross_validation.py`'s `tavily_has_usable_signal` (a distinct-
-    skill count, never `score` — see that module's docstring), not a
-    score threshold.
-    """
+    """Fetch and trust-check Tavily, collapsing any call failure into a no-signal status instead of raising."""
     try:
         results = await _fetch_tavily_results(
             f"{role_name} job requirements and key skills"
@@ -823,28 +783,7 @@ async def ground_role(
     session: Session,
     reference_time: datetime,
 ) -> LiveGroundingResult | CachedFallbackResult | GeneralKnowledgeFloorResult:
-    """Ground `role_name` against Himalayas + Tavily in parallel, apply
-    PRD §7.3's cross-validation rules (`data/cross_validation.py`), and
-    fall through to `data/grounding_fallback.py`'s cached-fallback/
-    general-knowledge-only rungs only if live grounding produces no
-    usable signal — the fallback-only-on-failure ordering that was never
-    previously enforced anywhere in the codebase.
-
-    Returns a `LiveGroundingResult` for the `high`/`medium`/`low` rungs,
-    or whatever `data/grounding_fallback.py` produces (`CachedFallbackResult`
-    or `GeneralKnowledgeFloorResult`) for the `cached-low`/
-    `general-knowledge-only` rungs. Every skill on a `LiveGroundingResult`
-    has already passed `security/output_guard.py`'s `validate_output_object`
-    (CLAUDE.md guardrail #12) — no raw dict escapes this function.
-
-    Does not raise for "no usable signal" from either source (that's the
-    expected, graceful-degradation case the whole ladder exists for —
-    CLAUDE.md guardrail #6). Only propagates exceptions for genuine
-    programming/data-integrity errors (e.g.
-    `security.output_guard.ConfidenceValidationError`, which would
-    indicate a bug in this function's own candidate construction, not an
-    external failure).
-    """
+    """Ground a role against Himalayas and Tavily in parallel, decide a confidence tier, and fall back to cached or general-knowledge data if live grounding finds no usable signal."""
     (himalayas_listings, himalayas_status), (tavily_results, tavily_status) = (
         await asyncio.gather(
             _safe_fetch_himalayas(role_name), _safe_fetch_tavily(role_name)
@@ -861,7 +800,6 @@ async def ground_role(
             if entry.get("skill")
         )
 
-    # casefolded skill -> (original-cased skill, first listing's source_url)
     himalayas_skill_map: dict[str, tuple[str, str]] = {}
     for listing in himalayas_listings:
         if listing.source_url is None:
@@ -884,10 +822,6 @@ async def ground_role(
             return cached
         return get_general_knowledge_floor(role_name)
 
-    # decision.tavily_citation is populated only on the Tavily-only
-    # medium-confidence path (himalayas_has_signal was False) — every
-    # other branch's skills come from Himalayas, which is the only
-    # source with anything in himalayas_skill_map in that case.
     if decision.tavily_citation is not None:
         validated_skills = [
             validate_output_object(
@@ -923,23 +857,12 @@ async def ground_role(
     )
 
 
-# --- Initial Outline Creation (PRD §7.4) ---------------------------------
-
 NOT_STARTED_STATUS = "not_started"
 
 
 @dataclass(frozen=True)
 class InitialOutlineTopic:
-    """One `outline_topics` row produced by initial hierarchy creation
-    (Architecture §5's schema, PRD §7.4) — not yet persisted; the actual
-    DB write path (not built as part of this task) is responsible for
-    assigning `id`/`user_id` and performing the insert.
-
-    `hierarchy_position` is the single global ordering across the entire
-    outline (1-indexed); `position_in_group` is this topic's order within
-    its own `topic_group` (also 1-indexed) — Architecture §5's two
-    separate ordering columns.
-    """
+    """One outline_topics row produced by initial hierarchy creation, not yet persisted."""
 
     topic_name: str
     hierarchy_position: int
@@ -956,17 +879,7 @@ def _build_grounded_skill_map(
     core_skills: list[ValidatedGroundedContent],
     emerging_skills: list[ValidatedGroundedContent],
 ) -> dict[str, ValidatedGroundedContent]:
-    """Build a skill-name -> already-validated-grounding lookup from
-    `ground_role`'s (or `data/grounding_fallback.py`'s) output, used to
-    re-attach each output topic's source_url/source_type/confidence by
-    exact name match — never by trusting anything Gemini says about
-    sourcing (see `create_initial_outline`'s docstring).
-
-    Raises `ValueError` if a skill entry has no usable name, or if the
-    same skill name appears in both `core_skills` and `emerging_skills` —
-    both indicate a caller/data-integrity bug upstream, not something
-    this function should silently resolve one way or another.
-    """
+    """Build a skill-name to validated-grounding lookup from grounded core and emerging skills, raising on missing names or duplicates."""
     skill_map: dict[str, ValidatedGroundedContent] = {}
     for grounded in (*core_skills, *emerging_skills):
         name = grounded.extra.get("skill")
@@ -997,36 +910,7 @@ async def create_initial_outline(
     core_skills: list[ValidatedGroundedContent],
     emerging_skills: list[ValidatedGroundedContent],
 ) -> list[InitialOutlineTopic]:
-    """Sequence already-grounded skill data (from `ground_role`'s
-    `LiveGroundingResult.skills` split by caller into core/emerging, or
-    directly from `data/grounding_fallback.py`'s `CachedFallbackResult`)
-    into a dependency-ordered outline hierarchy (PRD §7.4) — genuinely
-    requires LLM domain-knowledge judgment (Architecture §2/§3): correct
-    prerequisite order (HTML before CSS before JavaScript; Python
-    fundamentals before Django) isn't derivable from the grounded skill
-    list alone.
-
-    This function only *sequences and groups* already-grounded data; it
-    never re-grounds, re-fetches, or re-attributes sourcing. Every output
-    topic's `source_url`/`source_type`/`confidence` is copied unchanged
-    from the input skill it was derived from (matched by exact skill
-    name via `source_skill` in Gemini's response) — Gemini's JSON output
-    never carries sourcing fields at all, so it structurally cannot
-    invent, drop, or alter one (CLAUDE.md guardrail #1), rather than this
-    merely being a prompt instruction Gemini could get wrong.
-
-    Raises `GeminiCallError` if Gemini's response is malformed, omits any
-    input skill, or references a skill not in the input (a fabricated
-    `source_skill`). Raises `security.output_guard.ConfidenceValidationError`
-    if a constructed candidate somehow fails the structural gate (should
-    never happen given already-validated input, per CLAUDE.md guardrail
-    #12 — every topic still passes through `validate_output_object`
-    rather than being trusted by construction).
-
-    Does not build outline confirmation, day-by-day content, or
-    insertion/update logic for an existing outline (`outline/hierarchy.py`)
-    — this is one-time initial creation only.
-    """
+    """Sequence already-grounded skill data into a dependency-ordered outline hierarchy, re-attaching each topic's sourcing from its matched input skill."""
     skill_map = _build_grounded_skill_map(core_skills, emerging_skills)
     if not skill_map:
         raise ValueError("create_initial_outline requires at least one grounded skill")
@@ -1035,10 +919,10 @@ async def create_initial_outline(
         role=resolved_role,
         skill_list=_format_skill_list_for_prompt(core_skills, emerging_skills),
     )
-    parsed = await _call_gemini_json(
+    parsed = await call_agent_json(
+        _outline_hierarchy_agent,
         prompt,
         required_keys={"groups"},
-        model=OUTLINE_HIERARCHY_GEMINI_MODEL,
         timeout=HEAVY_GENERATION_TIMEOUT_SECONDS,
     )
 
@@ -1121,25 +1005,13 @@ async def create_initial_outline(
     return topics
 
 
-# --- Outline Confirmation (PRD §7.5) -------------------------------------
-
-# Fixed, non-LLM framing for the round-bound-exhausted exit — the same
-# framing pattern PRD §7.5 explicitly says to reuse from the clarify
-# gate's own low-confidence exit. Not LLM-generated: the outcome (bound
-# reached, proceed with the current outline) is already fully decided
-# deterministically by security.input_gate.advance_after_review_turn.
 OUTLINE_CONFIRMATION_BOUND_REACHED_MESSAGE = (
     "We've covered as much as we can before starting — starting here, "
     "we'll refine as we go."
 )
 
-# Fixed, non-LLM acknowledgment for an explicit confirmation.
 OUTLINE_CONFIRMATION_CONFIRMED_MESSAGE = "Great — let's get started!"
 
-# Fixed, non-LLM acknowledgment that an addition request was received.
-# The actual "why this is now included" reasoning comes from the
-# re-shown outline after regeneration (`_generate_topic_explanations`),
-# not from this immediate acknowledgment.
 OUTLINE_CONFIRMATION_ADDITION_ACK_MESSAGE_TEMPLATE = (
     "Got it — I'll add {addition!r} and update your outline."
 )
@@ -1147,22 +1019,7 @@ OUTLINE_CONFIRMATION_ADDITION_ACK_MESSAGE_TEMPLATE = (
 
 @dataclass(frozen=True)
 class OutlineConfirmationTurn:
-    """One turn of outline-confirmation output: the caller renders
-    `message` and persists `state`/`topics` to carry into the next turn.
-
-    `concluded` is True once `state.stage` is `CONFIRMED` or
-    `BOUND_REACHED` — no further outline editing occurs past that point
-    (PRD §7.5's "one-time, pre-start window only"); the caller proceeds
-    to Day 1 with `topics` exactly as they stand on this turn.
-
-    `action` is the `OutlineReviewAction` `handle_review_turn` classified
-    this turn as — `None` for the very first turn (`begin_outline_
-    confirmation`, which has no user message to classify) and for any
-    turn built directly by a caller rather than through `handle_review_
-    turn`. `main.py` reads this to decide whether to follow up with
-    `ground_addition_request`/`regenerate_outline_with_addition` on an
-    `ADDITION_REQUEST` turn — it is not used by this module itself.
-    """
+    """One turn of outline-confirmation output: the message, updated state and topics to persist, and whether review has concluded."""
 
     state: OutlineConfirmationState
     message: str
@@ -1182,22 +1039,15 @@ def _format_topic_list_for_prompt(topics: list[InitialOutlineTopic]) -> str:
 async def _generate_topic_explanations(
     resolved_role: str, topics: list[InitialOutlineTopic]
 ) -> dict[str, str]:
-    """Generate a short why-explanation per topic, grounded in each
-    topic's real source/confidence metadata (PRD §7.5).
-
-    Raises `GeminiCallError` if any topic is left uncovered, an unknown
-    topic is invented, or an entry has no usable explanation — the same
-    coverage-check discipline as `create_initial_outline`'s skill
-    coverage, applied to topic names instead of skill names.
-    """
+    """Generate a short why-explanation per topic, grounded in each topic's real source and confidence metadata."""
     prompt = PROMPT_REGISTRY["outline_confirmation_topic_explanations_v1"].format(
         role=resolved_role,
         topic_list=_format_topic_list_for_prompt(topics),
     )
-    parsed = await _call_gemini_json(
+    parsed = await call_agent_json(
+        _topic_explanations_agent,
         prompt,
         required_keys={"topic_explanations"},
-        model=OUTLINE_HIERARCHY_GEMINI_MODEL,
         timeout=HEAVY_GENERATION_TIMEOUT_SECONDS,
     )
     entries = parsed["topic_explanations"]
@@ -1240,13 +1090,7 @@ def _format_outline_presentation(
     topics: list[InitialOutlineTopic],
     explanations: dict[str, str],
 ) -> str:
-    """Deterministically assemble the user-facing outline presentation.
-
-    The `source_url`/`confidence` shown per topic always comes from
-    `topics` directly, never from anything Gemini said — Gemini only
-    supplied the why-explanation prose (`_generate_topic_explanations`),
-    the same sourcing-safety split `create_initial_outline` already uses.
-    """
+    """Deterministically assemble the user-facing outline presentation from real topic data and Gemini-generated explanations."""
     lines = [f"Here's your learning plan for {resolved_role}:", ""]
     current_group: str | None = None
     for topic in topics:
@@ -1263,21 +1107,15 @@ def _format_outline_presentation(
 async def _classify_review_turn(
     resolved_role: str, topics: list[InitialOutlineTopic], user_message: str
 ) -> OutlineReviewAction:
-    """Classify a user's outline-review message into one of
-    `OutlineReviewAction`'s four values (PRD §7.5) — genuinely
-    open-ended natural-language interpretation, mirroring the clarify
-    gate's accept/reject interpretation, hence an LLM call rather than a
-    heuristic.
-
-    Raises `GeminiCallError` if Gemini's response doesn't parse into one
-    of the four recognized action values.
-    """
+    """Classify a user's outline-review message as a question, concern, addition request, or confirmation."""
     prompt = PROMPT_REGISTRY["outline_review_turn_classification_v1"].format(
         role=resolved_role,
         topic_names=", ".join(t.topic_name for t in topics),
         user_message=user_message,
     )
-    parsed = await _call_gemini_json(prompt, required_keys={"action"})
+    parsed = await call_agent_json(
+        _review_turn_classification_agent, prompt, required_keys={"action"}
+    )
     raw_action = parsed["action"]
     try:
         return OutlineReviewAction(raw_action)
@@ -1290,83 +1128,34 @@ async def _classify_review_turn(
 async def _respond_to_review_message(
     resolved_role: str, topics: list[InitialOutlineTopic], user_message: str
 ) -> str:
-    """Respond to a question or concern about the outline (PRD §7.5) —
-    shared by both, since the underlying generation task (answer/respond,
-    grounded in the real topic list) is the same regardless of which one
-    consumes a round; only round-consumption differs, and that's decided
-    by `_classify_review_turn` + `security.input_gate`, not here.
-    """
+    """Respond to a question or concern raised about the outline."""
     prompt = PROMPT_REGISTRY["outline_review_response_v1"].format(
         role=resolved_role,
         topic_list=_format_topic_list_for_prompt(topics),
         user_message=user_message,
     )
-    return await _call_gemini_text(prompt)
+    return await call_agent_text(_review_response_agent, prompt)
 
 
 async def _extract_addition_skill_name(user_message: str) -> str:
-    """Extract a short, search-ready skill/topic name from a raw
-    addition-request message (PRD §7.5) — the user's own words are
-    frequently a full sentence ("can we add some kubernetes stuff please"),
-    not a usable search query on their own. A separate, dedicated
-    `PROMPT_REGISTRY` entry rather than folding this into
-    `outline_review_turn_classification_v1`, per CLAUDE.md's LLM Call
-    Discipline: that prompt is a single-responsibility classifier, and
-    this is a second, independent extraction step run only once an
-    `ADDITION_REQUEST` has already been classified.
-
-    Raises `GeminiCallError` if Gemini returns no usable `skill_name`.
-    """
+    """Extract a short, search-ready skill or topic name from a raw addition-request message."""
     prompt = PROMPT_REGISTRY["outline_addition_skill_name_extraction_v1"].format(
         user_message=user_message
     )
-    parsed = await _call_gemini_json(prompt, required_keys={"skill_name"})
+    parsed = await call_agent_json(
+        _addition_skill_name_extraction_agent, prompt, required_keys={"skill_name"}
+    )
     skill_name = parsed["skill_name"]
     if not isinstance(skill_name, str) or not skill_name.strip():
         raise GeminiCallError(f"Gemini returned no usable skill_name: {parsed!r}")
     return skill_name.strip()
 
 
-# Confidence assigned to a grounded addition request — reuses this
-# codebase's existing "Tavily confirmed it, nothing cross-validated it
-# against a role/job-listing anchor" meaning (`data/cross_validation.py`'s
-# tavily-only branch inside `ground_role`), rather than inventing a new
-# tier. There is no Himalayas equivalent for one ad hoc skill — Himalayas
-# is job-listing search keyed by role, not a per-skill lookup — so a
-# grounded addition can never reach `HIGH` the way a cross-validated role
-# skill can.
 SINGLE_SKILL_GROUNDING_CONFIDENCE = ConfidenceTier.MEDIUM
 
 
 async def ground_addition_request(user_message: str) -> ValidatedGroundedContent | None:
-    """Ground a raw, free-text Outline Confirmation addition request (PRD
-    §7.5) into a real, sourced `ValidatedGroundedContent` — closes the
-    gap `handle_review_turn`'s own docstring names: folding a user's
-    requested addition into the outline needs that addition to already
-    be grounded, which this function now does, rather than leaving it to
-    an unaddressed design question (previously Architecture §10/PRD §11
-    item 6).
-
-    Two steps: (1) `_extract_addition_skill_name` turns the user's full
-    sentence into a short, search-ready skill/topic name; (2) a live
-    Tavily search for that name — deliberately NOT `ground_role`'s full
-    Himalayas+Tavily+cross-validation pipeline, which is built around a
-    whole role's job-listing signal and has no per-skill lookup at all.
-    Any real Tavily result at all confirms the topic is a genuine,
-    publicly-documented subject, cited at `SINGLE_SKILL_GROUNDING_
-    CONFIDENCE` (medium).
-
-    Returns `None` if Tavily returns no usable result — never a
-    fabricated `source_url`/confidence (CLAUDE.md guardrail #1). The
-    caller (`main.py`) must tell the user this specific addition couldn't
-    be grounded and leave the outline unchanged, not silently drop or
-    invent it.
-
-    Raises `GeminiCallError` if skill-name extraction fails, or
-    `GroundingSourceCallError` if the Tavily call itself fails/times out
-    — both real, user-facing failures `main.py` degrades gracefully
-    around, per `_STAGE_EXCEPTIONS`.
-    """
+    """Ground a free-text outline addition request into a sourced grounded-content object via a Tavily lookup, or return None if nothing usable is found."""
     skill_name = await _extract_addition_skill_name(user_message)
     query = f"{skill_name} tutorial or official documentation"
     results = await _fetch_tavily_results(query)
@@ -1387,8 +1176,7 @@ async def ground_addition_request(user_message: str) -> ValidatedGroundedContent
 async def begin_outline_confirmation(
     resolved_role: str, topics: list[InitialOutlineTopic]
 ) -> OutlineConfirmationTurn:
-    """Show the outline for the first time, with grounded "why" reasoning
-    per topic (PRD §7.5)."""
+    """Show the outline for the first time, with grounded why-explanations per topic."""
     explanations = await _generate_topic_explanations(resolved_role, topics)
     message = _format_outline_presentation(resolved_role, topics, explanations)
     return OutlineConfirmationTurn(
@@ -1402,24 +1190,7 @@ async def handle_review_turn(
     topics: list[InitialOutlineTopic],
     user_message: str,
 ) -> OutlineConfirmationTurn:
-    """Handle one user turn during outline confirmation (PRD §7.5):
-    classify it, then dispatch.
-
-    For `ADDITION_REQUEST`, this function only classifies and consumes
-    the round — it does NOT regenerate the outline itself, since folding
-    in a new addition requires that addition to already be a properly
-    *grounded* `ValidatedGroundedContent` (a live grounding lookup for
-    the user's specific requested topic, not something this function can
-    invent per CLAUDE.md guardrail #1 — never fabricate a source_url).
-    The returned turn's `action` field tells the caller a grounding
-    follow-up is needed; the caller grounds the request via
-    `ground_addition_request` and then calls
-    `regenerate_outline_with_addition` — this function deliberately stays
-    a single, fast classify-and-acknowledge step so a slow/failing live
-    Tavily lookup never blocks the classification itself.
-
-    Raises `ValueError` if `state.stage` is not `REVIEWING`.
-    """
+    """Handle one user turn during outline confirmation by classifying the message and dispatching to the matching response."""
     if state.stage is not OutlineConfirmationStage.REVIEWING:
         raise ValueError(
             f"handle_review_turn called outside REVIEWING stage: {state.stage}"
@@ -1462,7 +1233,6 @@ async def handle_review_turn(
             action=action,
         )
 
-    # ADDITION_REQUEST
     next_state = advance_after_review_turn(state, action)
     concluded = next_state.stage is OutlineConfirmationStage.BOUND_REACHED
     message = OUTLINE_CONFIRMATION_ADDITION_ACK_MESSAGE_TEMPLATE.format(
@@ -1486,31 +1256,7 @@ async def regenerate_outline_with_addition(
     emerging_skills: list[ValidatedGroundedContent],
     new_addition: ValidatedGroundedContent,
 ) -> OutlineConfirmationTurn:
-    """Regenerate the full outline via `create_initial_outline` — never
-    `outline/hierarchy.py`'s insertion logic (this pre-Day-1 window is
-    the only time an outline is still being drafted rather than already
-    being progressed through; confirmed directly for this task, not
-    inferred) — folding `new_addition` into the input skill set (PRD
-    §7.5).
-
-    `new_addition` must already be a grounded `ValidatedGroundedContent`
-    — see `handle_review_turn`'s docstring for why grounding the raw
-    request is the caller's responsibility, not this function's. The new
-    addition is folded into `emerging_skills`, not `core_skills`: an ad
-    hoc, user-requested addition is not part of the role's already-
-    established core grounding, which is the judgment call this default
-    reflects.
-
-    Reuses `create_initial_outline`'s existing sourcing-safety mechanism
-    directly rather than building a second one: every topic in the
-    regenerated outline, including unchanged ones, still has its
-    source_url/source_type/confidence re-attached by exact skill-name
-    match against the (now-larger) input list, exactly as before.
-
-    `state` must already reflect this addition's round having been
-    consumed (via `handle_review_turn`) — this function does not itself
-    call `advance_after_review_turn` again.
-    """
+    """Regenerate the full outline via create_initial_outline with the new addition folded into the emerging skills."""
     updated_emerging_skills = [*emerging_skills, new_addition]
     new_topics = await create_initial_outline(
         resolved_role, core_skills, updated_emerging_skills

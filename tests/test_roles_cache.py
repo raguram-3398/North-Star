@@ -1,15 +1,4 @@
-"""Tests for data/roles_cache.py — roles_cache I/O.
-
-Uses a mocked SQLAlchemy Session rather than a real database, per the
-task's explicit choice between a test database and a mocked session.
-Rationale (flagged for review): CLAUDE.md's Stack section explicitly
-forbids substituting SQLite for Neon Postgres ("not local SQLite"), and
-`upsert_role` uses a Postgres-specific `INSERT ... ON CONFLICT` — a
-SQLite-backed test database couldn't even execute that statement, let
-alone verify it faithfully. A mocked Session, injected as a plain
-argument (see roles_cache.py's dependency-injection design), avoids both
-problems and keeps these tests fast and hitting no network at all.
-"""
+"""Tests for data/roles_cache.py: roles_cache I/O, using a mocked SQLAlchemy Session instead of a real database."""
 
 from datetime import datetime, timedelta
 from types import SimpleNamespace
@@ -95,14 +84,7 @@ def test_upsert_role_executes_an_upsert_and_commits() -> None:
 
 
 def test_upsert_role_rejects_raw_dict_in_place_of_validated_grounded_content() -> None:
-    """A raw, unvalidated dict must not be silently accepted in place of
-    a ValidatedGroundedContent instance — CLAUDE.md guardrail #12
-    requires a post-output_guard object at this write boundary. This is
-    an explicit isinstance check raising ConfidenceValidationError, not
-    an incidental AttributeError from a dict lacking `.extra` — the
-    enforcement is intentional and self-documenting, consistent with
-    every other guard in this codebase.
-    """
+    """A raw, unvalidated dict must not be silently accepted in place of a ValidatedGroundedContent instance."""
     session = MagicMock()
     unvalidated_core_skills = [
         {"skill": "SQL", "source_url": "https://x", "confidence": "high"}
@@ -143,9 +125,7 @@ def test_is_stale_false_within_the_thirty_day_floor() -> None:
 
 
 def test_is_stale_false_exactly_at_the_thirty_day_boundary() -> None:
-    """Exactly 30 days old is still within the floor, not past it —
-    `is_stale` uses a strict `>` comparison.
-    """
+    """Exactly 30 days old is still within the floor, not past it, since `is_stale` uses a strict `>` comparison."""
     last_updated = datetime(2026, 6, 1)
     reference_time = last_updated + timedelta(days=STALENESS_FLOOR_DAYS)
 

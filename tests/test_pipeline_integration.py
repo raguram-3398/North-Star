@@ -1,21 +1,4 @@
-"""End-to-end wiring proof: raw stated goal -> Clarify Gate resolves a
-role -> ground_role produces grounded skills -> create_initial_outline
-produces a valid, schema-correct outline.
-
-This is integration proof, not new feature work: it adds no behavior to
-any existing module (see the reconciliation note in
-specs/Architecture_North_Star.md §3 if any connecting fix turned out to
-be necessary — none was; every call site here uses the real function
-signatures exactly as already built). Mocking stays at the same
-boundary the rest of the suite already uses: real Himalayas/Tavily
-fixtures via a fake MCP tool/Tavily client, a mocked SQLAlchemy Session
-(never a real Postgres/SQLite), and a fake Gemini client — no live API
-calls anywhere in this file.
-
-Fakes and fixtures are imported directly from
-tests/test_research_outline_agent.py rather than duplicated, since that
-module already builds and maintains them.
-"""
+"""End-to-end proof that a raw stated goal wires through the Clarify Gate, grounding, and outline creation."""
 
 import json
 from datetime import datetime
@@ -29,6 +12,7 @@ from data.grounding_fallback import CachedFallbackResult
 from data.himalayas_parser import parse_search_jobs_response
 from security.input_gate import ClarifyGateStage
 from security.output_guard import ConfidenceTier, ValidatedGroundedContent
+from tests.test_adk_runtime import _patch_adk_runtime
 from tests.test_research_outline_agent import (
     _GENERIC_CONTENT,
     FIXTURES_DIR,
@@ -36,7 +20,6 @@ from tests.test_research_outline_agent import (
     _FakeHimalayasTool,
     _FakeTavilyClient,
     _himalayas_response,
-    _patch_gemini,
     _patch_himalayas,
     _patch_tavily,
     _tavily_response,
@@ -51,13 +34,7 @@ DEVOPS_HIMALAYAS_TEXT = (
 
 
 def _expected_himalayas_skill_names(raw_text: str) -> list[str]:
-    """Replicate `ground_role`'s own casefold-dedup-first-listing-wins
-    skill extraction exactly (see `agents/research_outline_agent.py`'s
-    `himalayas_skill_map` construction), so the mocked outline-hierarchy
-    response below covers precisely the skill names `ground_role` will
-    actually produce — not a hand-guessed list that could silently drift
-    from the real parser's output.
-    """
+    """Replicate ground_role's own casefold-dedup-first-listing-wins skill extraction exactly."""
     listings = parse_search_jobs_response(raw_text)
     seen: dict[str, str] = {}
     for listing in listings:
@@ -69,15 +46,7 @@ def _expected_himalayas_skill_names(raw_text: str) -> list[str]:
 
 
 def _hierarchy_response_covering(skill_names: list[str]) -> str:
-    """Build a minimal but valid mocked Gemini hierarchy response: one
-    topic per skill, split across two groups, covering every skill name
-    exactly once. Satisfies `create_initial_outline`'s "every grounded
-    skill must be covered by at least one topic" requirement without
-    hand-typing dozens of entries — cross-group/within-group *ordering*
-    correctness already has its own dedicated unit tests
-    (tests/test_research_outline_agent.py); this file's job is proving
-    the chain wires together, not re-verifying that logic.
-    """
+    """Build a minimal mocked Gemini hierarchy response with one topic per skill, split across two groups."""
     midpoint = max(len(skill_names) // 2, 1)
     return json.dumps(
         {
@@ -103,15 +72,7 @@ def _hierarchy_response_covering(skill_names: list[str]) -> str:
 
 
 def _mock_session_with_anchor(role_name: str, skill_names: list[str]) -> MagicMock:
-    """A mocked SQLAlchemy Session whose `.get()` returns a roles_cache-
-    shaped row — the same "mock the Session, not the function" pattern
-    tests/test_grounding_fallback.py already established. This one
-    session object is shared by both `ground_role`'s anchor lookup *and*
-    (when live grounding rejects) `get_cached_fallback`'s lookup, since
-    both call the real `data.roles_cache.get_role`, which just calls
-    `session.get(...)` — proving both call sites see consistent data
-    without needing to patch two separate `get_role` import bindings.
-    """
+    """Build a mocked SQLAlchemy Session whose .get() returns a roles_cache-shaped row."""
     session = MagicMock()
     session.get.return_value = SimpleNamespace(
         role_name=role_name,
@@ -133,13 +94,7 @@ def _assert_valid_outline(
     topics: list[roa.InitialOutlineTopic],
     input_skills: list[ValidatedGroundedContent],
 ) -> None:
-    """Shared assertions for every scenario below: non-empty, contiguous
-    strictly-increasing hierarchy_position, every topic carries a
-    non-empty source_url/confidence, every topic's sourcing traces back
-    to a *specific* entry in the original grounded skill list (not just
-    "truthy"), and is_enrichment/status are exactly as
-    `create_initial_outline` promises.
-    """
+    """Assert every topic has contiguous hierarchy_position, real sourcing, and correct is_enrichment/status."""
     assert topics
     positions = [t.hierarchy_position for t in topics]
     assert positions == list(range(1, len(topics) + 1))
@@ -160,13 +115,7 @@ def _assert_valid_outline(
 async def test_happy_path_real_role_through_to_valid_outline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Clearly real stated goal -> begin_clarify_gate resolves
-    immediately, no narrowing, no Gemini call -> ground_role against real
-    Himalayas fixture data (Himalayas signal + a roles_cache anchor,
-    Tavily deliberately generic/no-signal -> deterministic MEDIUM
-    confidence) -> create_initial_outline via the degenerate
-    core_skills=result.skills, emerging_skills=[] split.
-    """
+    """A clearly real stated goal resolves immediately and wires through grounding to a valid outline."""
     turn = await roa.begin_clarify_gate("DevOps Engineer")
     assert turn.gate_state.stage is ClarifyGateStage.RESOLVED
     assert turn.resolved_role == "DevOps Engineer"
@@ -192,7 +141,7 @@ async def test_happy_path_real_role_through_to_valid_outline(
     assert grounding_result.skills
 
     expected_skills = _expected_himalayas_skill_names(DEVOPS_HIMALAYAS_TEXT)
-    _patch_gemini(
+    _patch_adk_runtime(
         monkeypatch, responses=[_hierarchy_response_covering(expected_skills)]
     )
 
@@ -206,12 +155,8 @@ async def test_happy_path_real_role_through_to_valid_outline(
 async def test_vague_input_resolves_through_narrowing_then_valid_outline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Vague-but-genuine goal -> begin_clarify_gate enters the narrowing
-    loop -> advance_clarify_gate resolves within one round -> the
-    resolved role feeds into the identical ground_role ->
-    create_initial_outline chain as the happy path.
-    """
-    _patch_gemini(
+    """A vague-but-genuine goal resolves within one narrowing round and wires through to a valid outline."""
+    _patch_adk_runtime(
         monkeypatch,
         responses=[
             "What part of app development sounds most interesting to you?",
@@ -234,7 +179,7 @@ async def test_vague_input_resolves_through_narrowing_then_valid_outline(
     )
 
     assert turn.gate_state.stage is ClarifyGateStage.RESOLVED
-    assert turn.gate_state.narrowing_rounds_used == 0  # resolved rounds don't increment
+    assert turn.gate_state.narrowing_rounds_used == 0
     resolved_role = turn.resolved_role
     assert resolved_role == "DevOps Engineer"
 
@@ -255,7 +200,7 @@ async def test_vague_input_resolves_through_narrowing_then_valid_outline(
     assert grounding_result.confidence in (ConfidenceTier.MEDIUM, ConfidenceTier.HIGH)
 
     expected_skills = _expected_himalayas_skill_names(DEVOPS_HIMALAYAS_TEXT)
-    _patch_gemini(
+    _patch_adk_runtime(
         monkeypatch, responses=[_hierarchy_response_covering(expected_skills)]
     )
 
@@ -269,15 +214,7 @@ async def test_vague_input_resolves_through_narrowing_then_valid_outline(
 async def test_fallback_path_cached_result_wires_into_create_initial_outline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A stated goal that resolves to a role with zero live grounding
-    signal (Himalayas real-but-irrelevant fallback text, Tavily generic
-    content — neither clears its trust threshold) but a real roles_cache
-    entry: confirms `ground_role` produces a genuine `CachedFallbackResult`
-    (not a `LiveGroundingResult`), and — the actual point of this test —
-    that `CachedFallbackResult.core_skills`/`emerging_skills` work at
-    `create_initial_outline`'s real call site, not merely "look
-    type-compatible."
-    """
+    """A role with zero live grounding signal but a roles_cache entry falls back and still wires to a valid outline."""
     turn = await roa.begin_clarify_gate("Mainframe Systems Engineer")
     assert turn.gate_state.stage is ClarifyGateStage.RESOLVED
     resolved_role = turn.resolved_role
@@ -305,7 +242,7 @@ async def test_fallback_path_cached_result_wires_into_create_initial_outline(
     )
     assert grounding_result.emerging_skills == []
 
-    _patch_gemini(
+    _patch_adk_runtime(
         monkeypatch,
         responses=[_hierarchy_response_covering(cached_skill_names)],
     )

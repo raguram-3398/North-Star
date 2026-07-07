@@ -1,7 +1,4 @@
-"""Tests for security/input_gate.py — clarify-gate bound/loop state,
-outline-confirmation bound/loop state, first-pass stated-goal
-classification, and structural reject detection.
-"""
+"""Tests for security/input_gate.py: clarify-gate and outline-confirmation bound/loop state, goal classification, and reject detection."""
 
 import pytest
 
@@ -66,9 +63,7 @@ def test_advance_after_narrowing_round_resolved_goes_straight_to_resolved() -> N
 
 
 def test_advance_after_narrowing_round_unresolved_stays_within_bound() -> None:
-    """Gherkin: 'the gate either accepts a resolved role or asks one more
-    narrowing question' and 'the total narrowing rounds never exceed 2'.
-    """
+    """The gate either accepts a resolved role or asks one more narrowing question, never exceeding the round bound."""
     state = start_clarify_gate()
 
     state = advance_after_narrowing_round(state, resolved=False)
@@ -141,9 +136,7 @@ def test_advance_after_explanation_response_rejects_wrong_stage() -> None:
 
 
 def test_resolve_after_grounding_check_signal_found_resolves() -> None:
-    """Gherkin: 'if any market signal is found, the system proceeds at low
-    confidence'.
-    """
+    """If any market signal is found, the system proceeds at low confidence."""
     accept_own_words_state = ClarifyGateState(
         stage=ClarifyGateStage.ACCEPT_OWN_WORDS, narrowing_rounds_used=2
     )
@@ -156,9 +149,7 @@ def test_resolve_after_grounding_check_signal_found_resolves() -> None:
 
 
 def test_resolve_after_grounding_check_zero_signal_exits() -> None:
-    """Gherkin: 'if zero market signal is found, the system exits and
-    builds no outline'.
-    """
+    """If zero market signal is found, the system exits and builds no outline."""
     accept_own_words_state = ClarifyGateState(
         stage=ClarifyGateStage.ACCEPT_OWN_WORDS, narrowing_rounds_used=2
     )
@@ -178,9 +169,7 @@ def test_resolve_after_grounding_check_rejects_wrong_stage() -> None:
 def test_full_sequence_rejects_proposal_and_explanation_then_exits_on_zero_signal() -> (
     None
 ):
-    """End-to-end Gherkin: 'User rejects the proposed interpretation
-    twice' -> zero market signal -> exit.
-    """
+    """End-to-end: user rejects the proposed interpretation twice, then zero market signal leads to exit."""
     state = start_clarify_gate()
     state = advance_after_narrowing_round(state, resolved=False)
     state = advance_after_narrowing_round(state, resolved=False)
@@ -200,9 +189,7 @@ def test_full_sequence_rejects_proposal_and_explanation_then_exits_on_zero_signa
 def test_full_sequence_rejects_proposal_and_explanation_resolves_on_weak_signal() -> (
     None
 ):
-    """Same rejection path, but any market signal (even weak) proceeds at
-    low confidence instead of exiting.
-    """
+    """Same rejection path, but any market signal, even weak, proceeds at low confidence instead of exiting."""
     state = start_clarify_gate()
     state = advance_after_narrowing_round(state, resolved=False)
     state = advance_after_narrowing_round(state, resolved=False)
@@ -212,9 +199,6 @@ def test_full_sequence_rejects_proposal_and_explanation_resolves_on_weak_signal(
     state = resolve_after_grounding_check(state, market_signal_found=True)
 
     assert state.stage is ClarifyGateStage.RESOLVED
-
-
-# --- classify_stated_goal: first-pass reject/vague/real classification ---
 
 
 @pytest.mark.parametrize(
@@ -235,10 +219,7 @@ def test_full_sequence_rejects_proposal_and_explanation_resolves_on_weak_signal(
     ],
 )
 def test_classify_stated_goal_nonsense_examples(stated_goal: str) -> None:
-    """PRD §7.2's full nonsense list: blank, keyboard-mash, no-real-word
-    content, pure emoji/symbols, a single unrelated non-goal word, and a
-    fabricated/absurd job title.
-    """
+    """Blank, keyboard-mash, emoji/symbols, an unrelated word, or a fabricated job title all classify as nonsense."""
     assert classify_stated_goal(stated_goal) is GoalClassification.NONSENSE
 
 
@@ -255,9 +236,7 @@ def test_classify_stated_goal_nonsense_examples(stated_goal: str) -> None:
     ],
 )
 def test_classify_stated_goal_vague_examples(stated_goal: str) -> None:
-    """PRD §7.2's vague-but-genuine examples — accepted into the
-    narrowing loop, never rejected.
-    """
+    """Vague-but-genuine goal statements are accepted into the narrowing loop, never rejected."""
     assert classify_stated_goal(stated_goal) is GoalClassification.VAGUE
 
 
@@ -272,19 +251,12 @@ def test_classify_stated_goal_vague_examples(stated_goal: str) -> None:
     ],
 )
 def test_classify_stated_goal_clearly_real_role_examples(stated_goal: str) -> None:
-    """A clearly real, well-formed role name accepts straight through,
-    per PRD §7.2's 'Clearly real role -> accept, proceed to Research'.
-    """
+    """A clearly real, well-formed role name accepts straight through to research."""
     assert classify_stated_goal(stated_goal) is GoalClassification.REAL
 
 
 def test_classify_stated_goal_niche_real_role_is_not_gate_rejected() -> None:
-    """PRD §7.2: real-but-obscure or niche job titles must never be
-    gate-rejected, however unfamiliar — this must classify as REAL (and
-    proceed straight to Research/live grounding) exactly like a common
-    seed-list title, not fall into NONSENSE or VAGUE just because this
-    module has never seen the specific title before.
-    """
+    """A real-but-obscure or niche job title must classify as REAL, not NONSENSE or VAGUE, even if never seen before."""
     assert classify_stated_goal("Site Reliability Engineer") is GoalClassification.REAL
     assert (
         classify_stated_goal("Platform Reliability Architect")
@@ -293,34 +265,20 @@ def test_classify_stated_goal_niche_real_role_is_not_gate_rejected() -> None:
 
 
 def test_classify_stated_goal_fabricated_title_is_rejected_not_niche_real() -> None:
-    """The direct counterpart to the niche-real-role test above: a
-    fabricated/absurd title must be rejected as nonsense — this is a
-    lexical-plausibility judgment, never a market-existence check, so the
-    distinguishing signal is vocabulary, not whether the role "really"
-    exists.
-    """
+    """A fabricated or absurd title must be rejected as nonsense based on vocabulary, not on whether the role really exists."""
     assert classify_stated_goal("Dragon Whisperer") is GoalClassification.NONSENSE
     assert classify_stated_goal("Chief Vibes Officer") is GoalClassification.NONSENSE
 
 
 def test_classify_stated_goal_never_performs_a_market_existence_check() -> None:
-    """Regression guard for the module docstring's guardrail: a title
-    this module has never encountered (not in any seed list) must still
-    classify as REAL as long as it is lexically title-shaped and free of
-    fabricated-title markers — proving the mechanism is lexical, not a
-    lookup against a fixed roster of "known real" titles.
-    """
+    """A title never seen before must still classify as REAL if lexically title-shaped, proving the check is lexical, not a lookup."""
     assert classify_stated_goal("Quantum Firmware Engineer") is GoalClassification.REAL
 
 
 def test_narrowing_loop_never_exceeds_round_bound_under_repeated_non_resolution() -> (
     None
 ):
-    """Stress-test companion to the Gherkin 'total narrowing rounds never
-    exceed 2': hammer the loop with unresolved rounds well past the bound
-    and confirm it never advances beyond MAX_NARROWING_ROUNDS or lingers
-    in NARROWING once the bound is reached.
-    """
+    """Hammering the loop with unresolved rounds well past the bound must never exceed MAX_NARROWING_ROUNDS or linger in NARROWING."""
     state = start_clarify_gate()
     for _ in range(10):
         if state.stage is not ClarifyGateStage.NARROWING:
@@ -330,9 +288,6 @@ def test_narrowing_loop_never_exceeds_round_bound_under_repeated_non_resolution(
 
     assert state.stage is ClarifyGateStage.PROPOSE_BEST_GUESS
     assert state.narrowing_rounds_used == 2
-
-
-# --- Outline Confirmation (PRD §7.5) bounded loop --------------------------
 
 
 def test_start_outline_confirmation_begins_reviewing_with_zero_rounds() -> None:
@@ -353,10 +308,7 @@ def test_has_reached_outline_confirmation_bound_default_max(
 
 
 def test_question_never_consumes_a_round() -> None:
-    """A free question must leave stage and round count completely
-    unchanged — including when asked repeatedly, well past what would be
-    the bound for a round-consuming action.
-    """
+    """A free question must leave stage and round count completely unchanged, even when asked repeatedly."""
     state = start_outline_confirmation()
 
     for _ in range(5):
@@ -404,9 +356,7 @@ def test_confirm_ends_review_even_after_a_round_already_used() -> None:
 
 
 def test_round_bound_reached_after_exactly_two_consuming_actions() -> None:
-    """Gherkin-style bound test, mirroring the clarify gate's: mix
-    concerns and addition requests (both round-consuming) and confirm the
-    bound is reached at exactly 2, never before, never exceeded."""
+    """Mixing concerns and addition requests, both round-consuming, must reach the bound at exactly 2, never before or after."""
     state = start_outline_confirmation()
 
     state = advance_after_review_turn(state, OutlineReviewAction.CONCERN)
@@ -421,10 +371,7 @@ def test_round_bound_reached_after_exactly_two_consuming_actions() -> None:
 def test_questions_interleaved_with_consuming_actions_never_advance_bound_early() -> (
     None
 ):
-    """Interleave free questions between the two round-consuming actions
-    and confirm the bound is still reached only after exactly 2
-    consuming actions, unaffected by however many questions were asked in
-    between."""
+    """Free questions interleaved between round-consuming actions must not affect when the bound is reached."""
     state = start_outline_confirmation()
 
     for _ in range(3):
@@ -451,9 +398,7 @@ def test_advance_after_review_turn_rejects_wrong_stage() -> None:
 
 
 def test_outline_confirmation_loop_never_exceeds_round_bound_under_stress() -> None:
-    """Stress-test companion to the clarify gate's equivalent: hammer the
-    loop with round-consuming actions well past the bound and confirm it
-    never advances beyond MAX_OUTLINE_CONFIRMATION_ROUNDS."""
+    """Hammering the loop with round-consuming actions well past the bound must never advance beyond MAX_OUTLINE_CONFIRMATION_ROUNDS."""
     state = start_outline_confirmation()
     for _ in range(10):
         if state.stage is not OutlineConfirmationStage.REVIEWING:

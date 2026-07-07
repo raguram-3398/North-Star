@@ -1,33 +1,4 @@
-"""Tests for agents/coaching_pace_agent.py — day-by-day content
-generation (7-step hands-on-eligible structure and its conceptual-only
-variant), verification retry-cap orchestration (exactly 3 attempts,
-half-credit teach-and-de-escalate), and pace-signal computation +
-persistence.
-
-Gemini is mocked by reusing tests/test_gemini_client.py's `_patch_gemini`
-fake unchanged — `agents.coaching_pace_agent._call_gemini_json` is the
-*same function object* as `utils.gemini_client._call_gemini_json` (a
-direct import, not a copy), and that function's own internal call to
-`_get_gemini_client()` resolves via `utils.gemini_client`'s namespace
-regardless of which module calls it — so patching
-`utils.gemini_client._get_gemini_client` (what `_patch_gemini` already
-does) is the correct target here too.
-
-Tavily is different: `agents.coaching_pace_agent.fetch_theory_material_links`
-calls `_get_tavily_client()` as a bare name *defined in this module's own
-namespace* (a separate import binding from research_outline_agent.py's),
-so it must be patched at `agents.coaching_pace_agent._get_tavily_client`
-specifically — reusing `research_outline_agent`'s `_patch_tavily` would
-silently patch the wrong module and not take effect.
-
-The Verification Skill's `generate_questions`/`grade_answer` are mocked
-directly at `agents.coaching_pace_agent.generate_questions`/`grade_answer`
-(again, "patch where used" — these are direct imports into this module's
-own namespace) rather than exercising the Skill's own Gemini calls, since
-the Skill already has its own dedicated test suite
-(tests/test_verification_skill.py) — these tests focus on this module's
-own retry-cap orchestration logic.
-"""
+"""Tests for agents/coaching_pace_agent.py covering day content generation, verification retry-cap orchestration, and pace-signal computation."""
 
 import json
 from datetime import datetime
@@ -37,7 +8,7 @@ import pytest
 
 import agents.coaching_pace_agent as cpa
 from security.output_guard import ConfidenceTier
-from tests.test_gemini_client import _patch_gemini
+from tests.test_adk_runtime import _patch_adk_runtime
 from tests.test_research_outline_agent import (
     _FakeTavilyClient,
     _tavily_response,
@@ -51,19 +22,13 @@ TOPIC_SOURCE_MATERIAL = (
 )
 SOURCE_URL = "https://git-scm.com/book/en/v2/Git-Branching-Branches-in-a-Nutshell"
 
-# Well past COLD_START_CALIBRATION_DAYS — the default `created_at` for
-# every `complete_topic_verification` test's `get_user` fake, so tests
-# about drift/enrichment/pacing-extension behavior (not about the
-# cold-start gate itself) aren't accidentally suppressed by it.
 LONG_PAST_USER_CREATED_AT = datetime(2020, 1, 1)
 
 
 def _patch_tavily_theory(
     monkeypatch: pytest.MonkeyPatch, client: _FakeTavilyClient
 ) -> None:
-    """Patch Tavily at *this module's own* import binding — see module
-    docstring for why `research_outline_agent`'s `_patch_tavily` wouldn't
-    take effect here."""
+    """Patch Tavily at this module's own import binding."""
     monkeypatch.setattr(cpa, "_get_tavily_client", lambda: client)
 
 
@@ -82,8 +47,7 @@ def _theory_tavily_client() -> _FakeTavilyClient:
 
 
 class _FakeGenerateQuestions:
-    """Fake `generate_questions` returning one canned question per call,
-    in order, with call-count/argument tracking."""
+    """Fake `generate_questions` returning one canned question per call, in order, with call-count/argument tracking."""
 
     def __init__(self, question_texts: list[str]) -> None:
         self._question_texts = list(question_texts)
@@ -151,14 +115,11 @@ def _no_op_write_attempt(monkeypatch: pytest.MonkeyPatch) -> list[tuple]:
     return written
 
 
-# --- Day content generation: 7-step hands-on-eligible structure ----------
-
-
 async def test_generate_day_content_hands_on_eligible_is_fully_populated(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_tavily_theory(monkeypatch, _theory_tavily_client())
-    _patch_gemini(
+    _patch_adk_runtime(
         monkeypatch,
         responses=[
             json.dumps(
@@ -197,7 +158,7 @@ async def test_generate_day_content_conceptual_only_omits_hands_on_and_review(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_tavily_theory(monkeypatch, _theory_tavily_client())
-    _patch_gemini(
+    _patch_adk_runtime(
         monkeypatch,
         responses=[
             json.dumps(
@@ -232,7 +193,7 @@ async def test_generate_day_content_carries_remaining_content_forward(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_tavily_theory(monkeypatch, _theory_tavily_client())
-    _patch_gemini(
+    _patch_adk_runtime(
         monkeypatch,
         responses=[
             json.dumps(
@@ -271,9 +232,6 @@ async def test_fetch_theory_material_links_raises_on_tavily_failure(
         await cpa.fetch_theory_material_links("Git Branching")
 
 
-# --- Hands-on ramping rule (position_in_group / group_size driven) -------
-
-
 def test_compute_hands_on_intensity_first_day_is_zero() -> None:
     assert cpa.compute_hands_on_intensity(1, 5) == 0.0
 
@@ -287,8 +245,7 @@ def test_compute_hands_on_intensity_scales_linearly() -> None:
 
 
 def test_compute_hands_on_intensity_single_day_group_is_full_not_zero() -> None:
-    """Edge case: a single-topic group has no room to ramp — full
-    intensity immediately rather than permanently conceptual-only."""
+    """A single-topic group has no room to ramp, so it gets full intensity immediately rather than staying conceptual-only."""
     assert cpa.compute_hands_on_intensity(1, 1) == 1.0
 
 
@@ -306,7 +263,6 @@ def test_is_conceptual_only_day_matches_zero_intensity() -> None:
 
 
 def test_convert_weekly_hours_to_daily_minutes() -> None:
-    # 10 hours/week over a 5-day cadence = 2 hours = 120 minutes/day
     assert cpa.convert_weekly_hours_to_daily_minutes(10) == 120
 
 
@@ -316,29 +272,21 @@ def test_convert_weekly_hours_to_daily_minutes_rejects_non_positive() -> None:
 
 
 def test_calculate_days_expected_matches_estimated_minutes_exactly() -> None:
-    # 10 hours/week -> 120 minutes/day, exactly ESTIMATED_MINUTES_PER_TOPIC
-    # -> a single day is expected.
     assert cpa.ESTIMATED_MINUTES_PER_TOPIC == 120
     assert cpa.calculate_days_expected(10) == 1
 
 
 def test_calculate_days_expected_scales_up_for_less_available_time() -> None:
-    # 3 hours/week -> 36 minutes/day -> ceil(120 / 36) = 4 days.
     assert cpa.calculate_days_expected(3) == 4
 
 
 def test_calculate_days_expected_never_less_than_one_day() -> None:
-    # 70 hours/week -> 840 minutes/day, far more than one topic needs —
-    # still at least 1 day, never a fraction of a day.
     assert cpa.calculate_days_expected(70) == 1
 
 
 def test_calculate_days_expected_rejects_non_positive() -> None:
     with pytest.raises(ValueError):
         cpa.calculate_days_expected(0)
-
-
-# --- PROMPT_REGISTRY: baseline regression asserts on the prompt string ----
 
 
 def test_day_content_hands_on_prompt_v1_is_frozen() -> None:
@@ -397,18 +345,70 @@ def test_day_content_conceptual_prompt_v1_is_frozen() -> None:
     )
 
 
-# --- Verification retry-cap orchestration ---------------------------------
+def test_day_content_hands_on_prompt_v2_is_frozen() -> None:
+    assert cpa.PROMPT_REGISTRY["day_content_generation_hands_on_v2"] == (
+        "Generate today's lesson content for a learner studying "
+        "{topic_name!r} (part of the {topic_group!r} topic group). They "
+        "have about {minutes_available} minutes available today, and "
+        "today's hands-on exercise should be scaled to intensity "
+        "{hands_on_intensity:.2f} on a 0 (very light) to 1 (full depth) "
+        "scale.\n\n"
+        "{carried_over_instruction}"
+        "Theory material to build the lesson around — these are real, "
+        "existing sources; cite them by number, never invent any other "
+        "source:\n{theory_sources}\n\n"
+        "Respond with ONLY a JSON object matching this shape:\n"
+        '{{"summary": "<1-2 sentence summary of today\'s topic>", '
+        '"theory_framing": "<prose introducing/framing the numbered '
+        'theory sources above>", '
+        '"hands_on_exercise": "<a hands-on exercise scaled to the given '
+        'intensity>", '
+        '"review_prompt": "<a prompt for reviewing/refactoring the '
+        'hands-on work>", '
+        '"reflection_prompt": "<a short prompt instructing the learner '
+        "to recall and restate, in their own words, what they just "
+        "studied today — an instruction to recall, never phrased as a "
+        'question>", '
+        '"preview": "<a short preview of tomorrow and how it connects>", '
+        '"remaining_content": "<anything from today\'s intended material '
+        "that did not fit in the time budget and should carry over to "
+        'tomorrow, or an empty string if everything fit>"}}\n'
+        "Size the depth/length of every field to genuinely fit within "
+        "{minutes_available} minutes total for the whole lesson."
+    )
+
+
+def test_day_content_conceptual_prompt_v2_is_frozen() -> None:
+    assert cpa.PROMPT_REGISTRY["day_content_generation_conceptual_v2"] == (
+        "Generate today's lesson content for a learner studying "
+        "{topic_name!r} (part of the {topic_group!r} topic group). This "
+        "is a conceptual-only day (no hands-on exercise yet) — they have "
+        "about {minutes_available} minutes available today.\n\n"
+        "{carried_over_instruction}"
+        "Theory material to build the lesson around — these are real, "
+        "existing sources; cite them by number, never invent any other "
+        "source:\n{theory_sources}\n\n"
+        "Respond with ONLY a JSON object matching this shape:\n"
+        '{{"summary": "<1-2 sentence summary of today\'s topic>", '
+        '"theory_framing": "<prose introducing/framing the numbered '
+        'theory sources above>", '
+        '"reflection_prompt": "<a short prompt instructing the learner '
+        "to recall and restate, in their own words, what they just "
+        "studied today — an instruction to recall, never phrased as a "
+        'question>", '
+        '"preview": "<a short preview of tomorrow and how it connects>", '
+        '"remaining_content": "<anything from today\'s intended material '
+        "that did not fit in the time budget and should carry over to "
+        'tomorrow, or an empty string if everything fit>"}}\n'
+        "Size the depth/length of every field to genuinely fit within "
+        "{minutes_available} minutes total for the whole lesson."
+    )
 
 
 async def test_retry_cap_is_exactly_three_first_attempt_inside_the_counter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """CLAUDE.md's named anti-pattern: the first attempt must live inside
-    the same counter as retries 2/3, not run once outside the loop
-    before it starts. Verifies actual generate_questions call count is
-    exactly 3 (1 for attempt 1, 1 regeneration each for attempts 2 and
-    3) — not 2 (which would mean attempt 1 wasn't really counted) and
-    not 4 (a call after the cap)."""
+    """Verifies the first attempt lives inside the same retry counter as attempts 2 and 3, for an exact call count of 3."""
     fake_generate, fake_grade = _patch_verification_skill(
         monkeypatch, ["Q1", "Q2", "Q3"], [False, False, False]
     )
@@ -443,7 +443,7 @@ async def test_retry_cap_is_exactly_three_first_attempt_inside_the_counter(
     )
 
     assert state.resolved
-    assert fake_generate.call_count == 3  # NOT 4 — no generation call past the cap
+    assert fake_generate.call_count == 3
     assert fake_grade.call_count == 3
     assert len(written) == 3
 
@@ -502,7 +502,6 @@ async def test_success_on_any_attempt_stops_retrying_with_full_credit(
     assert state.resolved
     assert state.credit == cpa.FULL_CREDIT
     assert state.taught_answer_message is None
-    # no generation call after a resolving success
     assert fake_generate.call_count == success_attempt
     assert fake_grade.call_count == success_attempt
 
@@ -524,9 +523,6 @@ async def test_intermediate_failed_attempts_are_written_with_zero_credit(
     first_attempt_kwargs = written[0][1]
     assert first_attempt_kwargs["credit"] == cpa.NOT_YET_RESOLVED_CREDIT
     assert first_attempt_kwargs["passed"] is False
-
-
-# --- Topic completion: requires all 5 slots resolved, calls pace calc ----
 
 
 def test_complete_topic_verification_requires_all_five_slots_attempted(
@@ -559,8 +555,6 @@ def test_complete_topic_verification_requires_slots_resolved_not_just_attempted(
         {"question_number": q, "attempt_number": 1, "passed": True, "credit": 1.0}
         for q in range(1, 5)
     ]
-    # Question 5 has been attempted once, failed, and is NOT at the cap
-    # yet — genuinely still in progress, not resolved.
     attempts.append(
         {"question_number": 5, "attempt_number": 1, "passed": False, "credit": 0.0}
     )
@@ -584,24 +578,7 @@ def _all_full_credit_attempts() -> list[dict]:
 def _patch_completion_writes(
     monkeypatch: pytest.MonkeyPatch, attempts: list[dict]
 ) -> tuple[list[tuple], list[tuple]]:
-    """Shared setup for complete_topic_verification tests: fake
-    get_attempts_for_topic/write_pace_snapshot/mark_topic_completed,
-    returning the snapshot_calls/completed_calls lists so callers can
-    assert on them. Also fakes get_pending_patch_notes to return an empty
-    list — these tests aren't about patch delivery (see the dedicated
-    maybe_deliver_patch tests below), so this keeps that call a
-    deliberate, explicit no-op rather than relying on an unmocked
-    MagicMock session's query chain happening to iterate empty.
-
-    `get_user` defaults to a user created long ago (past
-    `COLD_START_CALIBRATION_DAYS`) with no `resolved_role` — the
-    cold-start gate now reads `created_at` unconditionally on every
-    non-enrichment completion, so every test through this shared helper
-    needs a real, well-formed `get_user` fake, not an unmocked `MagicMock`
-    session's auto-generated (and non-datetime) `.created_at`. Tests that
-    need a specific `resolved_role` override this again afterward and
-    must carry `created_at` forward too.
-    """
+    """Shared setup for complete_topic_verification tests, faking its DB reads/writes and returning call logs."""
     monkeypatch.setattr(
         cpa, "get_attempts_for_topic", lambda session, topic_id: attempts
     )
@@ -640,9 +617,6 @@ def test_complete_topic_verification_calls_pace_calculator_and_persists(
         {"question_number": 5, "attempt_number": 2, "passed": True, "credit": 1.0},
     ]
     snapshot_calls, completed_calls = _patch_completion_writes(monkeypatch, attempts)
-    # Cold start (no prior history) — this test is about the pace-calc/
-    # persistence wiring, not drift detection (see the dedicated drift
-    # tests below).
     monkeypatch.setattr(cpa, "get_pace_snapshot_history", lambda session, uid: [])
     session = MagicMock()
 
@@ -667,22 +641,12 @@ def test_complete_topic_verification_calls_pace_calculator_and_persists(
     assert completed_calls[0][0] == (session, "t1")
 
 
-# --- Sustained-drift wiring (Part 1) ---------------------------------------
-
-
 def test_complete_topic_verification_below_drift_window_size_triggers_neither_branch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Fewer than DRIFT_WINDOW_SIZE (3) total snapshots — detect_sustained_drift's
-    own window-size gating (a *count*, distinct from the calendar-based
-    `COLD_START_CALIBRATION_DAYS` gate tested separately below).
-    """
+    """Fewer than DRIFT_WINDOW_SIZE total snapshots triggers neither the ahead nor behind branch."""
     attempts = _all_full_credit_attempts()
     _patch_completion_writes(monkeypatch, attempts)
-    # Only 2 total snapshots (including the one this call is about to add
-    # would make 3, but get_pace_snapshot_history is faked to represent
-    # "before this call's own write took effect on a mocked session" —
-    # i.e. genuinely below the window).
     monkeypatch.setattr(
         cpa,
         "get_pace_snapshot_history",
@@ -716,13 +680,7 @@ def test_complete_topic_verification_below_drift_window_size_triggers_neither_br
 def test_complete_topic_verification_within_calibration_window_suppresses_drift(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """PRD §7.8's "weeks 1-2 are calibration only": a user still inside
-    `COLD_START_CALIBRATION_DAYS` of their own `users.created_at` gets
-    `drift` forced to "on_track" and `detect_sustained_drift` is never
-    even called — even though the snapshot history below would otherwise
-    read as sustained-ahead (3 perfect scores, well past
-    DRIFT_WINDOW_SIZE).
-    """
+    """A user still inside the cold-start calibration window gets drift forced to on_track."""
     attempts = _all_full_credit_attempts()
     _patch_completion_writes(monkeypatch, attempts)
     monkeypatch.setattr(
@@ -736,7 +694,6 @@ def test_complete_topic_verification_within_calibration_window_suppresses_drift(
         "get_user",
         lambda session, uid: {
             "resolved_role": "Backend Engineer",
-            # 5 days before reference_time — well inside the 14-day window.
             "created_at": datetime(2026, 1, 5),
         },
     )
@@ -769,11 +726,7 @@ def test_complete_topic_verification_within_calibration_window_suppresses_drift(
 def test_complete_topic_verification_past_calibration_window_allows_drift_detection(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The mirror image of the calibration-window test above: once
-    `COLD_START_CALIBRATION_DAYS` has elapsed since `users.created_at`,
-    `detect_sustained_drift` runs normally against the real snapshot
-    history.
-    """
+    """Once the cold-start calibration window has elapsed, drift detection runs normally."""
     attempts = _all_full_credit_attempts()
     _patch_completion_writes(monkeypatch, attempts)
     monkeypatch.setattr(
@@ -787,7 +740,6 @@ def test_complete_topic_verification_past_calibration_window_allows_drift_detect
         "get_user",
         lambda session, uid: {
             "resolved_role": "Backend Engineer",
-            # 15 days before reference_time — just past the 14-day window.
             "created_at": datetime(2026, 1, 5),
         },
     )
@@ -814,8 +766,7 @@ def test_complete_topic_verification_past_calibration_window_allows_drift_detect
 def test_complete_topic_verification_ordinary_variation_triggers_neither_branch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A full window of signals that land strictly between the behind/
-    ahead thresholds must trigger neither branch."""
+    """A full window of signals landing strictly between the behind/ahead thresholds triggers neither branch."""
     attempts = _all_full_credit_attempts()
     _patch_completion_writes(monkeypatch, attempts)
     monkeypatch.setattr(
@@ -933,11 +884,7 @@ def test_complete_topic_verification_sustained_behind_triggers_pacing_extension(
 def test_complete_topic_verification_sustained_behind_never_touches_outline_topics(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Pacing extension must never touch outline_topics content (no
-    deletion, no is_enrichment tagging, nothing structural) — proven here
-    by asserting the only three functions that could modify
-    outline_topics are never called at all on the behind path.
-    """
+    """A sustained-behind pacing extension never touches outline_topics content itself."""
     attempts = _all_full_credit_attempts()
     _patch_completion_writes(monkeypatch, attempts)
     monkeypatch.setattr(
@@ -970,9 +917,6 @@ def test_complete_topic_verification_sustained_behind_never_touches_outline_topi
     assert insert_calls == []
     assert get_all_topics_calls == []
     assert has_pending_calls == []
-
-
-# --- Enrichment selection/insertion (Part 2) -------------------------------
 
 
 def test_maybe_trigger_enrichment_inserts_unused_emerging_skill(
@@ -1033,10 +977,7 @@ def test_maybe_trigger_enrichment_inserts_unused_emerging_skill(
 def test_maybe_trigger_enrichment_skips_an_already_used_emerging_skill(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The first emerging skill (GraphQL) already matches an existing
-    outline topic (case-insensitively) — selection must move on to the
-    next one (gRPC), not stop or error.
-    """
+    """When the first emerging skill already matches an existing topic, selection moves on to the next one."""
     monkeypatch.setattr(cpa, "has_pending_enrichment_topic", lambda session, uid: False)
     monkeypatch.setattr(
         cpa,
@@ -1123,13 +1064,10 @@ def test_maybe_trigger_enrichment_does_nothing_when_role_not_in_roles_cache(
     assert result is None
 
 
-# --- Structural pace isolation for enrichment verification (Part 3) -------
-
-
 def test_complete_topic_verification_enrichment_never_writes_pace_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    attempts = _all_full_credit_attempts()  # would be "ahead"-eligible if evaluated
+    attempts = _all_full_credit_attempts()
     monkeypatch.setattr(
         cpa, "get_attempts_for_topic", lambda session, topic_id: attempts
     )
@@ -1155,20 +1093,17 @@ def test_complete_topic_verification_enrichment_never_writes_pace_snapshot(
     )
 
     assert snapshot_calls == []
-    assert history_calls == []  # drift isn't even evaluated for enrichment
+    assert history_calls == []
     assert result.drift is None
     assert result.enrichment_topic is None
     assert result.pace_extension_applied is None
-    assert len(completed_calls) == 1  # still marks completed, for closing-note credit
+    assert len(completed_calls) == 1
 
 
 def test_complete_topic_verification_enrichment_half_credit_still_skips_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Even when full/half credit was earned (a topic can still complete
-    with HALF_CREDIT slots via the retry-cap teach-in) — is_enrichment=True
-    must still skip the pace_snapshots write unconditionally.
-    """
+    """is_enrichment=True skips the pace_snapshots write unconditionally, even with mixed full/half credit."""
     attempts = [
         {
             "question_number": q,
@@ -1197,10 +1132,7 @@ def test_complete_topic_verification_enrichment_half_credit_still_skips_snapshot
 def test_complete_topic_verification_non_enrichment_still_writes_pace_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Regression guard: adding `is_enrichment` must not change the
-    default (`is_enrichment=False`) behavior — pace_snapshots still gets
-    written exactly as before.
-    """
+    """The default is_enrichment=False path still writes a pace_snapshot exactly as before."""
     attempts = _all_full_credit_attempts()
     snapshot_calls, completed_calls = _patch_completion_writes(monkeypatch, attempts)
     monkeypatch.setattr(cpa, "get_pace_snapshot_history", lambda session, uid: [])
@@ -1216,12 +1148,7 @@ def test_complete_topic_verification_non_enrichment_still_writes_pace_snapshot(
 async def test_complete_topic_test_out_with_is_enrichment_skips_pace_snapshot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Test-out AND enrichment together: nothing in this codebase's
-    test-out logic restricts it to non-enrichment topics (both regular
-    verification and test-out drive the identical
-    complete_topic_verification completion path), so this combination is
-    treated as genuinely possible and tested here, not assumed impossible.
-    """
+    """A test-out completion on an enrichment topic still skips the pace_snapshots write."""
     attempts = [_resolved_attempt(q, cpa.FULL_CREDIT) for q in range(1, 6)]
     monkeypatch.setattr(
         cpa, "get_attempts_for_topic", lambda session, topic_id: attempts
@@ -1246,17 +1173,10 @@ async def test_complete_topic_test_out_with_is_enrichment_skips_pace_snapshot(
     assert completed_calls[0][1] == {"status": cpa.COMPLETED_TEST_OUT_STATUS}
 
 
-# --- Patch-note delivery wiring (patch-delivery task, Part 1) -------------
-
-
 def test_maybe_deliver_patch_augments_high_confidence_patchs_origin_topic(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Resolved judgment call (Architecture §9): "insert_now" augments the
-    patch's own origin topic in place — never inserts a new "(Update)"
-    topic — since a patch-note's origin_topic_id is, by construction,
-    already an existing topic whose skill matches the significant event.
-    """
+    """A prioritized patch augments its own origin topic in place, never inserting a new topic."""
     pending_patch = {
         "id": "patch-1",
         "user_id": "u1",
@@ -1314,12 +1234,7 @@ def test_maybe_deliver_patch_augments_high_confidence_patchs_origin_topic(
 def test_maybe_deliver_patch_returns_pending_decision_for_low_confidence_patch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A low/uncertain-confidence patch routes to "ask_user", not
-    "insert_now" — nothing gets augmented yet, and the patch-note stays
-    pending (no status update at all) — but the caller gets back a
-    `PendingPatchDecision` carrying everything a UI banner needs, not a
-    bare `None` silently dropping the fact that a decision is needed.
-    """
+    """A low-confidence patch returns a PendingPatchDecision instead of augmenting anything yet."""
     pending_patch = {
         "id": "patch-2",
         "user_id": "u1",
@@ -1380,10 +1295,7 @@ def test_maybe_deliver_patch_no_pending_patches_does_nothing(
 
 
 def test_decide_patch_delivery_ask_user_can_construct_patch_decision_state() -> None:
-    """Confirms the low-level interface `resolve_pending_patch_decision`
-    below is built on: a `PatchDecisionState` constructs correctly from a
-    "needs_user_decision" outcome; no resolution is fabricated here.
-    """
+    """A PatchDecisionState constructs correctly from a needs_user_decision delivery outcome."""
     from patches.patch_manager import PatchDecisionState, decide_patch_delivery
 
     pending = [
@@ -1402,10 +1314,7 @@ def test_decide_patch_delivery_ask_user_can_construct_patch_decision_state() -> 
 def test_resolve_pending_patch_decision_learn_now_augments_and_marks_delivered(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """PRD §7.9's "learn now (confidence-labeled, folded in)" — choosing
-    "learn now" must fold the patch's content into its origin topic
-    exactly the way an auto-prioritized patch already is, and mark the
-    patch-note DELIVERED (not a separate status)."""
+    """Choosing "learn now" folds the patch's content into its origin topic and marks it DELIVERED."""
     decision = cpa.PendingPatchDecision(
         patch_note_id="patch-2",
         origin_topic_id="topic-sql",
@@ -1448,8 +1357,7 @@ def test_resolve_pending_patch_decision_learn_now_augments_and_marks_delivered(
 def test_resolve_pending_patch_decision_defer_does_not_augment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Deferring must leave the origin topic untouched and mark the
-    patch-note DEFERRED (parked permanently, per `get_deferred_patch_notes`)."""
+    """Deferring leaves the origin topic untouched and marks the patch-note DEFERRED."""
     decision = cpa.PendingPatchDecision(
         patch_note_id="patch-2",
         origin_topic_id="topic-sql",
@@ -1483,10 +1391,7 @@ def test_resolve_pending_patch_decision_defer_does_not_augment(
 def test_complete_topic_verification_calls_maybe_deliver_patch_regardless_of_drift(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Patch-note delivery is not pace-gated — unlike enrichment, it must
-    run on every non-enrichment completion regardless of drift's value
-    (here: cold-start "on_track").
-    """
+    """Patch-note delivery runs on every non-enrichment completion regardless of drift's value."""
     attempts = _all_full_credit_attempts()
     monkeypatch.setattr(
         cpa, "get_attempts_for_topic", lambda session, topic_id: attempts
@@ -1522,10 +1427,7 @@ def test_complete_topic_verification_calls_maybe_deliver_patch_regardless_of_dri
 def test_complete_topic_verification_ahead_and_pending_patch_both_fire(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Co-occurrence judgment call: sustained-ahead drift and a pending
-    high-confidence patch-note are independent conditions and can both
-    fire in the same call — neither suppresses the other.
-    """
+    """Sustained-ahead drift and a pending patch-note delivery are independent and can both fire together."""
     attempts = _all_full_credit_attempts()
     _patch_completion_writes(monkeypatch, attempts)
     monkeypatch.setattr(
@@ -1565,23 +1467,13 @@ def test_complete_topic_verification_ahead_and_pending_patch_both_fire(
     assert len(patch_deliver_calls) == 1
 
 
-# --- Test-out: verification-first (PRD §7.6's exception) ------------------
-
-
 def _resolved_attempt(
     question_number: int,
     credit: float,
     question_text: str | None = None,
     grading_criteria: str | None = None,
 ) -> dict:
-    """Build one 'final attempt' fixture row, shaped like
-    `get_attempts_for_topic`'s real return value. `credit` drives
-    `passed`/`attempt_number` consistently with how
-    `submit_verification_answer` actually writes them: a full-credit slot
-    passed on some attempt (attempt_number doesn't matter for these
-    tests, so attempt 1 is used); a half-credit slot only resolved by
-    failing all the way to the retry cap.
-    """
+    """Build one final-attempt fixture row shaped like get_attempts_for_topic's real return value."""
     passed = credit == cpa.FULL_CREDIT
     attempt_number = 1 if passed else cpa.MAX_VERIFICATION_ATTEMPTS
     return {
@@ -1598,10 +1490,7 @@ def _resolved_attempt(
 async def test_test_out_full_pass_writes_completed_test_out_status(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Full pass (PRD §7.6): every slot resolved at FULL_CREDIT -> the
-    topic is marked the schema's distinct `completed_test_out` value
-    (not `completed`), and no study content is generated at all.
-    """
+    """A full pass at FULL_CREDIT on every slot marks the topic completed_test_out with no study content generated."""
     attempts = [_resolved_attempt(q, cpa.FULL_CREDIT) for q in range(1, 6)]
     monkeypatch.setattr(
         cpa, "get_attempts_for_topic", lambda session, topic_id: attempts
@@ -1638,18 +1527,7 @@ async def test_test_out_full_pass_writes_completed_test_out_status(
 async def test_test_out_partial_pass_relies_on_the_inline_teach_in_not_a_second_step(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Regression guard for a real interaction this task got wrong on the
-    first pass and corrected after review: a partial pass's HALF_CREDIT
-    slot(s) already received `submit_verification_answer`'s inline
-    teach-in (`_build_taught_answer_message`), built from the identical
-    `grading_criteria`, during the retry-cap attempt itself — moments
-    before `complete_topic_test_out` is ever called. `complete_topic_
-    test_out` must still mark the topic complete (`completed_test_out`,
-    PRD §7.7's completion rule doesn't distinguish full/half credit), and
-    must generate no further remediation content — `TestOutResult` itself
-    carries no content field, so there is structurally nothing else for a
-    partial pass to produce here.
-    """
+    """A partial pass still marks the topic completed_test_out and generates no further remediation content."""
     attempts = [
         _resolved_attempt(1, cpa.FULL_CREDIT, "What is a commit?"),
         _resolved_attempt(2, cpa.FULL_CREDIT, "What is a branch?"),
@@ -1691,8 +1569,7 @@ async def test_test_out_partial_pass_relies_on_the_inline_teach_in_not_a_second_
 async def test_submit_verification_answer_defaults_to_is_test_out_false(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Regression guard: adding the `is_test_out` parameter must not
-    change regular (non-test-out) verification's persisted behavior."""
+    """Regular, non-test-out verification still persists is_test_out=False by default."""
     _patch_verification_skill(monkeypatch, ["Q1"], [True])
     written = _no_op_write_attempt(monkeypatch)
     session = MagicMock()
@@ -1710,16 +1587,7 @@ async def test_submit_verification_answer_defaults_to_is_test_out_false(
 async def test_test_out_reuses_the_identical_retry_cap_machinery_not_a_second_one(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Test-out drives the exact same `begin_verification_question`/
-    `submit_verification_answer` functions and the exact same
-    `MAX_VERIFICATION_ATTEMPTS == 3` cap as regular verification —
-    `is_test_out` only changes what gets persisted per attempt, never the
-    retry-counting mechanism. If test-out had grown a second, parallel
-    retry-cap implementation instead of reusing this one, the
-    attempt/write counts below (identical to
-    `test_retry_cap_is_exactly_three_first_attempt_inside_the_counter`)
-    would diverge.
-    """
+    """Test-out reuses the same retry-cap machinery as regular verification, not a second implementation."""
     fake_generate, fake_grade = _patch_verification_skill(
         monkeypatch, ["Q1", "Q2", "Q3"], [False, False, False]
     )
@@ -1744,13 +1612,10 @@ async def test_test_out_reuses_the_identical_retry_cap_machinery_not_a_second_on
 
     assert state.resolved
     assert state.credit == cpa.HALF_CREDIT
-    assert fake_generate.call_count == 3  # identical shape to regular verification
+    assert fake_generate.call_count == 3
     assert fake_grade.call_count == 3
     assert len(written) == 3
     assert all(kwargs["is_test_out"] is True for _, kwargs in written)
-
-
-# --- Goal completion / closing note (patch-delivery task, Part 2) ---------
 
 
 def test_is_goal_complete_true_when_all_core_topics_completed(
@@ -1849,7 +1714,7 @@ async def test_generate_closing_note_fast_learner_lists_enrichment_strengths(
     ]
     monkeypatch.setattr(cpa, "get_all_topics_for_user", lambda session, uid: topics)
     monkeypatch.setattr(cpa, "get_deferred_patch_notes", lambda session, uid: [])
-    _patch_gemini(
+    _patch_adk_runtime(
         monkeypatch,
         responses=[
             json.dumps({"note_text": "Congratulations! You built strong skills."})
@@ -1887,7 +1752,7 @@ async def test_generate_closing_note_core_only_learner_suggests_emerging_skills(
     ]
     monkeypatch.setattr(cpa, "get_all_topics_for_user", lambda session, uid: topics)
     monkeypatch.setattr(cpa, "get_deferred_patch_notes", lambda session, uid: [])
-    _patch_gemini(
+    _patch_adk_runtime(
         monkeypatch,
         responses=[json.dumps({"note_text": "Great work finishing the plan!"})],
     )
@@ -1912,7 +1777,7 @@ async def test_generate_closing_note_surfaces_deferred_patch_notes(
     monkeypatch.setattr(cpa, "get_all_topics_for_user", lambda session, uid: [])
     deferred = [{"id": "patch-1", "new_content": "x", "status": "deferred"}]
     monkeypatch.setattr(cpa, "get_deferred_patch_notes", lambda session, uid: deferred)
-    _patch_gemini(monkeypatch, responses=[json.dumps({"note_text": "text"})])
+    _patch_adk_runtime(monkeypatch, responses=[json.dumps({"note_text": "text"})])
 
     result = await cpa.generate_closing_note(MagicMock(), "u1")
 
@@ -1932,7 +1797,7 @@ async def test_generate_closing_note_unaffected_when_no_deferred_patches(
     )
     monkeypatch.setattr(cpa, "get_all_topics_for_user", lambda session, uid: [])
     monkeypatch.setattr(cpa, "get_deferred_patch_notes", lambda session, uid: [])
-    _patch_gemini(monkeypatch, responses=[json.dumps({"note_text": "text"})])
+    _patch_adk_runtime(monkeypatch, responses=[json.dumps({"note_text": "text"})])
 
     result = await cpa.generate_closing_note(MagicMock(), "u1")
 
@@ -1952,7 +1817,7 @@ async def test_generate_closing_note_raises_on_banned_leveling_language(
     )
     monkeypatch.setattr(cpa, "get_all_topics_for_user", lambda session, uid: [])
     monkeypatch.setattr(cpa, "get_deferred_patch_notes", lambda session, uid: [])
-    _patch_gemini(
+    _patch_adk_runtime(
         monkeypatch,
         responses=[
             json.dumps(

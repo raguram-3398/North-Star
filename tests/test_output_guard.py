@@ -1,6 +1,4 @@
-"""Tests for security/output_guard.py — confidence-ladder enforcement, the
-structural gate before any DB write.
-"""
+"""Tests for output_guard.py: confidence-ladder enforcement before any DB write."""
 
 from dataclasses import FrozenInstanceError
 
@@ -21,10 +19,7 @@ VALID_CANDIDATE = {
 
 
 def test_confidence_tier_values_match_canonical_ladder() -> None:
-    """The enum's string values must match Architecture_North_Star.md §8's
-    canonical ladder exactly, since they are compared/persisted as raw
-    strings elsewhere in the system.
-    """
+    """The enum's string values must match the canonical confidence ladder exactly."""
     assert ConfidenceTier.HIGH.value == "high"
     assert ConfidenceTier.MEDIUM.value == "medium"
     assert ConfidenceTier.LOW.value == "low"
@@ -50,9 +45,7 @@ def test_validate_output_object_accepts_every_persistable_tier(tier: str) -> Non
 
 
 def test_validate_output_object_rejects_reject_tier() -> None:
-    """A candidate resolved to `reject` (zero market signal) must never
-    become a writable object — PRD §7.3: no record is created.
-    """
+    """A `reject`-tier candidate must never become a writable object."""
     candidate = {**VALID_CANDIDATE, "confidence": "reject"}
 
     with pytest.raises(ConfidenceValidationError):
@@ -81,10 +74,7 @@ def test_validate_output_object_rejects_malformed_source_url() -> None:
 
 
 def test_validate_output_object_rejects_scheme_only_source_url() -> None:
-    """A URL that is structurally scheme-like but has no host or path
-    (e.g. "https://") must be rejected — it parses without error but
-    carries no real source, and is not just fully-empty or missing.
-    """
+    """A URL like "https://" with no host or path must be rejected."""
     candidate = {**VALID_CANDIDATE, "source_url": "https://", "confidence": "high"}
 
     with pytest.raises(ConfidenceValidationError):
@@ -123,9 +113,7 @@ def test_validate_output_object_rejects_unknown_confidence_string() -> None:
 
 
 def test_validated_grounded_content_is_immutable() -> None:
-    """The validated object type must be immutable so nothing between the
-    gate and the DB write can silently alter a validated field.
-    """
+    """The validated object is immutable, so no field can be altered later."""
     candidate = {**VALID_CANDIDATE, "confidence": "high"}
     result = validate_output_object(candidate)
 

@@ -1,8 +1,4 @@
-"""Tests for data/pace_snapshots.py — pace_snapshots I/O.
-
-Uses a mocked SQLAlchemy Session, matching data/roles_cache.py's
-established convention (see test_roles_cache.py's module docstring).
-"""
+"""Tests for data/pace_snapshots.py: pace_snapshots I/O, using a mocked SQLAlchemy Session."""
 
 from datetime import datetime
 from unittest.mock import MagicMock

@@ -1,11 +1,4 @@
-"""Tests for db/connection.py — Neon Postgres engine/session wiring.
-
-Uses `monkeypatch` to set a fake connection string rather than relying on
-the real `.env` file, so these tests need no real secrets and make no
-network call — `create_engine()` is lazy about actually connecting;
-these tests only verify the wiring (dialect normalization, singleton
-memoization, the missing-env-var error), never a real Neon round-trip.
-"""
+"""Tests for db/connection.py: Neon Postgres engine/session wiring, using a fake connection string and no real network calls."""
 
 import pytest
 from sqlalchemy import Engine
@@ -16,10 +9,7 @@ import db.connection as connection
 
 @pytest.fixture(autouse=True)
 def _reset_module_singletons(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Each test gets a clean slate: the module-level engine/session
-    factory are memoized globals, so a prior test's Engine would
-    otherwise leak into the next one.
-    """
+    """Reset the module-level engine/session-factory globals so no test's state leaks into the next one."""
     monkeypatch.setattr(connection, "_engine", None)
     monkeypatch.setattr(connection, "_session_factory", None)
 
