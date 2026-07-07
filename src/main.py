@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 
 import streamlit as st
 from dotenv import load_dotenv
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from agents.coaching_pace_agent import (
@@ -137,9 +138,14 @@ def _init_session_state() -> None:
 
 
 def _get_db_session() -> Session:
-    if st.session_state.db_session is None:
-        st.session_state.db_session = get_session()
-    session: Session = st.session_state.db_session
+    previous_session: Session | None = st.session_state.db_session
+    if previous_session is not None:
+        try:
+            previous_session.close()
+        except SQLAlchemyError:
+            pass
+    session = get_session()
+    st.session_state.db_session = session
     return session
 
 
