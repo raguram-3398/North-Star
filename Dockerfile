@@ -11,6 +11,6 @@ COPY pyproject.toml .
 
 RUN pip install --no-cache-dir --no-deps -e .
 
-EXPOSE 8501
+EXPOSE 7860
 
-CMD ["streamlit", "run", "streamlit_app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+CMD ["streamlit", "run", "streamlit_app.py", "--server.port=7860", "--server.address=0.0.0.0"]
