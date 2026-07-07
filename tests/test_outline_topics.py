@@ -26,6 +26,7 @@ from data.outline_topics import (
     COMPLETED_STATUS,
     COMPLETED_TEST_OUT_STATUS,
     NOT_STARTED_STATUS,
+    augment_outline_topic,
     get_all_topics_for_user,
     get_completed_topics_matching_skill,
     has_pending_enrichment_topic,
@@ -214,6 +215,75 @@ def test_mark_topic_completed_rejects_an_unrecognized_status() -> None:
 
     with pytest.raises(ValueError):
         mark_topic_completed(session, "t1", status="something_else")
+
+    session.commit.assert_not_called()
+
+
+def _completed_row(**overrides: object) -> SimpleNamespace:
+    fields: dict[str, object] = {
+        "id": "t1",
+        "user_id": "u1",
+        "topic_name": "SQL",
+        "hierarchy_position": 3,
+        "topic_group": "SQL",
+        "position_in_group": 1,
+        "source_url": "https://example.com/sql-old",
+        "source_type": "job_listing",
+        "confidence": "medium",
+        "is_enrichment": False,
+        "status": COMPLETED_STATUS,
+        "completed_at": "2026-01-01T00:00:00",
+    }
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+def test_augment_outline_topic_refreshes_provenance_fields_only() -> None:
+    """PRD §7.4's "Augmentation" update type + CLAUDE.md guardrail #5:
+    only source_url/source_type/confidence change — status, completed_at,
+    hierarchy_position, and topic_name (an already-completed topic) must
+    never be touched by an augmentation.
+    """
+    session = MagicMock()
+    row = _completed_row()
+    session.get.return_value = row
+
+    result = augment_outline_topic(
+        session,
+        "t1",
+        source_url="https://example.com/sql-new",
+        source_type="patch-note",
+        confidence=ConfidenceTier.HIGH,
+    )
+
+    assert row.source_url == "https://example.com/sql-new"
+    assert row.source_type == "patch-note"
+    assert row.confidence == ConfidenceTier.HIGH.value
+    assert row.status == COMPLETED_STATUS
+    assert row.completed_at == "2026-01-01T00:00:00"
+    assert row.hierarchy_position == 3
+    assert row.topic_name == "SQL"
+    session.commit.assert_called_once()
+
+    assert result["source_url"] == "https://example.com/sql-new"
+    assert result["source_type"] == "patch-note"
+    assert result["confidence"] == ConfidenceTier.HIGH.value
+    assert result["id"] == "t1"
+    assert result["hierarchy_position"] == 3
+
+
+def test_augment_outline_topic_raises_if_topic_not_found() -> None:
+    session = MagicMock()
+    session.get.return_value = None
+
+    with pytest.raises(ValueError):
+        augment_outline_topic(
+            session,
+            "missing",
+            source_url="https://example.com/x",
+            source_type="patch-note",
+            confidence=ConfidenceTier.HIGH,
+        )
 
     session.commit.assert_not_called()
 

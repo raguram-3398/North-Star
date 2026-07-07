@@ -1,0 +1,34 @@
+# Generated from pyproject.toml's [project.dependencies] — that file
+# remains the real dependency source (CLAUDE.md); this is a plain,
+# pip-installable mirror of it for contexts that expect requirements.txt
+# (Docker builds, HF Space deploys) rather than an editable/PEP 517
+# install. Keep the two in sync by hand — update both in the same commit.
+
+# Agent framework
+google-adk>=2.3.0
+
+# MCP client SDK — google-adk's MCP toolset (google.adk.tools.mcp_tool)
+# imports this directly but does not declare it as its own dependency;
+# required explicitly for the Himalayas MCP connection.
+mcp>=1.28.1
+
+# LLM (Google's official unified GenAI SDK)
+google-genai>=1.0.0
+
+# Search
+tavily-python>=0.5.0
+
+# UI
+streamlit>=1.38.0
+requests>=2.32.0
+
+# Persistence
+sqlalchemy>=2.0.0
+psycopg[binary]>=3.2.0
+
+# Validation / Settings
+pydantic>=2.8.0
+pydantic-settings>=2.5.0
+
+# Config
+python-dotenv>=1.0.1

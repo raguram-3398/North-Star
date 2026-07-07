@@ -10,15 +10,14 @@ the normal editable-install path the way `src/` is — this file adds
 `verification_question_generator.generator` (an implicit namespace
 package; no `__init__.py` needed, Python 3.3+).
 
-Gemini is mocked by reusing tests/test_research_outline_agent.py's
-existing `_patch_gemini`/`_FakeGeminiClient` fakes rather than duplicating
-them — the Skill's `generate_questions`/`grade_answer` call
-`agents.research_outline_agent._call_gemini_json` directly (imported by
-name), so patching `agents.research_outline_agent._get_gemini_client` (the
-module where that call actually resolves the client from) is the correct
-target, exactly as `_patch_gemini` already does — not
-`generator._get_gemini_client`, which doesn't exist as a name in this
-module's own namespace at all.
+Gemini is mocked by reusing tests/test_gemini_client.py's existing
+`_patch_gemini`/`_FakeGeminiClient` fakes rather than duplicating them —
+the Skill's `generate_questions`/`grade_answer` call
+`utils.gemini_client._call_gemini_json` directly (imported by name), so
+patching `utils.gemini_client._get_gemini_client` (the module where that
+call actually resolves the client from) is the correct target, exactly as
+`_patch_gemini` already does — not `generator._get_gemini_client`, which
+doesn't exist as a name in this module's own namespace at all.
 """
 
 import json
@@ -33,7 +32,7 @@ if str(_SKILLS_DIR) not in sys.path:
 
 from verification_question_generator import generator  # noqa: E402
 
-from tests.test_research_outline_agent import _patch_gemini  # noqa: E402
+from tests.test_gemini_client import _patch_gemini  # noqa: E402
 from utils.exceptions import GeminiCallError  # noqa: E402
 
 EVALUATION_DIR = Path(__file__).resolve().parent.parent / "evaluation"

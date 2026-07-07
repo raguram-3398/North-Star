@@ -36,9 +36,9 @@ north-star/
 ├── .claudeignore
 ├── .env / .env.example
 ├── .dockerignore
-├── Dockerfile            # NOT YET BUILT
-├── requirements.txt      # NOT YET BUILT — pyproject.toml is the real dependency source today
-├── streamlit_app.py      # NOT YET BUILT — src/main.py is the current streamlit run target; see Architecture §3's "Known limitation" (Enum/session_state) for why this thin wrapper would close a real bug class
+├── Dockerfile            # verified: boots and serves HTTP 200 (Docker daemon unavailable in-session, verified via an equivalent fresh-venv simulation instead)
+├── requirements.txt      # mirrors pyproject.toml's [project.dependencies]; that file remains the real dependency source
+├── streamlit_app.py      # thin `from main import main` wrapper — the real `streamlit run` target now, closing Architecture §3's Enum/session_state "Known limitation" structurally
 │
 ├── .agent/
 │   └── skills/
@@ -47,7 +47,7 @@ north-star/
 │           └── generator.py
 │
 ├── .github/workflows/
-│   ├── ci.yml            # NOT YET BUILT
+│   ├── ci.yml            # ruff/black/mypy/pytest on push+PR — verified via an equivalent fresh-venv simulation of each step
 │   └── refresh_roles.yml
 │
 ├── specs/
@@ -68,7 +68,7 @@ north-star/
 │   ├── pace/
 │   │   └── calculator.py               # topic_score, timing_ratio, 80/20 blend, sustained-drift check
 │   ├── outline/
-│   │   ├── hierarchy.py                # insertion into existing hierarchy — insert_new_topic's first real caller is data/outline_topics.py's insert_new_outline_topic
+│   │   ├── hierarchy.py                # insertion into existing hierarchy — insert_new_topic's first real caller is data/outline_topics.py's insert_new_outline_topic; augment_existing_topic's first real caller is data/outline_topics.py's augment_outline_topic (patch-note delivery, §7.9)
 │   │   └── significant_event.py        # bucket/confidence-crossing diff
 │   ├── patches/
 │   │   └── patch_manager.py            # confidence branching, delivery ordering (decide_patch_delivery), low-confidence learn-now-or-defer state machine (PatchDecisionState/resolve_patch_decision)
@@ -79,7 +79,7 @@ north-star/
 │   │   ├── progress_log.py             # progress_log I/O
 │   │   ├── pace_snapshots.py           # write_pace_snapshot + get_pace_snapshot_history
 │   │   ├── users.py                    # get_user + extend_pacing (pacing-extension mechanism)
-│   │   ├── outline_topics.py           # outline_topics I/O: get_completed_topics_matching_skill, get_all_topics_for_user/has_pending_enrichment_topic/insert_new_outline_topic (enrichment insertion)
+│   │   ├── outline_topics.py           # outline_topics I/O: get_completed_topics_matching_skill, get_all_topics_for_user/has_pending_enrichment_topic/insert_new_outline_topic (enrichment insertion), augment_outline_topic (patch-note augmentation — refreshes source_url/source_type/confidence only, never status)
 │   │   └── patch_notes.py              # patch_notes I/O
 │   ├── models/
 │   │   └── schemas.py
@@ -87,6 +87,7 @@ north-star/
 │   │   ├── connection.py
 │   │   └── create_schema.py            # one-time Base.metadata.create_all() script — `python -m src.db.create_schema`, no Alembic
 │   └── utils/
+│       ├── gemini_client.py            # shared Gemini call/timeout/retry/JSON-parsing infra — imported as a peer by both Agents and the Verification Skill
 │       └── exceptions.py               # logger.py was built, then deleted outright as a real scope cut — never re-add it for this submission, see Cost & Usage Tracking below
 │
 ├── evaluation/

@@ -1,0 +1,45 @@
+name: CI
+
+# Lint, format-check, type-check, and test every push/PR — no real secrets
+# needed: every test mocks its external calls (Gemini/Tavily/Himalayas/
+# Neon), per this repo's own testing conventions (CLAUDE.md), so
+# `NEON_CONNECTION_STRING`/`TAVILY_API_KEY`/`GEMINI_API_KEY` are never
+# read at import time (db/connection.py's own "lazy-but-memoized engine"
+# design) and this workflow never needs them configured as repo secrets.
+
+on:
+  push:
+    branches: [main]
+  pull_request: {}
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -e .[dev]
+
+      - name: ruff check
+        run: |
+          ruff check .
+
+      - name: black --check
+        run: |
+          black --check .
+
+      - name: mypy
+        run: |
+          mypy src/
+
+      - name: pytest
+        run: |
+          pytest

@@ -15,17 +15,14 @@ every attempt and is responsible for passing whatever context (e.g.
 `previous_question_texts`) this module needs to do its job correctly —
 statelessness does not make freshness automatic on its own.
 
-Reuses `agents/research_outline_agent.py`'s existing Gemini call/timeout/
-error-handling helper (`_call_gemini_json`, plus `GeminiCallError`)
-directly rather than duplicating that logic, per this
-task's explicit instruction. This does mean importing underscore-
-prefixed (module-private-by-convention) names across a real package
-boundary (`.agent/skills/` -> `src/agents/`) — a real architectural seam,
-not an oversight: a full extraction of that Gemini-call infrastructure
-into a shared `src/utils/` module would be the cleaner long-term fix, but
-this task's scope is the Skill itself, not a refactor of already-tested,
-already-committed Agent code. Flagged for a future promotion, same as
-this project's other flagged-not-solved seams.
+Reuses `utils/gemini_client.py`'s shared Gemini call/timeout/error-handling
+helper (`_call_gemini_json`, plus `GeminiCallError`) directly rather than
+duplicating that logic. That module is the extracted, shared home for
+this infrastructure (originally built in `agents/research_outline_agent.py`,
+promoted once this Skill and `agents/coaching_pace_agent.py` both needed
+the same behavior) — this Skill, both Agents, import it as legitimate
+peers from `src/utils/`, none reaching into another agent's private
+(underscore-prefixed) namespace across a package boundary anymore.
 
 `PROMPT_REGISTRY` here is this module's own, separate from
 `agents/research_outline_agent.py`'s — CLAUDE.md's LLM Call Discipline
@@ -37,17 +34,17 @@ Skill artifact... not inline agent logic").
 from dataclasses import dataclass
 from typing import Any
 
-from agents.research_outline_agent import _call_gemini_json
 from utils.exceptions import GeminiCallError
+from utils.gemini_client import _call_gemini_json
 
 # Judgment call: "flash" tier — question generation from a single piece
 # of source material and single-answer grading are both short, bounded
 # tasks, closer in shape to the clarify gate's per-turn calls than to
 # outline-hierarchy sequencing's whole-curriculum reasoning. Kept as this
 # Skill's own constant rather than importing
-# `agents.research_outline_agent.SHORT_TURN_GEMINI_MODEL` — an
-# independent choice for an independent artifact, even though the value
-# happens to match today.
+# `utils.gemini_client.SHORT_TURN_GEMINI_MODEL` — an independent choice
+# for an independent artifact, even though the value happens to match
+# today.
 VERIFICATION_GEMINI_MODEL = "gemini-2.5-flash"
 
 # CLAUDE.md's LLM Call Discipline: every prompt used for grounded or

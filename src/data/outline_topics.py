@@ -23,7 +23,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from models.schemas import OutlineTopic
-from outline.hierarchy import insert_new_topic
+from outline.hierarchy import augment_existing_topic, insert_new_topic
 from security.output_guard import ConfidenceTier
 
 # Match Architecture §5's `status TEXT` column comment
@@ -156,6 +156,51 @@ def mark_topic_completed(
     row.status = status
     row.completed_at = datetime.now(UTC).replace(tzinfo=None, microsecond=0)
     session.commit()
+
+
+def augment_outline_topic(
+    session: Session,
+    topic_id: str,
+    source_url: str,
+    source_type: str,
+    confidence: ConfidenceTier,
+) -> dict[str, Any]:
+    """Refresh an existing topic's provenance fields in place (PRD §7.4's
+    "Augmentation" update type: "an existing topic's content refreshed in
+    place") via `outline/hierarchy.py`'s existing `augment_existing_topic`
+    (not reimplemented here) — the augmentation counterpart to
+    `insert_new_outline_topic`'s addition path.
+
+    Never touches `status`/`completed_at`/`hierarchy_position`/
+    `topic_name` — CLAUDE.md guardrail #5 ("never let a patch-note reopen
+    or alter the completion/verification status of its origin topic")
+    applies here even though this function's caller
+    (`agents/coaching_pace_agent.py`'s `maybe_deliver_patch`) is delivering
+    a market update to an *already-completed* topic: only the market-
+    grounding provenance (`source_url`/`source_type`/`confidence`) is
+    refreshed, exactly what `augment_existing_topic`'s `refreshed_content`
+    parameter is scoped to. Commits the transaction.
+
+    Raises `ValueError` (via `augment_existing_topic`) if `topic_id` does
+    not exist.
+    """
+    row = session.get(OutlineTopic, topic_id)
+    if row is None:
+        raise ValueError(f"outline topic {topic_id!r} not found")
+
+    existing_topics = [_to_dict(row)]
+    refreshed_content = {
+        "source_url": source_url,
+        "source_type": source_type,
+        "confidence": confidence.value,
+    }
+    augmented = augment_existing_topic(existing_topics, topic_id, refreshed_content)[0]
+
+    row.source_url = source_url
+    row.source_type = source_type
+    row.confidence = confidence.value
+    session.commit()
+    return augmented
 
 
 def insert_outline_topics(

@@ -58,6 +58,7 @@ here would re-teach the identical rubric a second time.
 """
 
 import asyncio
+import math
 import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -74,16 +75,12 @@ from tavily.errors import (
 )
 from tavily.errors import TimeoutError as TavilyTimeoutError
 
-from agents.research_outline_agent import (
-    EXTERNAL_CALL_TIMEOUT_SECONDS,
-    HEAVY_GENERATION_TIMEOUT_SECONDS,
-    _call_gemini_json,
-    _get_tavily_client,
-)
+from agents.research_outline_agent import _get_tavily_client
 from data.grounding_fallback import CACHED_SOURCE_TYPE
 from data.outline_topics import (
     COMPLETED_STATUS,
     COMPLETED_TEST_OUT_STATUS,
+    augment_outline_topic,
     get_all_topics_for_user,
     get_topic,
     has_pending_enrichment_topic,
@@ -106,21 +103,29 @@ from pace.calculator import (
     calculate_topic_score,
     detect_sustained_drift,
 )
-from patches.patch_manager import PatchStatus, decide_patch_delivery
+from patches.patch_manager import (
+    PatchDecisionState,
+    PatchStatus,
+    decide_patch_delivery,
+    resolve_patch_decision,
+)
 from security.output_guard import ConfidenceTier, validate_output_object
 from utils.exceptions import GeminiCallError, GroundingSourceCallError
+from utils.gemini_client import (
+    EXTERNAL_CALL_TIMEOUT_SECONDS,
+    HEAVY_GENERATION_TIMEOUT_SECONDS,
+    _call_gemini_json,
+)
 
-# Reuses agents/research_outline_agent.py's private Gemini-call helper
-# directly, same flagged architectural seam as
-# .agent/skills/verification_question_generator/generator.py (see
-# Architecture §4's "Resolved" block and PRD §11 item #7) — this is now
-# the *third* consumer of that not-yet-extracted shared infrastructure
-# (the other two being research_outline_agent.py's own clarify-gate/
-# outline functions and the Verification Skill), strengthening the case
-# for eventually promoting it to a shared src/utils/ module. Still not
-# attempted here, for the same reason as before: out of this task's
-# scope, and it would mean touching already-tested, already-committed
-# code as a side effect.
+# Imports `_call_gemini_json` and its timeout constants from
+# `utils/gemini_client.py` — the shared Gemini-call infrastructure
+# extracted from `agents/research_outline_agent.py` once this module and
+# the Verification Skill both needed the identical call/timeout/retry/
+# error-handling behavior (see that module's own docstring for the full
+# history). All three consumers (this module, `research_outline_agent.py`,
+# and `.agent/skills/verification_question_generator/generator.py`) now
+# import it as legitimate peers, none reaching into another agent's
+# private namespace across a package boundary.
 
 # The Verification Skill lives in .agent/skills/, outside the src/
 # package (required for Antigravity workspace-manager recognition, per
@@ -238,6 +243,46 @@ def convert_weekly_hours_to_daily_minutes(available_time_per_week_hours: int) ->
     return round(available_time_per_week_hours * 60 / STUDY_DAYS_PER_WEEK)
 
 
+# Judgment call, flagged for review — a genuine spec gap: no function
+# anywhere in this codebase computed `days_expected` before this (`pace/
+# calculator.py`'s `calculate_timing_ratio` docstring: "supplied by the
+# caller as already derived from the user's own established baseline" —
+# PRD §7.8 only defers to "a future days_expected calculation," never
+# specifying one). `main.py` previously used a flat `DAYS_EXPECTED_PER_
+# TOPIC = 1` placeholder pending this. No per-skill effort estimate exists
+# anywhere in this codebase to derive a real per-topic number from
+# (`create_initial_outline` sequences topics but never estimates their
+# individual study time), so this is a single fixed constant applied to
+# every topic regardless of subject matter — 120 minutes (2 hours),
+# a middle-of-the-road guess for one topic's worth of the 7-step day
+# structure (summary, theory, hands-on, review, reflection, verification),
+# not derived from any measured data. Revisable once real usage data
+# exists.
+ESTIMATED_MINUTES_PER_TOPIC = 120
+
+
+def calculate_days_expected(available_time_per_week_hours: int) -> int:
+    """Baseline `days_expected` for one topic — `pace/calculator.py`'s
+    `calculate_timing_ratio` denominator, and `complete_topic_verification`/
+    `complete_topic_test_out`'s `days_expected` parameter.
+
+    `ESTIMATED_MINUTES_PER_TOPIC` divided by today's minute budget
+    (`convert_weekly_hours_to_daily_minutes` — the identical daily-budget
+    conversion `generate_day_content` already uses, not a second cadence
+    assumption), rounded UP: a user with less daily time takes
+    proportionally more days to cover the same fixed amount of topic
+    content. Never less than 1 day, even for a very high weekly-hours
+    user — a topic can't complete in a fraction of a day.
+
+    Raises `ValueError` (via `convert_weekly_hours_to_daily_minutes`) if
+    `available_time_per_week_hours` is not positive.
+    """
+    minutes_per_day = convert_weekly_hours_to_daily_minutes(
+        available_time_per_week_hours
+    )
+    return max(1, math.ceil(ESTIMATED_MINUTES_PER_TOPIC / minutes_per_day))
+
+
 # --- Day content generation (PRD §7.6) --------------------------------
 
 PROMPT_REGISTRY: dict[str, str] = {
@@ -352,7 +397,7 @@ class DayContent:
     remaining_content: str | None
 
 
-async def _fetch_theory_material_links(topic_name: str) -> list[dict[str, str]]:
+async def fetch_theory_material_links(topic_name: str) -> list[dict[str, str]]:
     """Live Tavily search for real, existing educational content (docs,
     tutorials, videos) for `topic_name` — never fabricated.
 
@@ -363,6 +408,14 @@ async def _fetch_theory_material_links(topic_name: str) -> list[dict[str, str]]:
     requirement. Reuses `agents/research_outline_agent.py`'s Tavily
     client and timeout convention directly, mirroring
     `_fetch_tavily_results`'s pattern exactly.
+
+    Public (not underscore-prefixed): `generate_day_content` below is the
+    original caller, and `main.py`'s test-out entry point (PRD §7.6's
+    "verification first, before study content is generated") is a second,
+    real caller that needs the identical real-teaching-material grounding
+    without paying for a full `generate_day_content` call — the same
+    "promote once a second real consumer needs it" reasoning already
+    applied to `utils/gemini_client.py`'s extraction.
 
     Raises `GroundingSourceCallError` on any Tavily-specific API failure
     or timeout. Returns up to 5 real `{url, title, content}` candidates,
@@ -456,7 +509,7 @@ async def generate_day_content(
     minutes_available = convert_weekly_hours_to_daily_minutes(
         available_time_per_week_hours
     )
-    theory_links = await _fetch_theory_material_links(topic_name)
+    theory_links = await fetch_theory_material_links(topic_name)
     theory_sources = _format_theory_sources(theory_links)
     carried_over_instruction = _format_carried_over_instruction(carried_over_content)
 
@@ -774,10 +827,16 @@ class TopicCompletionResult:
     the new total `users.pace_extension_days` after this trigger.
 
     `delivered_patch_topic` is populated whenever `maybe_deliver_patch`
-    actually inserted a patch-note's content this call — independent of
-    `drift` (patch delivery is not pace-gated; see `complete_topic_verification`'s
-    docstring for the judgment call on how this and `enrichment_topic` can
-    both be populated in the same call).
+    actually augmented a patch-note's origin topic this call — independent
+    of `drift` (patch delivery is not pace-gated; see
+    `complete_topic_verification`'s docstring for the judgment call on how
+    this and `enrichment_topic` can both be populated in the same call).
+
+    `pending_patch_decision` is populated instead of `delivered_patch_topic`
+    when `maybe_deliver_patch` returns a `PendingPatchDecision` (a low/
+    uncertain-confidence patch awaiting the user's "learn now or defer"
+    choice, PRD §7.9) — the two fields are mutually exclusive, never both
+    populated from the same call.
     """
 
     topic_score: float
@@ -787,6 +846,7 @@ class TopicCompletionResult:
     enrichment_topic: dict[str, Any] | None = None
     pace_extension_applied: int | None = None
     delivered_patch_topic: dict[str, Any] | None = None
+    pending_patch_decision: "PendingPatchDecision | None" = None
 
 
 def _select_enrichment_skill(
@@ -880,16 +940,6 @@ def maybe_trigger_enrichment(
     )
 
 
-# Judgment call, flagged: like enrichment, a delivered patch-note's new
-# outline_topics row gets its own singleton topic_group — the origin
-# topic's own name plus this suffix (mirrors
-# ENRICHMENT_TOPIC_GROUP_SUFFIX/ENRICHMENT_POSITION_IN_GROUP's reasoning
-# exactly, applied to a market-driven update instead of an emerging
-# skill), so compute_hands_on_intensity's group_size==1 special case
-# applies (full intensity, one day).
-PATCH_NOTE_TOPIC_SUFFIX = " (Update)"
-PATCH_NOTE_POSITION_IN_GROUP = 1
-
 # Judgment call, flagged: patch_notes rows carry no source_type column
 # (Architecture §5's schema: source_url/confidence only) — the same gap
 # data/grounding_fallback.py's CACHED_SOURCE_TYPE already exists to name
@@ -900,11 +950,33 @@ PATCH_NOTE_POSITION_IN_GROUP = 1
 PATCH_NOTE_SOURCE_TYPE = "patch-note"
 
 
+@dataclass(frozen=True)
+class PendingPatchDecision:
+    """A low/uncertain-confidence patch-note awaiting the user's "learn
+    now or defer" choice (PRD §7.9) — everything a UI banner needs to
+    render and later resolve it, without a second DB round-trip.
+
+    Deliberately a plain data carrier, not `patches/patch_manager.py`'s
+    own `PatchDecisionState` (which only names `patch_note_id` — that
+    module never reads patch *content*, per its own docstring): the UI
+    needs `new_content`/`source_url`/`confidence` to show the user
+    something meaningful to decide on. `resolve_pending_patch_decision`
+    below constructs the actual `PatchDecisionState` fresh from this
+    object's `patch_note_id` once the user actually chooses.
+    """
+
+    patch_note_id: str
+    origin_topic_id: str
+    new_content: str
+    source_url: str
+    confidence: ConfidenceTier
+
+
 def maybe_deliver_patch(
     session: Session,
     user_id: str,
     origin_topic_id: str,
-) -> dict[str, Any] | None:
+) -> dict[str, Any] | PendingPatchDecision | None:
     """Patch-note delivery (PRD §7.9): fetch `user_id`'s pending patch-
     notes, join in each one's origin topic's `hierarchy_position`
     (`patches/patch_manager.py`'s `decide_patch_delivery` does no DB
@@ -915,29 +987,32 @@ def maybe_deliver_patch(
     position" in the same sense `maybe_trigger_enrichment` already uses
     it for enrichment placement.
 
-    `"insert_now"`: inserts the chosen patch-note's content into the
-    user's outline via `outline/hierarchy.py`'s existing `insert_new_topic`
-    (`data/outline_topics.py`'s `insert_new_outline_topic` — the identical
-    wrapper `maybe_trigger_enrichment` already calls, not a second
-    insertion path), anchored on `origin_topic_id` as the sole
-    prerequisite so it lands immediately after the user's current
-    position. Source fields are the patch-note's own already-real
-    `source_url`/`confidence` (re-validated via `validate_output_object`,
-    CLAUDE.md guardrail #12, mirroring `maybe_trigger_enrichment`'s
-    pattern) — `new_content` itself is inserted as-is, the already-
-    documented deterministic placeholder from the prior task, not
-    regenerated here. On success, the patch-note's status is updated to
+    `"insert_now"`: **augments** the chosen patch-note's own origin topic
+    in place (`data/outline_topics.py`'s `augment_outline_topic`, wrapping
+    `outline/hierarchy.py`'s `augment_existing_topic`), never inserts a
+    new topic. Resolved judgment call (Architecture §9 had left "augment
+    vs. addition" unresolved): every patch-note's `origin_topic_id` is, by
+    construction, a topic the user has already completed with a skill
+    name that exactly matches the significant event that created the
+    patch (`refresh_roles_cache`'s `create_patch_notes_for_significant_
+    events` only ever creates a patch-note via `get_completed_topics_
+    matching_skill`) — so the update is always "this already-existing
+    topic's own market data changed," never "a genuinely new topic is
+    needed." CLAUDE.md guardrail #5 ("never let a patch-note reopen or
+    alter the completion/verification status of its origin topic") still
+    holds: `augment_outline_topic` only refreshes `source_url`/
+    `source_type`/`confidence`, never `status`/`completed_at`. Source
+    fields are the patch-note's own already-real `source_url`/
+    `confidence` (re-validated via `validate_output_object`, CLAUDE.md
+    guardrail #12). On success, the patch-note's status is updated to
     `DELIVERED` via the existing `update_patch_note_status`. Returns the
-    inserted topic dict.
+    augmented topic dict.
 
-    `"ask_user"`: this task does not build or wire any user-facing
-    prompt/response handling — no UI exists yet. Returns `None`; no
-    patch-note status changes, nothing is inserted. A future caller can
-    construct `PatchDecisionState(patch_note_id=decision.patch_note_id)`
-    directly from this same `decide_patch_delivery` call (see
-    `tests/test_coaching_pace_agent.py` for a test confirming this
-    constructs correctly) — this function does not fabricate a
-    resolution.
+    `"ask_user"`: no patch-note status changes, nothing is augmented yet —
+    returns a `PendingPatchDecision` carrying everything a UI banner needs
+    to display and later resolve it (`resolve_pending_patch_decision`
+    below is the resolution counterpart, called once the user actually
+    chooses "learn now" or "defer"). Never fabricates a resolution itself.
 
     `"none"` (including no pending patch-notes at all): returns `None`,
     no action.
@@ -967,10 +1042,20 @@ def maybe_deliver_patch(
         return None
 
     decision = decide_patch_delivery(assembled, current_hierarchy_position)
-    if decision.action != "insert_now":
+    if decision.action == "none":
         return None
 
     chosen = next(patch for patch in pending if patch["id"] == decision.patch_note_id)
+
+    if decision.action == "ask_user":
+        return PendingPatchDecision(
+            patch_note_id=chosen["id"],
+            origin_topic_id=chosen["origin_topic_id"],
+            new_content=chosen["new_content"],
+            source_url=chosen["source_url"],
+            confidence=ConfidenceTier(chosen["confidence"]),
+        )
+
     origin_topic = get_topic(session, chosen["origin_topic_id"])
     assert origin_topic is not None  # already confirmed present in the loop above
 
@@ -981,19 +1066,13 @@ def maybe_deliver_patch(
             "confidence": chosen["confidence"],
         }
     )
-    new_topic_name = f"{origin_topic['topic_name']}{PATCH_NOTE_TOPIC_SUFFIX}"
 
-    inserted = insert_new_outline_topic(
+    augmented = augment_outline_topic(
         session,
-        user_id=user_id,
-        topic_name=new_topic_name,
-        topic_group=new_topic_name,
-        position_in_group=PATCH_NOTE_POSITION_IN_GROUP,
+        origin_topic["id"],
         source_url=grounded.source_url,
         source_type=grounded.source_type,
         confidence=grounded.confidence,
-        is_enrichment=False,
-        prerequisite_topic_ids=frozenset({origin_topic_id}),
     )
     update_patch_note_status(
         session,
@@ -1001,7 +1080,68 @@ def maybe_deliver_patch(
         PatchStatus.DELIVERED,
         datetime.now(UTC).replace(tzinfo=None, microsecond=0),
     )
-    return inserted
+    return augmented
+
+
+def resolve_pending_patch_decision(
+    session: Session,
+    decision: PendingPatchDecision,
+    user_choice: Literal["learn_now", "defer"],
+    resolved_at: datetime,
+) -> dict[str, Any] | None:
+    """Resolve a `PendingPatchDecision` once the user has actually chosen
+    "learn now" or "defer" (PRD §7.9) — the UI-layer counterpart
+    `maybe_deliver_patch`'s own docstring previously flagged as not yet
+    built (Architecture §10 / PRD §11 item #9). A non-blocking banner is
+    expected to call this only when the user clicks one of the two
+    choices, never speculatively.
+
+    Advances `patches/patch_manager.py`'s pure `resolve_patch_decision`
+    state transition (constructing a fresh, unresolved `PatchDecisionState`
+    from `decision.patch_note_id` — that module's own docstring: this
+    *is* the initial state, no separate constructor needed), then acts on
+    the result:
+
+    `"learn_now"` -> folds the patch's content into its origin topic
+    exactly the way an auto-prioritized ("insert_now") patch already is
+    (`data/outline_topics.py`'s `augment_outline_topic`, re-validated via
+    `validate_output_object` per CLAUDE.md guardrail #12) — PRD §7.9's
+    "learn now (confidence-labeled, folded in)". Returns the augmented
+    topic dict.
+
+    `"defer"` -> the topic is left untouched; `resolve_patch_decision`
+    marks the patch `PatchStatus.DEFERRED` (parked permanently —
+    `data/patch_notes.py`'s `get_deferred_patch_notes` resurfaces it at
+    goal completion). Returns `None`.
+
+    Either choice updates the patch-note's status via the existing
+    `update_patch_note_status`.
+    """
+    state = PatchDecisionState(patch_note_id=decision.patch_note_id)
+    resolved_state = resolve_patch_decision(state, user_choice, resolved_at)
+
+    augmented: dict[str, Any] | None = None
+    if user_choice == "learn_now":
+        grounded = validate_output_object(
+            {
+                "source_url": decision.source_url,
+                "source_type": PATCH_NOTE_SOURCE_TYPE,
+                "confidence": decision.confidence,
+            }
+        )
+        augmented = augment_outline_topic(
+            session,
+            decision.origin_topic_id,
+            source_url=grounded.source_url,
+            source_type=grounded.source_type,
+            confidence=grounded.confidence,
+        )
+
+    assert resolved_state.status is not None  # always set by resolve_patch_decision
+    update_patch_note_status(
+        session, resolved_state.patch_note_id, resolved_state.status, resolved_at
+    )
+    return augmented
 
 
 def _get_latest_attempt_per_question(
@@ -1125,7 +1265,11 @@ def complete_topic_verification(
     after the drift branch, whenever `is_enrichment=False` — patch-note
     delivery is not pace-gated at all (unlike enrichment, which only
     fires on sustained-ahead drift), so it runs every non-enrichment
-    completion regardless of `drift`'s value.
+    completion regardless of `drift`'s value. Its result routes into
+    exactly one of `delivered_patch_topic` (a high-confidence patch was
+    auto-augmented) or `pending_patch_decision` (a low/uncertain-
+    confidence patch is awaiting the user's "learn now or defer" choice —
+    `resolve_pending_patch_decision` below is the resolution counterpart).
 
     **Co-occurrence judgment call, flagged:** `maybe_trigger_enrichment`
     and `maybe_deliver_patch` can both fire in the same call (sustained-
@@ -1159,6 +1303,7 @@ def complete_topic_verification(
     enrichment_topic: dict[str, Any] | None = None
     pace_extension_applied: int | None = None
     delivered_patch_topic: dict[str, Any] | None = None
+    pending_patch_decision: PendingPatchDecision | None = None
 
     if not is_enrichment:
         write_pace_snapshot(
@@ -1201,7 +1346,11 @@ def complete_topic_verification(
                 session, user_id, PACE_EXTENSION_DAYS_PER_TRIGGER
             )
 
-        delivered_patch_topic = maybe_deliver_patch(session, user_id, topic_id)
+        patch_result = maybe_deliver_patch(session, user_id, topic_id)
+        if isinstance(patch_result, PendingPatchDecision):
+            pending_patch_decision = patch_result
+        else:
+            delivered_patch_topic = patch_result
 
     mark_topic_completed(
         session,
@@ -1217,6 +1366,7 @@ def complete_topic_verification(
         enrichment_topic=enrichment_topic,
         pace_extension_applied=pace_extension_applied,
         delivered_patch_topic=delivered_patch_topic,
+        pending_patch_decision=pending_patch_decision,
     )
 
 

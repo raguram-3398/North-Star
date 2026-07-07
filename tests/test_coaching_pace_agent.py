@@ -4,16 +4,16 @@ variant), verification retry-cap orchestration (exactly 3 attempts,
 half-credit teach-and-de-escalate), and pace-signal computation +
 persistence.
 
-Gemini is mocked by reusing tests/test_research_outline_agent.py's
-`_patch_gemini` fake unchanged — `agents.coaching_pace_agent._call_gemini_json`
-is the *same function object* as `agents.research_outline_agent._call_gemini_json`
-(a direct import, not a copy), and that function's own internal call to
-`_get_gemini_client()` resolves via `research_outline_agent`'s namespace
+Gemini is mocked by reusing tests/test_gemini_client.py's `_patch_gemini`
+fake unchanged — `agents.coaching_pace_agent._call_gemini_json` is the
+*same function object* as `utils.gemini_client._call_gemini_json` (a
+direct import, not a copy), and that function's own internal call to
+`_get_gemini_client()` resolves via `utils.gemini_client`'s namespace
 regardless of which module calls it — so patching
-`agents.research_outline_agent._get_gemini_client` (what `_patch_gemini`
-already does) is the correct target here too.
+`utils.gemini_client._get_gemini_client` (what `_patch_gemini` already
+does) is the correct target here too.
 
-Tavily is different: `agents.coaching_pace_agent._fetch_theory_material_links`
+Tavily is different: `agents.coaching_pace_agent.fetch_theory_material_links`
 calls `_get_tavily_client()` as a bare name *defined in this module's own
 namespace* (a separate import binding from research_outline_agent.py's),
 so it must be patched at `agents.coaching_pace_agent._get_tavily_client`
@@ -37,9 +37,9 @@ import pytest
 
 import agents.coaching_pace_agent as cpa
 from security.output_guard import ConfidenceTier
+from tests.test_gemini_client import _patch_gemini
 from tests.test_research_outline_agent import (
     _FakeTavilyClient,
-    _patch_gemini,
     _tavily_response,
     _tavily_result_dict,
 )
@@ -268,7 +268,7 @@ async def test_fetch_theory_material_links_raises_on_tavily_failure(
     )
 
     with pytest.raises(GroundingSourceCallError):
-        await cpa._fetch_theory_material_links("Git Branching")
+        await cpa.fetch_theory_material_links("Git Branching")
 
 
 # --- Hands-on ramping rule (position_in_group / group_size driven) -------
@@ -313,6 +313,29 @@ def test_convert_weekly_hours_to_daily_minutes() -> None:
 def test_convert_weekly_hours_to_daily_minutes_rejects_non_positive() -> None:
     with pytest.raises(ValueError):
         cpa.convert_weekly_hours_to_daily_minutes(0)
+
+
+def test_calculate_days_expected_matches_estimated_minutes_exactly() -> None:
+    # 10 hours/week -> 120 minutes/day, exactly ESTIMATED_MINUTES_PER_TOPIC
+    # -> a single day is expected.
+    assert cpa.ESTIMATED_MINUTES_PER_TOPIC == 120
+    assert cpa.calculate_days_expected(10) == 1
+
+
+def test_calculate_days_expected_scales_up_for_less_available_time() -> None:
+    # 3 hours/week -> 36 minutes/day -> ceil(120 / 36) = 4 days.
+    assert cpa.calculate_days_expected(3) == 4
+
+
+def test_calculate_days_expected_never_less_than_one_day() -> None:
+    # 70 hours/week -> 840 minutes/day, far more than one topic needs —
+    # still at least 1 day, never a fraction of a day.
+    assert cpa.calculate_days_expected(70) == 1
+
+
+def test_calculate_days_expected_rejects_non_positive() -> None:
+    with pytest.raises(ValueError):
+        cpa.calculate_days_expected(0)
 
 
 # --- PROMPT_REGISTRY: baseline regression asserts on the prompt string ----
@@ -1226,9 +1249,14 @@ async def test_complete_topic_test_out_with_is_enrichment_skips_pace_snapshot(
 # --- Patch-note delivery wiring (patch-delivery task, Part 1) -------------
 
 
-def test_maybe_deliver_patch_inserts_high_confidence_patch_and_marks_delivered(
+def test_maybe_deliver_patch_augments_high_confidence_patchs_origin_topic(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Resolved judgment call (Architecture §9): "insert_now" augments the
+    patch's own origin topic in place — never inserts a new "(Update)"
+    topic — since a patch-note's origin_topic_id is, by construction,
+    already an existing topic whose skill matches the significant event.
+    """
     pending_patch = {
         "id": "patch-1",
         "user_id": "u1",
@@ -1252,13 +1280,13 @@ def test_maybe_deliver_patch_inserts_high_confidence_patch_and_marks_delivered(
         return None
 
     monkeypatch.setattr(cpa, "get_topic", _fake_get_topic)
-    insert_calls: list[dict] = []
+    augment_calls: list[tuple] = []
 
-    def _fake_insert(session: object, **kwargs: object) -> dict:
-        insert_calls.append(kwargs)
-        return {"id": "new-patch-topic-1", **kwargs}
+    def _fake_augment(session: object, topic_id: str, **kwargs: object) -> dict:
+        augment_calls.append((topic_id, kwargs))
+        return {"id": topic_id, "topic_name": "SQL", **kwargs}
 
-    monkeypatch.setattr(cpa, "insert_new_outline_topic", _fake_insert)
+    monkeypatch.setattr(cpa, "augment_outline_topic", _fake_augment)
     update_calls: list[tuple] = []
     monkeypatch.setattr(
         cpa,
@@ -1271,27 +1299,26 @@ def test_maybe_deliver_patch_inserts_high_confidence_patch_and_marks_delivered(
     result = cpa.maybe_deliver_patch(MagicMock(), "u1", "t1")
 
     assert result is not None
-    assert len(insert_calls) == 1
-    call = insert_calls[0]
-    assert call["user_id"] == "u1"
-    assert call["topic_name"] == "SQL (Update)"
-    assert call["topic_group"] == "SQL (Update)"
-    assert call["is_enrichment"] is False
-    assert call["source_url"] == "https://example.com/sql-update"
-    assert call["source_type"] == "patch-note"
-    assert call["confidence"] == ConfidenceTier.HIGH
-    assert call["prerequisite_topic_ids"] == frozenset({"t1"})
+    assert result["topic_name"] == "SQL"
+    assert len(augment_calls) == 1
+    topic_id, kwargs = augment_calls[0]
+    assert topic_id == "topic-sql"
+    assert kwargs["source_url"] == "https://example.com/sql-update"
+    assert kwargs["source_type"] == "patch-note"
+    assert kwargs["confidence"] == ConfidenceTier.HIGH
     assert len(update_calls) == 1
     assert update_calls[0][0] == "patch-1"
     assert update_calls[0][1] == cpa.PatchStatus.DELIVERED
 
 
-def test_maybe_deliver_patch_does_not_insert_low_confidence_patch(
+def test_maybe_deliver_patch_returns_pending_decision_for_low_confidence_patch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A low/uncertain-confidence patch routes to "ask_user", not
-    "insert_now" — nothing gets inserted, and the patch-note stays
-    pending (no status update at all).
+    "insert_now" — nothing gets augmented yet, and the patch-note stays
+    pending (no status update at all) — but the caller gets back a
+    `PendingPatchDecision` carrying everything a UI banner needs, not a
+    bare `None` silently dropping the fact that a decision is needed.
     """
     pending_patch = {
         "id": "patch-2",
@@ -1316,9 +1343,9 @@ def test_maybe_deliver_patch_does_not_insert_low_confidence_patch(
             "hierarchy_position": 1,
         },
     )
-    insert_calls: list[dict] = []
+    augment_calls: list[dict] = []
     monkeypatch.setattr(
-        cpa, "insert_new_outline_topic", lambda *a, **k: insert_calls.append(k)
+        cpa, "augment_outline_topic", lambda *a, **k: augment_calls.append(k)
     )
     update_calls: list[tuple] = []
     monkeypatch.setattr(
@@ -1327,8 +1354,13 @@ def test_maybe_deliver_patch_does_not_insert_low_confidence_patch(
 
     result = cpa.maybe_deliver_patch(MagicMock(), "u1", "t1")
 
-    assert result is None
-    assert insert_calls == []
+    assert isinstance(result, cpa.PendingPatchDecision)
+    assert result.patch_note_id == "patch-2"
+    assert result.origin_topic_id == "topic-sql"
+    assert result.new_content == "content"
+    assert result.source_url == "https://example.com/x"
+    assert result.confidence == ConfidenceTier.LOW
+    assert augment_calls == []
     assert update_calls == []
 
 
@@ -1336,23 +1368,21 @@ def test_maybe_deliver_patch_no_pending_patches_does_nothing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(cpa, "get_pending_patch_notes", lambda session, uid: [])
-    insert_calls: list[dict] = []
+    augment_calls: list[dict] = []
     monkeypatch.setattr(
-        cpa, "insert_new_outline_topic", lambda *a, **k: insert_calls.append(k)
+        cpa, "augment_outline_topic", lambda *a, **k: augment_calls.append(k)
     )
 
     result = cpa.maybe_deliver_patch(MagicMock(), "u1", "t1")
 
     assert result is None
-    assert insert_calls == []
+    assert augment_calls == []
 
 
 def test_decide_patch_delivery_ask_user_can_construct_patch_decision_state() -> None:
-    """Confirms the interface a future caller would use for the
-    "needs_user_decision" outcome — this task does not build or wire the
-    actual resolution (no UI exists yet), only confirms a
-    `PatchDecisionState` constructs correctly from the decision; no
-    resolution is fabricated.
+    """Confirms the low-level interface `resolve_pending_patch_decision`
+    below is built on: a `PatchDecisionState` constructs correctly from a
+    "needs_user_decision" outcome; no resolution is fabricated here.
     """
     from patches.patch_manager import PatchDecisionState, decide_patch_delivery
 
@@ -1367,6 +1397,87 @@ def test_decide_patch_delivery_ask_user_can_construct_patch_decision_state() -> 
     state = PatchDecisionState(patch_note_id=decision.patch_note_id)
     assert state.patch_note_id == "patch-low"
     assert state.resolved is False
+
+
+def test_resolve_pending_patch_decision_learn_now_augments_and_marks_delivered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PRD §7.9's "learn now (confidence-labeled, folded in)" — choosing
+    "learn now" must fold the patch's content into its origin topic
+    exactly the way an auto-prioritized patch already is, and mark the
+    patch-note DELIVERED (not a separate status)."""
+    decision = cpa.PendingPatchDecision(
+        patch_note_id="patch-2",
+        origin_topic_id="topic-sql",
+        new_content="SQL is now more in-demand.",
+        source_url="https://example.com/sql-update",
+        confidence=ConfidenceTier.LOW,
+    )
+    augment_calls: list[tuple] = []
+
+    def _fake_augment(session: object, topic_id: str, **kwargs: object) -> dict:
+        augment_calls.append((topic_id, kwargs))
+        return {"id": topic_id, "topic_name": "SQL", **kwargs}
+
+    monkeypatch.setattr(cpa, "augment_outline_topic", _fake_augment)
+    update_calls: list[tuple] = []
+    monkeypatch.setattr(
+        cpa,
+        "update_patch_note_status",
+        lambda session, patch_id, status, resolved_at: update_calls.append(
+            (patch_id, status, resolved_at)
+        ),
+    )
+    resolved_at = datetime(2026, 1, 1)
+
+    result = cpa.resolve_pending_patch_decision(
+        MagicMock(), decision, "learn_now", resolved_at
+    )
+
+    assert result is not None
+    assert result["topic_name"] == "SQL"
+    assert len(augment_calls) == 1
+    topic_id, kwargs = augment_calls[0]
+    assert topic_id == "topic-sql"
+    assert kwargs["source_url"] == "https://example.com/sql-update"
+    assert kwargs["source_type"] == "patch-note"
+    assert kwargs["confidence"] == ConfidenceTier.LOW
+    assert update_calls == [("patch-2", cpa.PatchStatus.DELIVERED, resolved_at)]
+
+
+def test_resolve_pending_patch_decision_defer_does_not_augment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deferring must leave the origin topic untouched and mark the
+    patch-note DEFERRED (parked permanently, per `get_deferred_patch_notes`)."""
+    decision = cpa.PendingPatchDecision(
+        patch_note_id="patch-2",
+        origin_topic_id="topic-sql",
+        new_content="content",
+        source_url="https://example.com/x",
+        confidence=ConfidenceTier.LOW,
+    )
+    augment_calls: list[dict] = []
+    monkeypatch.setattr(
+        cpa, "augment_outline_topic", lambda *a, **k: augment_calls.append(k)
+    )
+    update_calls: list[tuple] = []
+    monkeypatch.setattr(
+        cpa,
+        "update_patch_note_status",
+        lambda session, patch_id, status, resolved_at: update_calls.append(
+            (patch_id, status, resolved_at)
+        ),
+    )
+    resolved_at = datetime(2026, 1, 1)
+
+    result = cpa.resolve_pending_patch_decision(
+        MagicMock(), decision, "defer", resolved_at
+    )
+
+    assert result is None
+    assert augment_calls == []
+    assert update_calls == [("patch-2", cpa.PatchStatus.DEFERRED, resolved_at)]
 
 
 def test_complete_topic_verification_calls_maybe_deliver_patch_regardless_of_drift(

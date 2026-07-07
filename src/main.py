@@ -25,6 +25,14 @@ place these keys are declared):
   interaction) — every `data/*` function still commits its own
   transaction, so a single long-lived `Session` object is safe to reuse
   across reruns the same way a real request-scoped session would be.
+- `startup_staleness_checked`: whether `_maybe_check_stale_roles` has
+  already run for this browser session (Architecture §3's startup
+  staleness check) — this codebase's practical reading of "on Streamlit
+  app startup (or first session of the day)": Streamlit has no
+  cross-session calendar-day state without a new persistence mechanism,
+  so "once per browser session" is the honest, achievable version of
+  that requirement. Set `True` the first time it runs, success or
+  failure, so a live-call failure doesn't retry on every single rerun.
 - `current_stage`: the *string* `.value` of the `PipelineStage` currently
   being rendered — the single source of truth for which stage function
   `main()` dispatches to. Stored as a plain string, never the `Enum`
@@ -82,16 +90,43 @@ place these keys are declared):
   a stepped, "Next"-button reveal rather than showing every section at
   once. Reset to 0 whenever `day_content` is reset to `None` (a new day
   or a new topic).
+- `test_out_prompt_dismissed`: whether the user has already been offered
+  (and declined) test-out for the *current topic* — gates the one-time
+  choice screen shown whenever `day_content is None` (PRD §7.6's
+  "verification first, before study content is generated"). Reset to
+  `False` only when a genuinely new topic starts (`_advance_to_day_one`/
+  the "Continue to next topic" action), never on a same-topic spillover
+  day, so a user who already declined mid-topic isn't re-prompted after
+  they've already seen day 1's material.
+- `is_test_out`: whether the verification currently in progress is a
+  test-out attempt (PRD §7.6) rather than regular post-content
+  verification — threaded into `submit_verification_answer`'s
+  `is_test_out` flag and used to decide whether topic completion calls
+  `complete_topic_test_out` or `complete_topic_verification`.
 - `verification_source_material` / `verification_source_url`: the single
-  source pair (computed once per topic, when its content is generated —
-  see `_build_verification_source`) that all 5 verification question
+  source pair (computed once per topic — from the generated `DayContent`
+  via `_build_verification_source` for regular verification, or directly
+  from a fresh `fetch_theory_material_links` call for test-out, since no
+  `DayContent` exists yet in that case) that all 5 verification question
   slots for this topic are anchored to.
 - `current_question_number`: which of the 5 verification slots (1-5) is
   active; `6` signals all slots resolved.
 - `verification_slot_state`: the current slot's `VerificationSlotState`,
   or `None` before its first question has been generated.
 - `last_completion_result`: the `TopicCompletionResult` from the most
-  recent `complete_topic_verification` call, read back for display only.
+  recent `complete_topic_verification`/`complete_topic_test_out` call,
+  read back for display only.
+- `last_test_out_full_pass`: `TestOutResult.full_pass` from the most
+  recent `complete_topic_test_out` call, or `None` when the current
+  topic wasn't completed via test-out — read back for display only.
+- `pending_patch_decision`: the `PendingPatchDecision` from the most
+  recent completion call, or `None` if no low/uncertain-confidence
+  patch-note is currently awaiting the user's "learn now or defer"
+  choice (PRD §7.9). Rendered as a non-blocking, dismissible banner
+  (`_render_patch_decision_banner`) alongside — never instead of — the
+  normal "Continue to next topic"/"View closing note" actions: ignoring
+  it is always safe, since an unresolved patch simply stays `PENDING`
+  and is reconsidered the next time `maybe_deliver_patch` runs.
 - `closing_note`: the `ClosingNote` from the one `generate_closing_note`
   call, once Goal Completion is reached.
 """
@@ -100,7 +135,7 @@ import asyncio
 from collections.abc import Callable
 from datetime import UTC, datetime
 from enum import Enum
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 import streamlit as st
@@ -110,14 +145,20 @@ from sqlalchemy.orm import Session
 from agents.coaching_pace_agent import (
     FULL_CREDIT,
     DayContent,
+    PendingPatchDecision,
+    TestOutResult,
     TopicCompletionResult,
     VerificationSlotState,
     begin_verification_question,
+    calculate_days_expected,
+    complete_topic_test_out,
     complete_topic_verification,
+    fetch_theory_material_links,
     generate_closing_note,
     generate_day_content,
     is_goal_complete,
     record_day_content,
+    resolve_pending_patch_decision,
     submit_verification_answer,
 )
 from agents.research_outline_agent import (
@@ -133,8 +174,8 @@ from agents.research_outline_agent import (
     ground_role,
     handle_review_turn,
     regenerate_outline_with_addition,
-    reset_gemini_client_for_new_event_loop,
 )
+from cron.refresh_roles import SEED_ROLES, check_and_refresh_stale_roles
 from data.grounding_fallback import CachedFallbackResult, GeneralKnowledgeFloorResult
 from data.outline_topics import (
     get_all_topics_for_user,
@@ -153,6 +194,7 @@ from utils.exceptions import (
     HimalayasParseError,
     TavilyParseError,
 )
+from utils.gemini_client import reset_gemini_client_for_new_event_loop
 
 # Loaded here (not left to the operator to `source .env` manually, unlike
 # src/cron/refresh_roles.py's __main__ block, which relies on GH Actions
@@ -181,24 +223,6 @@ class PipelineStage(Enum):
     VERIFICATION = "verification"
     GOAL_COMPLETION = "goal_completion"
 
-
-# Judgment call, flagged loudly — a genuine spec gap discovered while
-# wiring this task, not a pre-existing constant: no function anywhere in
-# this codebase computes `days_expected` (pace/calculator.py's own
-# docstring: "supplied by the caller as already derived from the user's
-# own established baseline" — PRD §7.8 explicitly defers that baseline
-# calculation to "a future days_expected calculation," not built by any
-# prior task). Rather than inventing an unbaked formula, this orchestration
-# skeleton uses a flat 1-day-per-topic baseline: `days_taken`
-# (`day_number_for_topic`) is derived honestly from the existing spillover
-# mechanism (one real day per generate_day_content call for the same
-# topic), so a topic that spills over 2+ days already registers as
-# genuinely "behind" via timing_ratio; a topic resolved same-day reads as
-# exactly on-baseline (ratio 1.0, timing contributes nothing — see
-# pace/calculator.py's TIMING_OUTLIER_THRESHOLD). See this task's report
-# for why this was decided rather than asked about, and why it's flagged
-# as revisable, not settled.
-DAYS_EXPECTED_PER_TOPIC = 1
 
 # Broad but named (not bare `except:`) — every exception a stage's real
 # calls can raise, per each function's own documented contract. Caught at
@@ -241,6 +265,7 @@ def _init_session_state() -> None:
     """
     defaults: dict[str, Any] = {
         "db_session": None,
+        "startup_staleness_checked": False,
         "current_stage": PipelineStage.LANDING.value,
         "user_id": None,
         "stated_goal": None,
@@ -257,11 +282,15 @@ def _init_session_state() -> None:
         "carried_over_content": None,
         "day_content": None,
         "day_coaching_step_index": 0,
+        "test_out_prompt_dismissed": False,
+        "is_test_out": False,
         "verification_source_material": None,
         "verification_source_url": None,
         "current_question_number": 1,
         "verification_slot_state": None,
         "last_completion_result": None,
+        "last_test_out_full_pass": None,
+        "pending_patch_decision": None,
         "closing_note": None,
     }
     for key, value in defaults.items():
@@ -274,6 +303,34 @@ def _get_db_session() -> Session:
         st.session_state.db_session = get_session()
     session: Session = st.session_state.db_session
     return session
+
+
+def _maybe_check_stale_roles() -> None:
+    """Architecture §3's startup staleness resilience layer: once per
+    browser session (see `startup_staleness_checked`'s own docstring
+    entry above), refresh any `SEED_ROLES` entry whose `roles_cache` row
+    is stale or missing (`check_and_refresh_stale_roles`) before the
+    user's own pipeline run can reach it. `SEED_ROLES`, not the as-yet-
+    unresolved `resolved_role`, since this runs before Intake/Clarify Gate
+    have resolved anything — the same seed-role bootstrap list the cron
+    job and initial seed run already use (CLAUDE.md guardrail #9: this
+    reuses `check_and_refresh_stale_roles`/`refresh_roles_cache` as-is,
+    never a reimplementation).
+
+    A resilience layer must never become a hard dependency: failure here
+    is caught and surfaced as a dismissable warning (the same
+    `_STAGE_EXCEPTIONS` every other live-call stage already degrades on),
+    never a crash that blocks the rest of the app from loading.
+    """
+    if st.session_state.startup_staleness_checked:
+        return
+    st.session_state.startup_staleness_checked = True
+    session = _get_db_session()
+    reference_time = datetime.now(UTC).replace(tzinfo=None)
+    try:
+        _run_async(check_and_refresh_stale_roles(session, SEED_ROLES, reference_time))
+    except _STAGE_EXCEPTIONS as exc:
+        st.warning(f"Startup roles_cache staleness check failed: {exc}")
 
 
 # --- Shared presentation helpers (visual-pass task, native-Streamlit) ---
@@ -922,6 +979,35 @@ def _build_verification_source(
     return topic_source_material, source_url
 
 
+def _build_test_out_verification_source(
+    theory_links: list[dict[str, str]],
+) -> tuple[str, str] | None:
+    """Test-out's twin of `_build_verification_source` above — same
+    anchoring rule (real teaching material, never the topic's own
+    market-grounding `source_url` alone), but built directly from a fresh
+    `fetch_theory_material_links` call rather than a `DayContent`, since
+    test-out (PRD §7.6: "verification first, before study content is
+    generated") never generates one.
+
+    Returns `None` if Tavily's theory search returned nothing at all —
+    unlike regular verification (which always has at least `content.
+    theory_framing` to fall back to), test-out has no Gemini-written
+    framing text to anchor questions to, so there's no honest source
+    material to hand `generate_questions` here (CLAUDE.md guardrail #6:
+    never silently fabricate a source). The caller must treat this as
+    "test-out isn't available for this topic right now," not force it
+    through with an empty string.
+    """
+    if not theory_links:
+        return None
+    material_parts = [link["content"] for link in theory_links if link.get("content")]
+    if not material_parts:
+        return None
+    topic_source_material = "\n\n".join(material_parts)
+    source_url = theory_links[0]["url"]
+    return topic_source_material, source_url
+
+
 def _day_coaching_steps(
     content: DayContent,
 ) -> list[tuple[str, str, Callable[[], None]]]:
@@ -960,6 +1046,58 @@ def _day_coaching_steps(
     return steps
 
 
+def _render_test_out_choice(topic: dict[str, Any]) -> None:
+    """The test-out choice screen (PRD §7.6: "for any topic, the user may
+    trigger verification first, before study content is generated") —
+    shown once per topic, exactly when `day_content is None` and the user
+    hasn't already declined it for this topic
+    (`test_out_prompt_dismissed`).
+
+    "Test out" fetches real teaching-material links directly
+    (`fetch_theory_material_links`) rather than calling
+    `generate_day_content` — the whole point is skipping that generation
+    step entirely, not just skipping its display. If Tavily's theory
+    search comes back empty, `_build_test_out_verification_source`
+    returns `None` and test-out is refused for this topic right now
+    (never a fabricated source) rather than silently falling through.
+    """
+    st.write(
+        "You can test out of this topic by answering 5 verification "
+        "questions first — a full pass skips today's study content "
+        "entirely."
+    )
+    col_test_out, col_decline = st.columns(2)
+    with col_test_out:
+        test_out_clicked = st.button("Test out of this topic", type="primary")
+    with col_decline:
+        decline_clicked = st.button("No, teach me the material")
+
+    if decline_clicked:
+        st.session_state.test_out_prompt_dismissed = True
+        st.rerun()
+
+    if test_out_clicked:
+        try:
+            theory_links = _run_async(fetch_theory_material_links(topic["topic_name"]))
+        except _STAGE_EXCEPTIONS as exc:
+            st.error(f"Fetching teaching material failed: {exc}")
+            return
+        source = _build_test_out_verification_source(theory_links)
+        if source is None:
+            st.error(
+                "No grounded teaching material was found for this topic "
+                "yet — test-out isn't available right now."
+            )
+            return
+        st.session_state.verification_source_material = source[0]
+        st.session_state.verification_source_url = source[1]
+        st.session_state.current_question_number = 1
+        st.session_state.verification_slot_state = None
+        st.session_state.is_test_out = True
+        st.session_state.current_stage = PipelineStage.VERIFICATION.value
+        st.rerun()
+
+
 def _render_day_by_day_coaching() -> None:
     st.header("Day-by-Day Coaching")
     session = _get_db_session()
@@ -969,6 +1107,13 @@ def _render_day_by_day_coaching() -> None:
         return
 
     st.subheader(topic["topic_name"])
+
+    if (
+        st.session_state.day_content is None
+        and not st.session_state.test_out_prompt_dismissed
+    ):
+        _render_test_out_choice(topic)
+        return
 
     if st.session_state.day_content is None:
         group_topics = get_topics_in_group(
@@ -1047,6 +1192,42 @@ def _render_day_by_day_coaching() -> None:
 # --- Verification (PRD §7.1 stage 7 / §7.7) -----------------------------
 
 
+def _render_patch_decision_banner(session: Session) -> None:
+    """Non-blocking, dismissible banner for a low/uncertain-confidence
+    patch-note awaiting the user's "learn now or defer" choice (PRD
+    §7.9) — rendered alongside, never instead of, the normal "Continue to
+    next topic"/"View closing note" actions below, so ignoring it never
+    blocks progression: an unresolved decision simply stays `PENDING` in
+    the DB and is reconsidered the next time `maybe_deliver_patch` runs
+    (its own already-established behavior).
+    """
+    decision: PendingPatchDecision = st.session_state.pending_patch_decision
+    with st.container(border=True, key="ns-card-patch-decision"):
+        _render_kicker("Market update awaiting your decision")
+        st.write(decision.new_content)
+        _render_citations([{"title": "Source", "url": decision.source_url}])
+        learn_col, defer_col = st.columns(2)
+        with learn_col:
+            learn_now_clicked = st.button("Learn now", type="primary")
+        with defer_col:
+            defer_clicked = st.button("Defer")
+
+    if not (learn_now_clicked or defer_clicked):
+        return
+
+    user_choice: Literal["learn_now", "defer"] = (
+        "learn_now" if learn_now_clicked else "defer"
+    )
+    resolve_pending_patch_decision(
+        session,
+        decision,
+        user_choice,
+        datetime.now(UTC).replace(tzinfo=None, microsecond=0),
+    )
+    st.session_state.pending_patch_decision = None
+    st.rerun()
+
+
 def _advance_after_topic_completion(session: Session) -> None:
     result: TopicCompletionResult = st.session_state.last_completion_result
     st.subheader("Topic completed")
@@ -1063,9 +1244,19 @@ def _advance_after_topic_completion(session: Session) -> None:
         )
     if result.delivered_patch_topic is not None:
         st.info(
-            "Market-update topic delivered: "
+            "Market data refreshed for a completed topic: "
             f"{result.delivered_patch_topic['topic_name']}"
         )
+    if st.session_state.last_test_out_full_pass is not None:
+        if st.session_state.last_test_out_full_pass:
+            st.success("Tested out — full pass, no study content needed.")
+        else:
+            st.info(
+                "Tested out — partial pass. You've already been taught the "
+                "questions you missed above."
+            )
+    if st.session_state.pending_patch_decision is not None:
+        _render_patch_decision_banner(session)
 
     if is_goal_complete(session, st.session_state.user_id):
         if st.button("View closing note"):
@@ -1085,7 +1276,11 @@ def _advance_after_topic_completion(session: Session) -> None:
         st.session_state.carried_over_content = None
         st.session_state.day_content = None
         st.session_state.day_coaching_step_index = 0
+        st.session_state.test_out_prompt_dismissed = False
+        st.session_state.is_test_out = False
         st.session_state.last_completion_result = None
+        st.session_state.last_test_out_full_pass = None
+        st.session_state.pending_patch_decision = None
         st.session_state.current_stage = PipelineStage.DAY_BY_DAY_COACHING.value
         st.rerun()
 
@@ -1100,20 +1295,38 @@ def _render_verification() -> None:
 
     if st.session_state.current_question_number > 5:
         if st.session_state.last_completion_result is None:
+            user = get_user(session, st.session_state.user_id)
+            assert user is not None
+            days_expected = calculate_days_expected(user["available_time_per_week"])
             try:
-                result = complete_topic_verification(
-                    session,
-                    st.session_state.user_id,
-                    st.session_state.current_topic_id,
-                    days_taken=st.session_state.day_number_for_topic,
-                    days_expected=DAYS_EXPECTED_PER_TOPIC,
-                    is_test_out=False,
-                    is_enrichment=topic["is_enrichment"],
-                )
+                if st.session_state.is_test_out:
+                    test_out_result: TestOutResult = _run_async(
+                        complete_topic_test_out(
+                            session,
+                            st.session_state.user_id,
+                            st.session_state.current_topic_id,
+                            days_taken=st.session_state.day_number_for_topic,
+                            days_expected=days_expected,
+                            is_enrichment=topic["is_enrichment"],
+                        )
+                    )
+                    result = test_out_result.completion
+                    st.session_state.last_test_out_full_pass = test_out_result.full_pass
+                else:
+                    result = complete_topic_verification(
+                        session,
+                        st.session_state.user_id,
+                        st.session_state.current_topic_id,
+                        days_taken=st.session_state.day_number_for_topic,
+                        days_expected=days_expected,
+                        is_test_out=False,
+                        is_enrichment=topic["is_enrichment"],
+                    )
             except _STAGE_EXCEPTIONS as exc:
                 st.error(f"Completing verification failed: {exc}")
                 return
             st.session_state.last_completion_result = result
+            st.session_state.pending_patch_decision = result.pending_patch_decision
         _advance_after_topic_completion(session)
         return
 
@@ -1176,7 +1389,7 @@ def _render_verification() -> None:
                     session,
                     st.session_state.verification_source_material,
                     st.session_state.verification_source_url,
-                    is_test_out=False,
+                    is_test_out=st.session_state.is_test_out,
                 )
             )
         except _STAGE_EXCEPTIONS as exc:
@@ -1230,6 +1443,7 @@ _STAGE_RENDERERS = {
 def main() -> None:
     """Start Project North Star's Streamlit application."""
     _init_session_state()
+    _maybe_check_stale_roles()
     st.title("North Star")
     _STAGE_RENDERERS[st.session_state.current_stage]()
 
